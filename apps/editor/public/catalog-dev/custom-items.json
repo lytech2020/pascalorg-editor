@@ -91,5 +91,191 @@
       1,
       1
     ]
+  },
+  {
+    "id": "zhongshichuang1",
+    "category": "furniture",
+    "name": "中式床1",
+    "tags": [
+      "floor",
+      "custom"
+    ],
+    "thumbnail": "https://madori-navi.jp/glb/zhongshichuang.jpg",
+    "src": "https://madori-navi.jp/glb/zhongshichuang1.glb",
+    "dimensions": [
+      1.5735,
+      1.9105,
+      1.4637
+    ],
+    "offset": [
+      0.0011,
+      0.9564,
+      0.0009
+    ],
+    "rotation": [
+      0,
+      0,
+      0
+    ],
+    "scale": [
+      1,
+      1,
+      1
+    ]
+  },
+  {
+    "id": "40000",
+    "category": "furniture",
+    "name": "中式床40000",
+    "tags": [
+      "floor",
+      "custom"
+    ],
+    "thumbnail": "https://madori-navi.jp/glb/zhongshichuang.jpg",
+    "src": "https://madori-navi.jp/glb/40000.glb",
+    "dimensions": [
+      1.5737,
+      1.9105,
+      1.4637
+    ],
+    "offset": [
+      0.001,
+      0.9564,
+      0.0009
+    ],
+    "rotation": [
+      0,
+      0,
+      0
+    ],
+    "scale": [
+      1,
+      1,
+      1
+    ]
+  },
+  {
+    "id": "50000",
+    "category": "furniture",
+    "name": "中式床50000",
+    "tags": [
+      "floor",
+      "custom"
+    ],
+    "thumbnail": "https://madori-navi.jp/glb/zhongshichuang.jpg",
+    "src": "https://madori-navi.jp/glb/50000.glb",
+    "dimensions": [
+      1.5735,
+      1.9105,
+      1.4638
+    ],
+    "offset": [
+      0.0011,
+      0.9564,
+      0.0009
+    ],
+    "rotation": [
+      0,
+      0,
+      0
+    ],
+    "scale": [
+      1,
+      1,
+      1
+    ]
+  },
+  {
+    "id": "70000",
+    "category": "furniture",
+    "name": "中式床70000",
+    "tags": [
+      "floor",
+      "custom"
+    ],
+    "thumbnail": "https://madori-navi.jp/glb/zhongshichuang.jpg",
+    "src": "https://madori-navi.jp/glb/70000.glb",
+    "dimensions": [
+      1.5735,
+      1.9107,
+      1.4638
+    ],
+    "offset": [
+      0.0011,
+      0.9564,
+      0.0009
+    ],
+    "rotation": [
+      0,
+      0,
+      0
+    ],
+    "scale": [
+      1,
+      1,
+      1
+    ]
+  },
+  {
+    "id": "bigzhongshichuang",
+    "category": "furniture",
+    "name": "中式床大",
+    "tags": [
+      "floor",
+      "custom"
+    ],
+    "thumbnail": "https://madori-navi.jp/glb/zhongshichuang.jpg",
+    "src": "https://madori-navi.jp/glb/stander.glb",
+    "dimensions": [
+      1.5893,
+      1.8983,
+      1.5005
+    ],
+    "offset": [
+      -0.0008,
+      0.9503,
+      0.0007
+    ],
+    "rotation": [
+      0,
+      0,
+      0
+    ],
+    "scale": [
+      1,
+      1,
+      1
+    ]
+  },
+  {
+    "id": "xiaotuiche",
+    "category": "furniture",
+    "name": "小推车",
+    "tags": [
+      "floor",
+      "custom"
+    ],
+    "thumbnail": "https://madori-navi.jp/glb/bao.jpg",
+    "src": "https://madori-navi.jp/glb/bao.glb",
+    "dimensions": [
+      0.3875,
+      1,
+      0.408
+    ],
+    "offset": [
+      0.0002,
+      0.9,
+      0.0001
+    ],
+    "rotation": [
+      0,
+      0,
+      0
+    ],
+    "scale": [
+      1,
+      1,
+      1
+    ]
   }
 ]

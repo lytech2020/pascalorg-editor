@@ -3,7 +3,7 @@
 import { Bounds, OrbitControls, useGLTF } from '@react-three/drei'
 import { Canvas } from '@react-three/fiber'
 import { Box, Loader2 } from 'lucide-react'
-import { Suspense, useMemo } from 'react'
+import { Component, Suspense, useMemo, type ReactNode } from 'react'
 // @ts-expect-error three types are provided outside this app package in the current workspace.
 import * as THREE from 'three'
 
@@ -52,6 +52,28 @@ function GlbModel({ url }: { url: string }) {
       <primitive object={content} />
     </Bounds>
   )
+}
+
+class PreviewErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: string | null }
+> {
+  state = { error: null as string | null }
+
+  static getDerivedStateFromError(error: Error) {
+    return { error: error.message }
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="flex h-full items-center justify-center p-6 text-center">
+          <p className="max-w-xs text-destructive text-sm leading-relaxed">{this.state.error}</p>
+        </div>
+      )
+    }
+    return this.props.children
+  }
 }
 
 function PreviewCanvas({ url }: { url: string }) {
@@ -106,7 +128,9 @@ export function GlbPreviewPanel({
       <div className="relative min-h-0 flex-1 bg-muted/20">
         {glbUrl ? (
           <div className="absolute inset-0">
-            <PreviewCanvas key={glbUrl} url={glbUrl} />
+            <PreviewErrorBoundary key={glbUrl}>
+              <PreviewCanvas url={glbUrl} />
+            </PreviewErrorBoundary>
           </div>
         ) : (
           <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center">
