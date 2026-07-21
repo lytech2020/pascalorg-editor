@@ -50,8 +50,22 @@ type ChatResponse = {
   clientRequestId?: string
 }
 
+type RequestStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+type RequestKind = 'chat' | 'confirm' | 'cancel'
+type WorkflowStepStatus = 'running' | 'succeeded' | 'failed' | 'cancelled' | 'failed_recoverable'
+
+type WorkflowStepProgress = {
+  stepId: string
+  operationKey: string
+  attemptNo: number
+  status: WorkflowStepStatus
+  errorCode?: string
+  startedAt: string
+  completedAt?: string
+}
+
 type AcceptedResponse = {
-  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+  status: RequestStatus
   reused?: boolean
   statusUrl: string
   requestId: string
@@ -63,8 +77,12 @@ type RequestStatusResponse = {
   requestId: string
   traceId: string
   clientRequestId?: string
-  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+  sessionId: string
+  kind: RequestKind
+  status: RequestStatus
+  sessionPhase?: Phase
   errorCode?: string
+  steps: WorkflowStepProgress[]
   result?: ChatResponse
 }
 
@@ -91,6 +109,30 @@ type PendingSubmission = {
   idempotencyKey: string
 }
 
+type ActiveRequestReference = {
+  requestId: string
+  traceId: string
+  clientRequestId: string
+  sessionId: string
+  kind: RequestKind
+}
+
+type WaitForRequestOptions = {
+  signal?: AbortSignal
+  onUpdate?: (request: RequestStatusResponse) => void
+  onConnectionChange?: (retrying: boolean) => void
+}
+
+class RequestStatusError extends Error {
+  constructor(
+    message: string,
+    readonly permanent: boolean,
+  ) {
+    super(message)
+    this.name = 'RequestStatusError'
+  }
+}
+
 function aiAgentUrl(): string {
   if (process.env.NEXT_PUBLIC_AI_AGENT_URL) return process.env.NEXT_PUBLIC_AI_AGENT_URL
   return '/api/ai'
@@ -103,8 +145,11 @@ function editorHref(editorUrl: string): string {
   return editorUrl
 }
 
-function mapSessionMessages(session: WorkflowSession): UiMessage[] {
-  return (session.messages ?? [])
+function mapSessionMessages(
+  session: WorkflowSession,
+  currentMessages: UiMessage[] = [],
+): UiMessage[] {
+  const mapped = (session.messages ?? [])
     .filter(
       (message) =>
         (message.role === 'user' || message.role === 'assistant') &&
@@ -115,6 +160,34 @@ function mapSessionMessages(session: WorkflowSession): UiMessage[] {
       role: message.role as 'user' | 'assistant',
       content: message.content as string,
     }))
+
+  const currentUserMessages = currentMessages.filter((message) => message.role === 'user')
+  const mappedUserIndexes = mapped.flatMap((message, index) =>
+    message.role === 'user' ? [index] : [],
+  )
+  const alignedCount = Math.min(currentUserMessages.length, mappedUserIndexes.length)
+  for (let offset = 1; offset <= alignedCount; offset += 1) {
+    const current = currentUserMessages[currentUserMessages.length - offset]
+    const mappedIndex = mappedUserIndexes[mappedUserIndexes.length - offset]
+    const mappedMessage = mappedIndex === undefined ? undefined : mapped[mappedIndex]
+    if (current?.content.includes('\n[Image: ') && mappedIndex !== undefined && mappedMessage) {
+      mapped[mappedIndex] = { ...mappedMessage, content: current.content }
+    }
+  }
+  return mapped
+}
+
+async function fetchSessionSnapshot(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<WorkflowSession | null> {
+  const response = await fetch(`${aiAgentUrl()}/sessions/${encodeURIComponent(sessionId)}`, {
+    cache: 'no-store',
+    signal,
+  })
+  if (!response.ok) return null
+  const payload = (await response.json()) as { session?: WorkflowSession | null }
+  return payload.session ?? null
 }
 
 function createSessionId(sceneId?: string): string {
@@ -124,6 +197,84 @@ function createSessionId(sceneId?: string): string {
   const created = crypto.randomUUID()
   window.localStorage.setItem(storageKey, created)
   return created
+}
+
+function activeRequestStorageKey(sessionId: string): string {
+  return `pascal-ai-active-request:${sessionId}`
+}
+
+function rememberActiveRequest(request: ActiveRequestReference): void {
+  try {
+    window.localStorage.setItem(activeRequestStorageKey(request.sessionId), JSON.stringify(request))
+  } catch (storageError) {
+    console.warn('[ai-assistant] could not persist active request reference', storageError)
+  }
+}
+
+function readActiveRequest(sessionId: string): ActiveRequestReference | null {
+  try {
+    const raw = window.localStorage.getItem(activeRequestStorageKey(sessionId))
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as Partial<ActiveRequestReference>
+    if (
+      parsed.sessionId !== sessionId ||
+      typeof parsed.requestId !== 'string' ||
+      typeof parsed.traceId !== 'string' ||
+      typeof parsed.clientRequestId !== 'string' ||
+      (parsed.kind !== 'chat' && parsed.kind !== 'confirm' && parsed.kind !== 'cancel')
+    ) {
+      window.localStorage.removeItem(activeRequestStorageKey(sessionId))
+      return null
+    }
+    return parsed as ActiveRequestReference
+  } catch {
+    try {
+      window.localStorage.removeItem(activeRequestStorageKey(sessionId))
+    } catch {}
+    return null
+  }
+}
+
+function forgetActiveRequest(sessionId: string, requestId?: string): void {
+  if (requestId) {
+    const current = readActiveRequest(sessionId)
+    if (current?.requestId !== requestId) return
+  }
+  try {
+    window.localStorage.removeItem(activeRequestStorageKey(sessionId))
+  } catch {}
+}
+
+function waitWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason)
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      signal?.removeEventListener('abort', abort)
+      resolve()
+    }, ms)
+    const abort = () => {
+      window.clearTimeout(timer)
+      reject(signal?.reason)
+    }
+    signal?.addEventListener('abort', abort, { once: true })
+  })
+}
+
+function isRequestStatusResponse(value: unknown): value is RequestStatusResponse {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Partial<RequestStatusResponse>
+  return (
+    typeof candidate.requestId === 'string' &&
+    typeof candidate.traceId === 'string' &&
+    typeof candidate.sessionId === 'string' &&
+    (candidate.kind === 'chat' || candidate.kind === 'confirm' || candidate.kind === 'cancel') &&
+    (candidate.status === 'queued' ||
+      candidate.status === 'running' ||
+      candidate.status === 'succeeded' ||
+      candidate.status === 'failed' ||
+      candidate.status === 'cancelled') &&
+    Array.isArray(candidate.steps)
+  )
 }
 
 export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
@@ -136,6 +287,8 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
   const [busy, setBusy] = useState(false)
   const [cancelling, setCancelling] = useState(false)
   const [error, setError] = useState('')
+  const [requestProgress, setRequestProgress] = useState<RequestStatusResponse | null>(null)
+  const [pollReconnecting, setPollReconnecting] = useState(false)
   // Rolling log of recent request correlations (client id -> server ids);
   // kept in a ref (not render state) and mirrored to console.debug.
   const requestLogRef = useRef<RequestRecord[]>([])
@@ -156,17 +309,13 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
 
   useEffect(() => {
     if (!sessionId) return
+    if (readActiveRequest(sessionId)) return
     const controller = new AbortController()
-    void fetch(`${aiAgentUrl()}/sessions/${encodeURIComponent(sessionId)}`, {
-      cache: 'no-store',
-      signal: controller.signal,
-    })
-      .then(async (response) => {
-        if (!response.ok) return
-        const payload = (await response.json()) as { session: WorkflowSession | null }
-        if (!payload.session) return
-        setSession(payload.session)
-        setMessages(mapSessionMessages(payload.session))
+    void fetchSessionSnapshot(sessionId, controller.signal)
+      .then((restored) => {
+        if (!restored) return
+        setSession(restored)
+        setMessages(mapSessionMessages(restored))
       })
       .catch((loadError: unknown) => {
         if (!(loadError instanceof DOMException && loadError.name === 'AbortError')) {
@@ -180,22 +329,60 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   })
 
-  const waitForRequest = useCallback(async (requestId: string): Promise<RequestStatusResponse> => {
-    const deadline = Date.now() + 30 * 60 * 1000
-    while (Date.now() < deadline) {
-      const response = await fetch(`${aiAgentUrl()}/requests/${encodeURIComponent(requestId)}`, {
-        cache: 'no-store',
-      })
-      const payload = (await response.json()) as RequestStatusResponse & { error?: string }
-      if (!response.ok)
-        throw new Error(payload.error ?? `Request status failed (${response.status})`)
-      if (payload.status !== 'queued' && payload.status !== 'running') return payload
-      await new Promise((resolve) => setTimeout(resolve, 750))
-    }
-    throw new Error(
-      'The AI request is still running after 30 minutes. Refresh later to check its status.',
-    )
-  }, [])
+  const waitForRequest = useCallback(
+    async (
+      requestId: string,
+      options: WaitForRequestOptions = {},
+    ): Promise<RequestStatusResponse> => {
+      const deadline = Date.now() + 30 * 60 * 1000
+      let retryDelayMs = 750
+      while (Date.now() < deadline) {
+        try {
+          const response = await fetch(
+            `${aiAgentUrl()}/requests/${encodeURIComponent(requestId)}`,
+            {
+              cache: 'no-store',
+              signal: options.signal,
+            },
+          )
+          const payload = (await response
+            .json()
+            .catch(() => ({}))) as Partial<RequestStatusResponse> & {
+            error?: string
+          }
+          if (!response.ok) {
+            const permanent =
+              response.status >= 400 &&
+              response.status < 500 &&
+              response.status !== 408 &&
+              response.status !== 429
+            throw new RequestStatusError(
+              payload.error ?? `Request status failed (${response.status})`,
+              permanent,
+            )
+          }
+          if (!isRequestStatusResponse(payload)) {
+            throw new RequestStatusError('AI request status response was incomplete', false)
+          }
+          options.onConnectionChange?.(false)
+          options.onUpdate?.(payload)
+          if (payload.status !== 'queued' && payload.status !== 'running') return payload
+          retryDelayMs = 750
+          await waitWithSignal(750, options.signal)
+        } catch (statusError) {
+          if (options.signal?.aborted) throw statusError
+          if (statusError instanceof RequestStatusError && statusError.permanent) throw statusError
+          options.onConnectionChange?.(true)
+          await waitWithSignal(retryDelayMs, options.signal)
+          retryDelayMs = Math.min(5_000, Math.ceil(retryDelayMs * 1.5))
+        }
+      }
+      throw new Error(
+        'The AI request is still running after 30 minutes. Refresh later to check its status.',
+      )
+    },
+    [],
+  )
 
   const maybeRedirectToScene = useCallback(
     (body: Record<string, unknown>, target: WorkflowSession) => {
@@ -211,6 +398,84 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
     },
     [sceneId],
   )
+
+  useEffect(() => {
+    if (!sessionId) return
+    const active = readActiveRequest(sessionId)
+    if (!active) return
+    const controller = new AbortController()
+    setBusy(true)
+    setError('')
+    setRequestProgress({
+      requestId: active.requestId,
+      traceId: active.traceId,
+      clientRequestId: active.clientRequestId,
+      sessionId: active.sessionId,
+      kind: active.kind,
+      status: 'running',
+      steps: [],
+    })
+    void waitForRequest(active.requestId, {
+      signal: controller.signal,
+      onUpdate: setRequestProgress,
+      onConnectionChange: setPollReconnecting,
+    })
+      .then(async (completed) => {
+        forgetActiveRequest(sessionId, active.requestId)
+        const ok = completed.status === 'succeeded' || completed.status === 'cancelled'
+        recordRequest({
+          clientRequestId: active.clientRequestId,
+          requestId: completed.requestId,
+          traceId: completed.traceId,
+          kind: active.kind === 'cancel' ? 'cancel' : 'chat',
+          status: ok ? 'ok' : 'error',
+          at: new Date().toISOString(),
+        })
+        if (!ok || !completed.result) {
+          const restored = await fetchSessionSnapshot(sessionId, controller.signal).catch(
+            () => null,
+          )
+          if (controller.signal.aborted) return
+          if (restored) {
+            setSession(restored)
+            setMessages((current) => mapSessionMessages(restored, current))
+          }
+          setError(completed.errorCode ?? `AI request ${completed.status}`)
+          return
+        }
+        const result = completed.result
+        setSession(result.session)
+        setMessages((current) => mapSessionMessages(result.session, current))
+        maybeRedirectToScene(active.kind === 'confirm' ? { action: 'confirm' } : {}, result.session)
+      })
+      .catch(async (resumeError: unknown) => {
+        if (controller.signal.aborted) return
+        if (resumeError instanceof RequestStatusError && resumeError.permanent) {
+          forgetActiveRequest(sessionId, active.requestId)
+          const restored = await fetchSessionSnapshot(sessionId, controller.signal).catch(
+            () => null,
+          )
+          if (controller.signal.aborted) return
+          if (restored) {
+            setSession(restored)
+            setMessages((current) => mapSessionMessages(restored, current))
+          }
+        }
+        setError(resumeError instanceof Error ? resumeError.message : String(resumeError))
+      })
+      .finally(() => {
+        if (controller.signal.aborted) return
+        setBusy(false)
+        setRequestProgress((current) => (current?.requestId === active.requestId ? null : current))
+        setPollReconnecting(false)
+      })
+    return () => {
+      controller.abort()
+      setBusy(false)
+      setRequestProgress((current) => (current?.requestId === active.requestId ? null : current))
+      setPollReconnecting(false)
+    }
+  }, [maybeRedirectToScene, recordRequest, sessionId, waitForRequest])
 
   const callAgent = useCallback(
     async (body: Record<string, unknown>) => {
@@ -252,7 +517,29 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
           clearPendingSubmission()
           throw new Error(accepted.error ?? `AI request failed (${response.status})`)
         }
-        const completed = await waitForRequest(accepted.requestId)
+        const requestKind: RequestKind =
+          body.action === 'confirm' ? 'confirm' : body.action === 'cancel' ? 'cancel' : 'chat'
+        rememberActiveRequest({
+          requestId: accepted.requestId,
+          traceId: accepted.traceId,
+          clientRequestId,
+          sessionId,
+          kind: requestKind,
+        })
+        setRequestProgress({
+          requestId: accepted.requestId,
+          traceId: accepted.traceId,
+          clientRequestId,
+          sessionId,
+          kind: requestKind,
+          status: accepted.status,
+          steps: [],
+        })
+        const completed = await waitForRequest(accepted.requestId, {
+          onUpdate: setRequestProgress,
+          onConnectionChange: setPollReconnecting,
+        })
+        forgetActiveRequest(sessionId, accepted.requestId)
         clearPendingSubmission()
         const ok = completed.status === 'succeeded' || completed.status === 'cancelled'
         recordRequest({
@@ -269,10 +556,7 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
         }
         const payload = completed.result
         setSession(payload.session)
-        setMessages((current) => [
-          ...current,
-          { id: crypto.randomUUID(), role: 'assistant', content: payload.reply },
-        ])
+        setMessages((current) => mapSessionMessages(payload.session, current))
         maybeRedirectToScene(body, payload.session)
         return true
       } catch (requestError) {
@@ -288,10 +572,17 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
             at: new Date().toISOString(),
           })
         }
+        if (requestId && requestError instanceof RequestStatusError && requestError.permanent) {
+          forgetActiveRequest(sessionId, requestId)
+        }
         setError(requestError instanceof Error ? requestError.message : String(requestError))
         return false
       } finally {
         setBusy(false)
+        setRequestProgress((current) =>
+          !requestId || current?.requestId === requestId ? null : current,
+        )
+        setPollReconnecting(false)
       }
     },
     [maybeRedirectToScene, recordRequest, sceneId, sessionId, waitForRequest],
@@ -338,7 +629,17 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
         clearPendingSubmission()
         throw new Error(accepted.error ?? `Cancel failed (${response.status})`)
       }
-      const completed = await waitForRequest(accepted.requestId)
+      rememberActiveRequest({
+        requestId: accepted.requestId,
+        traceId: accepted.traceId,
+        clientRequestId,
+        sessionId,
+        kind: 'cancel',
+      })
+      const completed = await waitForRequest(accepted.requestId, {
+        onConnectionChange: setPollReconnecting,
+      })
+      forgetActiveRequest(sessionId, accepted.requestId)
       clearPendingSubmission()
       const ok = completed.status === 'succeeded' || completed.status === 'cancelled'
       recordRequest({
@@ -351,10 +652,11 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
       })
       recorded = true
       if (completed.result) {
-        setSession(completed.result.session)
-        setMessages(mapSessionMessages(completed.result.session))
+        const result = completed.result
+        setSession(result.session)
+        setMessages((current) => mapSessionMessages(result.session, current))
       }
-    } catch {
+    } catch (cancelError) {
       // Best-effort: the in-flight request will still surface the outcome.
       if (!recorded) {
         recordRequest({
@@ -366,8 +668,15 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
           at: new Date().toISOString(),
         })
       }
+      if (requestId && cancelError instanceof RequestStatusError && cancelError.permanent) {
+        forgetActiveRequest(sessionId, requestId)
+      }
     } finally {
       setCancelling(false)
+      setRequestProgress((current) =>
+        !requestId || current?.requestId === requestId ? null : current,
+      )
+      setPollReconnecting(false)
     }
   }, [cancelling, recordRequest, sceneId, sessionId, waitForRequest])
 
@@ -457,6 +766,7 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
     }
     const storageKey = `pascal-ai-session:${sceneId ?? 'local-editor'}`
     window.localStorage.removeItem(storageKey)
+    forgetActiveRequest(sessionId)
     pendingChatSubmissionRef.current = null
     pendingCancelSubmissionRef.current = null
     setSessionId(createSessionId(sceneId))
@@ -465,14 +775,22 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
     setError('')
   }, [busy, sceneId, sessionId])
 
+  const visiblePhase = requestProgress?.sessionPhase ?? session?.phase
+  const visibleProgressSteps = requestProgress ? latestWorkflowSteps(requestProgress.steps) : []
+  const canStopActiveRequest =
+    busy &&
+    !cancelling &&
+    requestProgress?.kind !== 'cancel' &&
+    (visiblePhase === 'generating' || visiblePhase === 'modifying')
+
   return (
     <div className="flex h-full min-h-0 flex-col bg-background">
       <header className="flex h-11 shrink-0 items-center gap-2 border-border/70 border-b px-3">
         <Bot className="h-4 w-4 shrink-0" aria-hidden />
         <span className="truncate font-medium text-sm">AI Floor Plan Designer</span>
-        {session && (
+        {visiblePhase && (
           <span className="ml-auto rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground">
-            {phaseLabel(session.phase)}
+            {phaseLabel(visiblePhase)}
           </span>
         )}
         <button
@@ -508,17 +826,15 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
             {message.content}
           </div>
         ))}
-        {busy && (
+        {(busy || cancelling) && (
           <div className="flex items-center gap-2 text-muted-foreground text-xs">
             <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
             <span>
-              {session?.phase === 'generating'
-                ? 'Generating and checking the scene…'
-                : session?.phase === 'modifying'
-                  ? 'Modifying and checking the scene…'
-                  : 'Understanding your requirements…'}
+              {cancelling
+                ? 'Stopping the current request…'
+                : requestProgressLabel(requestProgress, pollReconnecting, visiblePhase)}
             </span>
-            {(session?.phase === 'generating' || session?.phase === 'modifying') && (
+            {canStopActiveRequest && (
               <button
                 className="ml-auto flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs hover:bg-muted disabled:opacity-50"
                 disabled={cancelling}
@@ -534,7 +850,20 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
         {error && (
           <p className="rounded-lg bg-destructive/10 px-3 py-2 text-destructive text-xs">{error}</p>
         )}
-        {(session?.executionSteps?.length ?? 0) > 0 && (
+        {(busy || cancelling) && visibleProgressSteps.length > 0 && (
+          <div className="space-y-1 rounded-xl border border-border/70 bg-muted/20 p-3 text-xs">
+            {visibleProgressSteps.map((step) => (
+              <div className="flex items-center gap-2" key={step.operationKey}>
+                <WorkflowStepIcon status={step.status} />
+                <span>{workflowStepLabel(step.operationKey)}</span>
+                {step.attemptNo > 1 && (
+                  <span className="text-muted-foreground">attempt {step.attemptNo}</span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        {!busy && !cancelling && (session?.executionSteps?.length ?? 0) > 0 && (
           <div className="space-y-1 rounded-xl border border-border/70 bg-muted/20 p-3 text-xs">
             {session?.executionSteps?.map((step) => (
               <div className="flex items-center gap-2" key={step.phase}>
@@ -700,4 +1029,55 @@ function phaseLabel(phase: Phase): string {
     cancelled: 'Cancelled',
     failed: 'Needs attention',
   }[phase]
+}
+
+function latestWorkflowSteps(steps: WorkflowStepProgress[]): WorkflowStepProgress[] {
+  const latest = new Map<string, WorkflowStepProgress>()
+  for (const step of steps) latest.set(step.operationKey, step)
+  return [...latest.values()]
+}
+
+function workflowStepLabel(operationKey: string): string {
+  if (operationKey.startsWith('repair:')) {
+    return `Repairing detected issues (round ${operationKey.slice('repair:'.length)})`
+  }
+  return (
+    {
+      plan: 'Planning the layout',
+      scaffold: 'Creating the scene',
+      'structure-openings': 'Building rooms, walls, doors, and windows',
+      furniture: 'Placing furniture',
+      gates: 'Checking requirements',
+      verification: 'Verifying the scene',
+      modify: 'Applying requested changes',
+      'modify-plan': 'Planning requested changes',
+    }[operationKey] ?? operationKey
+  )
+}
+
+function requestProgressLabel(
+  progress: RequestStatusResponse | null,
+  reconnecting: boolean,
+  phase?: Phase,
+): string {
+  if (reconnecting) return 'Connection interrupted. Reconnecting to the running request…'
+  if (progress?.status === 'queued') return 'Waiting in the AI request queue…'
+  if (progress?.kind === 'cancel') return 'Stopping the current request…'
+  const runningStep = [...(progress?.steps ?? [])]
+    .reverse()
+    .find((step) => step.status === 'running')
+  if (runningStep) return `${workflowStepLabel(runningStep.operationKey)}…`
+  if (phase === 'generating') return 'Generating and checking the scene…'
+  if (phase === 'modifying') return 'Modifying and checking the scene…'
+  if (phase === 'inspecting') return 'Inspecting the current scene…'
+  return 'Understanding your requirements…'
+}
+
+function WorkflowStepIcon({ status }: { status: WorkflowStepStatus }) {
+  if (status === 'running') {
+    return <LoaderCircle className="h-3 w-3 animate-spin text-blue-600" aria-hidden />
+  }
+  if (status === 'succeeded') return <span className="text-green-600">✓</span>
+  if (status === 'failed_recoverable') return <span className="text-amber-600">!</span>
+  return <span className="text-destructive">×</span>
 }

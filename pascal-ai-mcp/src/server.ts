@@ -255,7 +255,7 @@ async function handle(request: Request): Promise<Response> {
     const requestId = decodeURIComponent(requestMatch[1] ?? '')
     const record = requests.find(requestId)
     if (!record) return json({ error: 'request_not_found' }, 404)
-    const session = record.result ? agent.getSession(record.result.sessionId) : undefined
+    const session = sessions.load(record.sessionId)?.session
     const steps = workflowSteps.findByRequestId(requestId)
     return json({
       requestId: record.requestId,
@@ -270,6 +270,7 @@ async function handle(request: Request): Promise<Response> {
       ...(record.startedAt ? { startedAt: record.startedAt } : {}),
       ...(record.completedAt ? { completedAt: record.completedAt } : {}),
       ...(record.errorCode ? { errorCode: record.errorCode } : {}),
+      ...(session ? { sessionPhase: session.phase } : {}),
       steps,
       ...(record.result && session ? {
         result: { reply: record.result.reply, session },

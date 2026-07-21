@@ -159,7 +159,11 @@
 - 依赖：T2.1。
 - 依据：§5.2。
 
-### [ ] T2.3 前端进度事件
+### [x] T2.3 前端进度事件
+- 完成于 2026-07-21。采用现有 `GET /requests/:id` 的可恢复快照轮询，而非新增 SSE 长连接：响应在 request 状态和 `workflow_steps` 之外补当前持久化 `sessionPhase`，前端每 750ms 拉取一次，把 queued、plan、scaffold、structure-openings、furniture、gates、verification、repair:N、modify/modify-plan 映射为用户可读的实时阶段和逐步状态；重复 operation 只展示最新 attempt，失败/取消/可恢复失败有不同图标。最终 `session.executionSteps` 仍作为完成后的结果摘要，两者不形成第二套任务真相源。
+- 断线恢复：轮询遇到网络错误、429 或 5xx 不结束任务，显示“正在重连”并以 750ms→5s 有界退避自动续查；明确 4xx 才停止。收到 202 后把当前 `requestId/traceId/clientRequestId/sessionId/kind` 写入按 session 隔离的 localStorage 引用，刷新页面后自动恢复轮询、追到终态并从服务端 session 重建消息；引用不保存问题、回答或图片。终态或明确 request 不存在时删除引用，模糊网络失败继续保留。Next 代理沿用无缓冲 GET 转发，不新增长连接与内存队列。
+- 复审收口：request 状态查询只读 SQLite session 快照，不触发 stale recovery 写入；已有 queued request 也会阻止启动期 stale recovery，避免待续跑 session 被提前降级；取消请求进入同一套断线重试和刷新续查链路，但以独立 `cancelling` 状态展示，避免与主请求轮询争抢步骤进度造成界面闪烁；effect 切换时显式清理 busy/progress 状态；服务端消息重建时仅在当前页面内保留图片文件名标注，不把文件名写入 session 或 localStorage。
+- 验证：真实 server 集成测试预置 running confirm request + generating session + running structure-openings step，断言 `/requests/:id` 同时返回 request 状态、`sessionPhase` 与步骤快照；编辑器组件通过 TypeScript（该文件零错误）、Biome format/lint，AI 端 `check-types` 干净。完整回归测试保持全绿。
 - 内容：`GET /requests/:id/events`（SSE）或前端轮询 `GET /requests/:id`，替换现在"发出后干等 + 空响应再读 session 猜结果"的交互；phase 变化实时反映到 AI 气泡（可复用 workflow_steps 数据）。
 - 涉及：`src/server.ts`、`apps/editor/components/ai-assistant-bubble.tsx`、代理路由。
 - 完成标准：生成过程中 UI 按阶段更新；断网重连后状态自动追上。

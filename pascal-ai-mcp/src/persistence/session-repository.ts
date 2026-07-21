@@ -495,9 +495,15 @@ export class ChatRequestRepository implements ChatRequestWriter {
     `)
     this.liveWorkerBySessionStatement = database.connection.prepare(`
       SELECT 1 FROM ai_requests
-      WHERE session_id = ? AND status = 'running'
-        AND owner_instance_id LIKE 'worker:%'
-        AND lease_expires_at > ?
+      WHERE session_id = ?
+        AND (
+          status = 'queued'
+          OR (
+            status = 'running'
+            AND owner_instance_id LIKE 'worker:%'
+            AND lease_expires_at > ?
+          )
+        )
       LIMIT 1
     `)
     this.activeBySessionStatement = database.connection.prepare(`

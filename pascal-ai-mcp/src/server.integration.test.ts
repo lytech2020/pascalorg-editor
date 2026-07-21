@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AppDatabase } from './persistence/database'
 import { ChatRequestRepository, SqliteSessionPersistence } from './persistence/session-repository'
+import { WorkflowStepRepository } from './persistence/workflow-step-repository'
 import type { WorkflowSession } from './types'
 
 interface HttpResult {
@@ -114,14 +115,18 @@ async function startServer(dataDir: string, extraEnv: Record<string, string> = {
   return { proc, port }
 }
 
-function seedSession(dataDir: string, sessionId: string): void {
+function seedSession(
+  dataDir: string,
+  sessionId: string,
+  phase: WorkflowSession['phase'] = 'cancelled',
+): void {
   const database = new AppDatabase(join(dataDir, 'ai.db'))
   try {
     const now = new Date().toISOString()
     const session: WorkflowSession = {
       sessionId,
       inputType: 'text',
-      phase: 'cancelled',
+      phase,
       availability: 'partially_usable',
       brief: {
         existingCondition: [], designGoals: [], hardConstraints: [],
@@ -313,6 +318,40 @@ describe('server request identity (T1.3)', () => {
       const queuedDatabase = new AppDatabase(join(dataDir, 'ai.db'))
       try {
         const queue = new ChatRequestRepository(queuedDatabase)
+        const sessionPersistence = new SqliteSessionPersistence(queuedDatabase)
+        const progressSession: WorkflowSession = {
+          sessionId: 'progress-template-gate',
+          inputType: 'text',
+          phase: 'generating',
+          availability: 'usable',
+          brief: {
+            existingCondition: [], designGoals: [], hardConstraints: [],
+            assumptions: [], uncertainties: [], conflicts: [],
+          },
+          questions: [], reasons: [], summary: '', messages: [],
+          clarificationRounds: 0,
+          createdAt: '2026-07-21T00:00:00.000Z',
+          updatedAt: '2026-07-21T00:00:00.000Z',
+        }
+        sessionPersistence.save(progressSession, 0)
+        queue.enqueue({
+          requestId: 'preexisting-progress-request',
+          traceId: 'preexisting-progress-trace',
+          sessionId: 'progress-template-gate',
+          kind: 'confirm',
+          startedAt: '2026-07-21T00:00:00.000Z',
+        }, { sessionId: 'progress-template-gate', action: 'confirm' }, 10)
+        queue.claimNext(
+          'worker:still-alive',
+          '2026-07-21T00:00:00.000Z',
+          '2099-07-21T00:00:00.000Z',
+        )
+        new WorkflowStepRepository(queuedDatabase).start({
+          requestId: 'preexisting-progress-request',
+          sessionId: 'progress-template-gate',
+          operationKey: 'structure-openings',
+          startedAt: '2026-07-21T00:00:01.000Z',
+        })
         queue.enqueue({
           requestId: 'preexisting-expired-request',
           traceId: 'preexisting-expired-trace',
@@ -332,6 +371,17 @@ describe('server request identity (T1.3)', () => {
           kind: 'chat',
           startedAt: new Date().toISOString(),
         }, { sessionId: 'template-gate', message: 'queued before template validation' }, 10)
+        sessionPersistence.save({
+          ...progressSession,
+          sessionId: 'queued-progress-template-gate',
+        }, 0)
+        queue.enqueue({
+          requestId: 'preexisting-queued-progress-request',
+          traceId: 'preexisting-queued-progress-trace',
+          sessionId: 'queued-progress-template-gate',
+          kind: 'confirm',
+          startedAt: new Date().toISOString(),
+        }, { sessionId: 'queued-progress-template-gate', action: 'confirm' }, 10)
       } finally {
         queuedDatabase.close()
       }
@@ -352,6 +402,28 @@ describe('server request identity (T1.3)', () => {
         expect(payload.error).toBe('template_library_unavailable')
         expect(payload.requestId).toMatch(/^[0-9a-f-]{36}$/)
         expect(responseHeader(response, 'x-request-id')).toBe(payload.requestId ?? '')
+        const progress = await requestHttp(`${base}/requests/preexisting-progress-request`)
+        expect(progress.status).toBe(200)
+        expect(JSON.parse(progress.body)).toMatchObject({
+          requestId: 'preexisting-progress-request',
+          kind: 'confirm',
+          status: 'running',
+          sessionPhase: 'generating',
+          steps: [{
+            operationKey: 'structure-openings',
+            attemptNo: 1,
+            status: 'running',
+          }],
+        })
+        const queuedProgress = await requestHttp(
+          `${base}/requests/preexisting-queued-progress-request`,
+        )
+        expect(queuedProgress.status).toBe(200)
+        expect(JSON.parse(queuedProgress.body)).toMatchObject({
+          requestId: 'preexisting-queued-progress-request',
+          status: 'queued',
+          sessionPhase: 'generating',
+        })
         await Bun.sleep(100)
         const queuedAudit = new Database(join(dataDir, 'ai.db'), { readonly: true, strict: true })
         try {
@@ -363,6 +435,12 @@ describe('server request identity (T1.3)', () => {
           `).get('preexisting-expired-request')).toEqual({
             status: 'failed', error_code: 'process_interrupted',
           })
+          expect(queuedAudit.query(`
+            SELECT version, phase FROM ai_sessions WHERE session_id = ?
+          `).get('queued-progress-template-gate')).toEqual({ version: 1, phase: 'generating' })
+          expect(queuedAudit.query(`
+            SELECT COUNT(*) AS count FROM ai_messages WHERE session_id = ?
+          `).get('queued-progress-template-gate')).toEqual({ count: 0 })
         } finally {
           queuedAudit.close()
         }
