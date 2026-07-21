@@ -30,6 +30,7 @@ import { ModelCallRepository } from '../src/persistence/model-call-repository'
 import { ChatRequestRepository, SqliteSessionPersistence } from '../src/persistence/session-repository'
 import { SqliteModelAttemptRecorder } from '../src/telemetry/model-attempt-recorder'
 import { WorkflowStepRepository } from '../src/persistence/workflow-step-repository'
+import { SceneBuildRepository } from '../src/persistence/scene-build-repository'
 import type { ChatInput, ChatResult, PhaseToolTrace, SceneResult, WorkflowPhase } from '../src/types'
 import {
   canConfirmFromPhase,
@@ -840,9 +841,10 @@ async function main(): Promise<void> {
   sessions.importLegacyFile(config.sessionFile)
   const requests = new ChatRequestRepository(database)
   const workflowSteps = new WorkflowStepRepository(database)
+  const sceneBuilds = new SceneBuildRepository(database)
   const mcp = new PascalMcpClient(config)
   await mcp.connect()
-  const agent = new PascalAiAgent(config, mcp, modelAttempts, sessions, requests, workflowSteps)
+  const agent = new PascalAiAgent(config, mcp, modelAttempts, sessions, requests, workflowSteps, sceneBuilds)
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
   const reportDir = join(REPORT_ROOT, timestamp)

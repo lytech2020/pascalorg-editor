@@ -17,6 +17,7 @@ import { RequestWorker } from './request-worker'
 import { SqliteModelAttemptRecorder } from './telemetry/model-attempt-recorder'
 import { loadTemplateLibrary, templateLibraryAllowsTraffic } from './template-seed'
 import { WorkflowStepRepository } from './persistence/workflow-step-repository'
+import { SceneBuildRepository } from './persistence/scene-build-repository'
 
 const config = loadConfig()
 const database = new AppDatabase(config.databaseFile)
@@ -28,6 +29,7 @@ if (legacySessions.status === 'imported') {
 }
 const requests = new ChatRequestRepository(database)
 const workflowSteps = new WorkflowStepRepository(database)
+const sceneBuilds = new SceneBuildRepository(database)
 const templateLibrary = loadTemplateLibrary(config.templatesDir)
 const templatesAcceptTraffic = templateLibraryAllowsTraffic(templateLibrary.health)
 const templateHealthSummary = {
@@ -46,13 +48,13 @@ if (templateLibrary.health.failures.length > 0) {
 const mcp = new PascalMcpClient(config)
 await mcp.connect()
 
-const agent = new PascalAiAgent(config, mcp, modelAttempts, sessions, requests, workflowSteps)
+const agent = new PascalAiAgent(config, mcp, modelAttempts, sessions, requests, workflowSteps, sceneBuilds)
 const requestPayloads = new RequestPayloadStore(config.requestArtifactsDir)
 const worker = new RequestWorker(requests, sessions, requestPayloads, agent, {
   concurrency: config.requestWorkerConcurrency,
   leaseMs: config.requestLeaseMs,
   pollMs: config.requestWorkerPollMs,
-}, workflowSteps)
+}, workflowSteps, sceneBuilds)
 if (templatesAcceptTraffic) worker.start()
 else worker.recoverExpired()
 // Keep Bun's transport safety cap above the application limit so ordinary
@@ -257,6 +259,7 @@ async function handle(request: Request): Promise<Response> {
     if (!record) return json({ error: 'request_not_found' }, 404)
     const session = sessions.load(record.sessionId)?.session
     const steps = workflowSteps.findByRequestId(requestId)
+    const sceneBuild = sceneBuilds.findByRequestId(requestId)
     return json({
       requestId: record.requestId,
       traceId: record.traceId,
@@ -272,6 +275,15 @@ async function handle(request: Request): Promise<Response> {
       ...(record.errorCode ? { errorCode: record.errorCode } : {}),
       ...(session ? { sessionPhase: session.phase } : {}),
       steps,
+      ...(sceneBuild ? {
+        sceneBuild: {
+          buildId: sceneBuild.buildId,
+          status: sceneBuild.status,
+          ...(sceneBuild.sceneId ? { sceneId: sceneBuild.sceneId } : {}),
+          ...(sceneBuild.errorCode ? { errorCode: sceneBuild.errorCode } : {}),
+          cleanupAttempts: sceneBuild.cleanupAttempts,
+        },
+      } : {}),
       ...(record.result && session ? {
         result: { reply: record.result.reply, session },
       } : {}),

@@ -172,6 +172,9 @@
 - 顺带解决：既有备忘中的"运行中无进度流"。
 
 ### [ ] T2.4 场景写入的版本边界与失败清理
+- 进展（2026-07-21，MCP 约束内安全部分已完成）：能力矩阵见 `SCENE_WRITE_SAFETY.md`。migration v6 新增 `scene_builds`，fresh build 在创建前登记 request/trace/session，拿到 sceneId 后立即记录，并持续刷新权威 version + graphHash；失败、取消及父 request 已终态的崩溃残留统一标记 abandoned，`GET /requests/:id` 返回脱敏的 sceneBuild 状态/sceneId/清理次数。`bun run scenes:cleanup -- --execute` 仅在 version 与 graphHash 同时未变化时带 `expectedVersion` 删除，场景已不存在视为幂等成功，已保存边界变化、边界缺失、CAS 冲突或 MCP 错误均保留为 cleanup_failed，绝不强删；命令默认仅 dry-run，执行前必须停正常流量并确认场景无人编辑，因为未保存的浏览器草稿不受 store version CAS 保护。
+- 原场景的 plan-first 结构重建一旦开始删除节点，后续失败/取消会明确提示“可能部分修改、当前无法 checkpoint restore”，并清除 pending 操作、禁用确认式自动重试；此前“可恢复旧版本”“未保存所以原场景不变”的误导文案已移除。队列 worker 对同 session/scene 的排他继续由 `ai_requests` DB claim/lease 提供，CLI/eval 直连路径仍不在该保证内。
+- **尚未完成/阻塞**：现有 MCP 没有 restore-to-version、隐藏 staging/publish-swap 或幂等 scene creation key；semantic 写入直接影响 browser-visible draft。因此不能满足“原 scene 权威恢复”或“fresh scene 构建期间未发布”的完整验收，也无法消除 MCP 创建成功与 AI DB 写入 sceneId 之间的跨库崩溃缝隙。按本任务禁令保持 `[ ]`，需先确认解除 `packages/mcp` 约束并补正式能力，禁止用 `get_scene + delete_node` 补偿冒充完成。
 - 内容：①先形成 scene capability matrix：当前是否支持权威 scene version、compare-and-swap、checkpoint/restore、批量原子写、幂等 operation key；②有正式能力时，施工前记录 scene version/checkpoint，失败时回滚或标记；③能力不足时，fresh build 优先采用“新 scene 构建成功后再发布/切换”，失败 scene 作为 abandoned 记录到 DB 并由幂等清理命令处理；对原 scene 的 destructive rebuild 必须显式标为不可原子回滚并要求用户确认/禁用自动重试；④同 scene 并发请求用 DB 锁/租约取代进程内 `sessionLocks`。**禁止把 `get_scene + delete_node` 当作通用回滚方案**：它不能恢复原 ID、引用、metadata 和并发期间的第三方改动。若缺必要能力，本任务先停在设计/约束结论，再申请解除 ⚠️MCP 约束，不能用危险补偿假装完成。
 - 涉及：`src/agent.ts`（rebuildScenePlanFirst、clearLevelChildren 一带）、`src/persistence/`。
 - 完成标准：注入一次施工中途失败，原 scene 要么通过权威 checkpoint 回到施工前版本，要么保持未发布状态；新建半成品被持久标记并可幂等清理。系统不得把部分 delete/recreate 宣称为成功回滚，用户能看到明确状态和下一步。

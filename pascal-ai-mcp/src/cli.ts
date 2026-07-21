@@ -8,6 +8,7 @@ import { ModelCallRepository } from './persistence/model-call-repository'
 import { ChatRequestRepository, SqliteSessionPersistence } from './persistence/session-repository'
 import { SqliteModelAttemptRecorder } from './telemetry/model-attempt-recorder'
 import { WorkflowStepRepository } from './persistence/workflow-step-repository'
+import { SceneBuildRepository } from './persistence/scene-build-repository'
 
 const config = loadConfig()
 const database = new AppDatabase(config.databaseFile)
@@ -16,10 +17,11 @@ const sessions = new SqliteSessionPersistence(database)
 sessions.importLegacyFile(config.sessionFile)
 const requests = new ChatRequestRepository(database)
 const workflowSteps = new WorkflowStepRepository(database)
+const sceneBuilds = new SceneBuildRepository(database)
 const mcp = new PascalMcpClient(config)
 await mcp.connect()
 
-const agent = new PascalAiAgent(config, mcp, modelAttempts, sessions, requests, workflowSteps)
+const agent = new PascalAiAgent(config, mcp, modelAttempts, sessions, requests, workflowSteps, sceneBuilds)
 const sessionId = process.env.AI_MCP_CLI_SESSION || 'cli'
 const rl = createInterface({ input, output })
 

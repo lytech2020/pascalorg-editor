@@ -18,6 +18,7 @@ describe('AppDatabase migrations', () => {
         { version: 3, name: 'turn_ai_requests_into_durable_queue' },
         { version: 4, name: 'add_request_idempotency_and_workflow_steps' },
         { version: 5, name: 'index_running_workflow_steps' },
+        { version: 6, name: 'track_fresh_scene_build_lifecycle' },
       ])
       expect(
         first.connection.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ai_model_calls'").get(),
@@ -27,7 +28,7 @@ describe('AppDatabase migrations', () => {
       const reopened = new AppDatabase(file)
       expect(
         reopened.connection.query('SELECT COUNT(*) AS count FROM schema_migrations').get(),
-      ).toEqual({ count: 5 })
+      ).toEqual({ count: 6 })
       reopened.close()
     } finally {
       rmSync(dir, { recursive: true, force: true })

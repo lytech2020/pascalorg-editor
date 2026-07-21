@@ -9,6 +9,7 @@ import type {
 import { RequestPayloadStore } from './request-payload-store'
 import type { ChatInput, ChatResult } from './types'
 import type { WorkflowStepWriter } from './persistence/workflow-step-repository'
+import type { SceneBuildWriter } from './persistence/scene-build-repository'
 
 export type RequestWorkerOptions = {
   concurrency: number
@@ -35,6 +36,7 @@ export class RequestWorker {
     private readonly executor: ChatExecutor,
     private readonly options: RequestWorkerOptions,
     private readonly workflowSteps?: WorkflowStepWriter,
+    private readonly sceneBuilds?: SceneBuildWriter,
   ) {}
 
   start(): void {
@@ -47,6 +49,7 @@ export class RequestWorker {
   recoverExpired(): void {
     this.failExpiredRequests()
     this.reconcileOrphanedSteps()
+    this.reconcileOrphanedSceneBuilds()
     this.nextOrphanStepSweepAt = Date.now() + ORPHAN_STEP_SWEEP_INTERVAL_MS
   }
 
@@ -82,6 +85,7 @@ export class RequestWorker {
       this.failExpiredRequests()
       if (Date.now() >= this.nextOrphanStepSweepAt) {
         this.reconcileOrphanedSteps()
+        this.reconcileOrphanedSceneBuilds()
         this.nextOrphanStepSweepAt = Date.now() + ORPHAN_STEP_SWEEP_INTERVAL_MS
       }
       while (this.accepting && this.active.size < this.options.concurrency) {
@@ -221,6 +225,15 @@ export class RequestWorker {
       if (recovered > 0) console.warn(`recovered ${recovered} orphaned workflow step(s)`)
     } catch (error) {
       console.error(`orphaned workflow step reconciliation failed: ${errorMessage(error)}`)
+    }
+  }
+
+  private reconcileOrphanedSceneBuilds(): void {
+    try {
+      const recovered = this.sceneBuilds?.abandonOrphaned(new Date().toISOString()) ?? 0
+      if (recovered > 0) console.warn(`recovered ${recovered} orphaned scene build(s)`)
+    } catch (error) {
+      console.error(`orphaned scene build reconciliation failed: ${errorMessage(error)}`)
     }
   }
 

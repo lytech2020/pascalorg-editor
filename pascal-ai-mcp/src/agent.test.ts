@@ -1110,6 +1110,18 @@ describe('staleSessionRecovery（stuck 状态守卫）', () => {
     })
   })
 
+  test('破坏性重建中断后禁止自动重试', () => {
+    expect(staleSessionRecovery({
+      phase: 'modifying',
+      pendingModification: '删除次卧并重排',
+      sceneResult,
+      destructiveSceneWriteStarted: true,
+    })).toEqual({
+      phase: 'completed_with_issues',
+      template: 'staleDestructive',
+    })
+  })
+
   test('inspecting 卡死 → 按有无场景回落；等待型/终态 phase 不动', () => {
     expect(staleSessionRecovery({ ...base, phase: 'inspecting', sceneResult })?.phase).toBe('completed_with_issues')
     expect(staleSessionRecovery({ ...base, phase: 'inspecting' })?.phase).toBe('failed')

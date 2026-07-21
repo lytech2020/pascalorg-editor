@@ -51,14 +51,19 @@ export const MESSAGES = {
     p => `The floor plan was generated and passed all automated checks.${p.url ? `\nOpen the scene: ${p.url}` : ''}`,
   ),
   generateCancelled: def<Record<string, never>>(
-    () => '已在生成过程中取消。未完成的半成品不会保存到你的项目，已确认的需求仍然保留，可以稍后重新生成。',
-    () => '生成をキャンセルしました。未完成のシーンはプロジェクトに保存されません。確認済みの要件は保持されているため、後で再生成できます。',
-    () => 'Generation was cancelled. The unfinished scene will not be saved to your project; your confirmed requirements are preserved, so you can regenerate later.',
+    () => '已在生成过程中取消。若已创建半成品，它会被标记为废弃并等待安全清理，不会作为本次结果交付；已确认的需求仍然保留。',
+    () => '生成をキャンセルしました。作成済みの未完成シーンは破棄対象として記録され、安全なクリーンアップを待ちます。今回の結果としては使用されません。確認済みの要件は保持されています。',
+    () => 'Generation was cancelled. Any partial scene already created is recorded as abandoned for safe cleanup and will not be delivered as the result; your confirmed requirements are preserved.',
   ),
   generateFailed: def<{ error: string }>(
     p => `户型生成失败：${p.error}。已确认的结构化需求仍然保留，可以稍后重试。`,
     p => `間取りの生成に失敗しました：${p.error}。確認済みの要件は保持されています。後で再度お試しください。`,
     p => `Floor plan generation failed: ${p.error}. Your confirmed requirements are preserved — please try again later.`,
+  ),
+  generateAbandonedScene: def<{ sceneId: string }>(
+    p => `半成品场景 ${p.sceneId} 已持久标记为废弃。管理员可在停止正常流量、确认无人编辑后运行 bun run scenes:cleanup -- --execute；已保存边界发生变化时清理会拒绝删除。`,
+    p => `未完成のシーン ${p.sceneId} は破棄対象として記録されました。管理者は通常トラフィックを停止し、誰も編集中でないことを確認してから bun run scenes:cleanup -- --execute を実行できます。保存済み境界が変わっていれば削除は拒否されます。`,
+    p => `Partial scene ${p.sceneId} was persistently marked abandoned. After stopping normal traffic and confirming nobody is editing it, an administrator can run bun run scenes:cleanup -- --execute; cleanup refuses deletion when the saved boundary changed.`,
   ),
   modifySuccess: def<Record<string, never>>(
     () => '已按你的要求修改当前户型，并通过自动检查。',
@@ -85,6 +90,11 @@ export const MESSAGES = {
     p => `シーンの修正に失敗しました：${p.error}。元のシーンは保持されています。修正内容をもう一度入力してください。`,
     p => `Scene modification failed: ${p.error}. The original scene is preserved — please describe the change again.`,
   ),
+  modifyDestructiveFailed: def<{ sceneId: string; error: string }>(
+    p => `场景 ${p.sceneId} 的结构重建在写入开始后失败：${p.error}。当前接口不支持权威 checkpoint 恢复，场景可能处于部分修改状态；系统已禁止自动重试。请先在编辑器中检查该场景，再决定手工修复或重新生成。`,
+    p => `シーン ${p.sceneId} の構造再構築は書き込み開始後に失敗しました：${p.error}。現在のインターフェースには正式なチェックポイント復元機能がないため、シーンが部分的に変更されている可能性があります。自動再試行は無効化しました。エディタで確認してから、手動修正または再生成を選んでください。`,
+    p => `Structural rebuild of scene ${p.sceneId} failed after writes began: ${p.error}. The current interface has no authoritative checkpoint restore, so the scene may be partially modified; automatic retry has been disabled. Inspect it in the editor before choosing manual repair or regeneration.`,
+  ),
   modifyDriftWarning: def<Record<string, never>>(
     () => '检测到当前场景与原规划之间存在手动修改的差异。继续执行这次结构修改会按新规划重建结构，手动改动可能被覆盖（家具类修改不受影响）。发送确认以继续，或重新描述修改需求。',
     () => '現在のシーンと元のプランに手動編集による差分が検出されました。この構造修正を続行すると新しいプランに基づいて再構築され、手動の変更は上書きされる可能性があります（家具の変更は影響を受けません）。続行するには確認を送信するか、修正内容を改めて入力してください。',
@@ -101,9 +111,9 @@ export const MESSAGES = {
     p => `${p.count} other completion note(s) are unrelated to this change (pre-existing, or the result of removals you requested) and were not counted against it.`,
   ),
   modifyPreviousVersion: def<{ version: number }>(
-    p => `修改前的场景版本为 v${p.version}，如需回滚可恢复该版本。`,
-    p => `修正前のシーンバージョンは v${p.version} です。必要であればこのバージョンに戻せます。`,
-    p => `The scene version before this change was v${p.version}; restore it to roll back if needed.`,
+    p => `修改前的场景版本为 v${p.version}（仅作审计记录；当前接口不支持自动恢复到该版本）。`,
+    p => `修正前のシーンバージョンは v${p.version} です（監査用の記録のみ。現在のインターフェースではこのバージョンへの自動復元はできません）。`,
+    p => `The pre-change scene version was v${p.version} (audit reference only; the current interface cannot automatically restore it).`,
   ),
   staleGenerating: def<Record<string, never>>(
     () => '上次的户型生成因服务中断而未完成。已确认的需求仍然有效——发送确认即可重新生成；场景可能停留在中断时的中间状态。',
@@ -111,9 +121,14 @@ export const MESSAGES = {
     () => 'The previous floor-plan generation was interrupted by a service restart. Your confirmed requirements are intact — send a confirmation to regenerate. The scene may be in a partial state from the interruption.',
   ),
   staleModifying: def<Record<string, never>>(
-    () => '上次的修改因服务中断而未完成，场景保持中断前最后一次保存的状态。若存在待确认的修改，发送确认即可重试；也可以直接描述新的修改。',
-    () => '前回の修正はサービス中断のため完了しませんでした。シーンは中断前に保存された状態のままです。保留中の修正があれば確認を送信して再試行できます。新しい修正内容を入力しても構いません。',
-    () => 'The previous modification was interrupted by a service restart; the scene remains at its last saved state. If a pending change exists, send a confirmation to retry it — or describe a new change.',
+    () => '上次的修改因服务中断而未完成。场景可能停在中间状态；在确认场景完整前不要直接重试破坏性重建。你也可以描述新的非破坏性修改。',
+    () => '前回の修正はサービス中断のため完了しませんでした。シーンが中間状態の可能性があります。内容を確認するまで破壊的な再構築を再試行しないでください。新しい非破壊的な修正内容を入力することもできます。',
+    () => 'The previous modification was interrupted by a service restart and the scene may be partial. Do not retry a destructive rebuild until you inspect it; you may instead describe a new non-destructive change.',
+  ),
+  staleDestructive: def<Record<string, never>>(
+    () => '上次的结构重建在破坏性写入期间被服务中断。场景可能处于部分修改状态，系统已清除待重试操作并禁止自动重放。请先在编辑器中检查，再决定手工修复或重新生成。',
+    () => '前回の構造再構築は破壊的な書き込み中にサービス中断となりました。シーンが部分的に変更されている可能性があるため、保留中の再試行を削除し、自動再実行を無効化しました。エディタで確認してから手動修正または再生成を選んでください。',
+    () => 'The previous structural rebuild was interrupted during destructive writes. The scene may be partial, so the pending retry was cleared and automatic replay disabled. Inspect it in the editor before choosing manual repair or regeneration.',
   ),
   staleInspecting: def<Record<string, never>>(
     () => '上次的场景核对因服务中断而未完成；场景没有被修改。',

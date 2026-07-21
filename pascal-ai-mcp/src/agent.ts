@@ -41,6 +41,7 @@ import type {
 } from './persistence/session-repository'
 import { SessionVersionConflictError } from './persistence/session-repository'
 import type { WorkflowStepWriter } from './persistence/workflow-step-repository'
+import type { SceneBoundary, SceneBuildWriter } from './persistence/scene-build-repository'
 import type { ModelAttemptSink } from './telemetry/model-attempt-recorder'
 import type {
   Availability,
@@ -140,6 +141,14 @@ class BudgetExceededError extends Error {
   }
 }
 
+class DestructiveSceneWriteError extends Error {
+  constructor(readonly sceneId: string, cause: unknown) {
+    super(`Destructive rebuild of scene ${sceneId} failed after writes began: ${errorMessage(cause)}`)
+    this.name = 'DestructiveSceneWriteError'
+    this.cause = cause
+  }
+}
+
 type ExtractionResponse = {
   existingCondition?: unknown[]
   designGoals?: unknown[]
@@ -234,6 +243,7 @@ export class PascalAiAgent {
   // `chargeModelCall` can enforce the per-session ceiling in real time within
   // the turn rather than only at the next turn's boundary.
   private readonly sessionPriorTotals = new Map<string, number>()
+  private readonly destructiveWrites = new Set<string>()
   // Lazily-fetched, process-lifetime cache of the MCP `pascal://agent-guide`
   // resource. Read once; failures are swallowed so a missing/renamed
   // resource never breaks the main generation flow.
@@ -245,7 +255,8 @@ export class PascalAiAgent {
     private readonly modelAttempts: ModelAttemptSink,
     private readonly sessions: SessionPersistence,
     private readonly requests: ChatRequestWriter,
-    private readonly workflowSteps?: WorkflowStepWriter,
+    private readonly workflowSteps: WorkflowStepWriter | undefined,
+    private readonly sceneBuilds: SceneBuildWriter,
   ) {
     if (config.aiApiKey) {
       this.model = new OpenAiCompatibleClient({
@@ -404,6 +415,11 @@ export class PascalAiAgent {
     if (!recovery) return session
     const updated = structuredClone(session)
     updated.phase = recovery.phase
+    if (recovery.template === 'staleDestructive') {
+      delete updated.pendingModification
+      delete updated.pendingOperation
+      delete updated.destructiveSceneWriteStarted
+    }
     const reply = t(updated.language, recovery.template, {})
     updated.messages.push({ role: 'assistant', content: reply })
     this.persistSession(updated)
@@ -800,6 +816,7 @@ export class PascalAiAgent {
     // clean rebuild. Remember what it was before this attempt so the catch
     // block can roll it back.
     const priorSceneId = session.sceneId
+    let freshBuildId: string | undefined
     try {
       session.executionSteps = []
       session.toolTrace = []
@@ -856,6 +873,20 @@ export class PascalAiAgent {
       session.layoutPlan = planned.plan
       this.persistSession(session)
 
+      if (!priorSceneId && this.sceneBuilds) {
+        const context = this.activeRequestContexts.get(session.sessionId)
+        if (!context) throw new Error('Missing request context for fresh scene build')
+        freshBuildId = crypto.randomUUID()
+        const startedAt = new Date().toISOString()
+        this.sceneBuilds.start({
+          buildId: freshBuildId,
+          requestId: context.requestId,
+          traceId: context.traceId,
+          sessionId: session.sessionId,
+          startedAt,
+        })
+      }
+
       // ④ scaffolding only (project/site/building/level) — the template rooms
       // it drops in are cleared and the plan's rooms are built by the
       // deterministic executor instead.
@@ -863,9 +894,18 @@ export class PascalAiAgent {
         await this.callMcp(session.sessionId, 'create_house_from_brief', generationArgs),
       ))
       session.sceneId = nullableString(created.projectId ?? created.sceneId ?? created.id) ?? undefined
+      if (freshBuildId && session.sceneId) {
+        this.sceneBuilds.identifyScene(freshBuildId, session.sceneId, new Date().toISOString())
+        const boundary = await this.sceneBoundary(session.sessionId, session.sceneId)
+        this.sceneBuilds.updateBoundary(freshBuildId, boundary, new Date().toISOString())
+      }
       const levelId = nullableString(created.defaultLevelId)
       const persistAfterRound = async (valid: boolean) => {
         await this.persistScene(session.sessionId, session.sceneId, valid, nullableNumber(created.version))
+        if (freshBuildId && session.sceneId) {
+          const boundary = await this.sceneBoundary(session.sessionId, session.sceneId)
+          this.sceneBuilds.updateBoundary(freshBuildId, boundary, new Date().toISOString())
+        }
       }
       await this.clearLevelForRebuild(session, levelId)
       let construction = await this.constructScenePlanFirst(session, levelId, planned.plan, { persistAfterRound })
@@ -900,6 +940,10 @@ export class PascalAiAgent {
         diagnostics.validation.valid,
         nullableNumber(created.version),
       )
+      if (freshBuildId && session.sceneId) {
+        const boundary = await this.sceneBoundary(session.sessionId, session.sceneId)
+        this.sceneBuilds.succeed(freshBuildId, boundary, new Date().toISOString())
+      }
 
       const sceneResult: SceneResult = {
         sceneId: nullableString(created.projectId ?? created.sceneId ?? created.id),
@@ -947,23 +991,44 @@ export class PascalAiAgent {
       // pre-existing scene never touches session.sceneId, so priorSceneId
       // still matches and this is a no-op — the real project reference is
       // never disturbed.
+      const abandonedSceneId = session.sceneId !== priorSceneId ? session.sceneId : undefined
       if (session.sceneId !== priorSceneId) {
         // The half-built scene is abandoned, not deleted — record it so
         // it's not just silently orphaned in storage with no trace.
         if (session.sceneId) {
-          session.abandonedSceneIds = [...(session.abandonedSceneIds ?? []), session.sceneId]
           console.warn(`[pascal-ai-mcp] abandoned half-built scene ${session.sceneId} after generate() failure:`, error)
         }
         session.sceneId = priorSceneId
       }
+      if (freshBuildId) {
+        try {
+          this.sceneBuilds.abandon(
+            freshBuildId,
+            error instanceof GenerationCancelledError ? 'cancelled_by_user' : 'scene_build_failed',
+            new Date().toISOString(),
+          )
+        } catch (persistenceError) {
+          console.error(`[scene-build ${freshBuildId}] failed to persist abandonment: ${errorMessage(persistenceError)}`)
+        }
+      }
       if (error instanceof GenerationCancelledError) {
         session.phase = 'cancelled'
-        const reply = t(session.language, 'generateCancelled', {})
+        const reply = [
+          t(session.language, 'generateCancelled', {}),
+          ...(abandonedSceneId
+            ? [t(session.language, 'generateAbandonedScene', { sceneId: abandonedSceneId })]
+            : []),
+        ].join('\n')
         session.messages.push({ role: 'assistant', content: reply })
         return { session, reply, next: 'finish' }
       }
       session.phase = 'failed'
-      const reply = t(session.language, 'generateFailed', { error: errorMessage(error) })
+      const reply = [
+        t(session.language, 'generateFailed', { error: errorMessage(error) }),
+        ...(abandonedSceneId
+          ? [t(session.language, 'generateAbandonedScene', { sceneId: abandonedSceneId })]
+          : []),
+      ].join('\n')
       session.messages.push({ role: 'assistant', content: reply })
       return { session, reply, next: 'finish' }
     }
@@ -1171,6 +1236,21 @@ export class PascalAiAgent {
       session.messages.push({ role: 'assistant', content: reply })
       return { session, reply, next: 'finish' }
     } catch (error) {
+      const destructiveWriteFailed = session.destructiveSceneWriteStarted === true
+        || this.destructiveWrites.delete(session.sessionId)
+      if (destructiveWriteFailed) {
+        this.destructiveWrites.delete(session.sessionId)
+        delete session.destructiveSceneWriteStarted
+        delete session.pendingModification
+        delete session.pendingOperation
+        session.phase = session.sceneResult ? 'completed_with_issues' : 'failed'
+        const reply = t(session.language, 'modifyDestructiveFailed', {
+          sceneId,
+          error: errorMessage(error),
+        })
+        session.messages.push({ role: 'assistant', content: reply })
+        return { session, reply, next: 'finish' }
+      }
       if (error instanceof GenerationCancelledError) {
         // Leave pendingModification/pendingOperation and phase intact so the
         // user can re-confirm the same change later; the scene was not saved.
@@ -1560,22 +1640,32 @@ export class PascalAiAgent {
       return [{ catalogItemId: assetId, name, dimensions: dims, roomName: home.name }]
     })
     const clearTypes = new Set(['zone', 'wall', 'slab', 'ceiling', 'item'])
-    for (const [id, node] of Object.entries(nodes)) {
-      if (!clearTypes.has(String(node.type))) continue
-      try {
-        await traceMcp('delete_node', { id, cascade: true })
-      } catch {
-        // Swallowed on purpose: usually the node was already removed by an
-        // earlier cascade. Real failures are caught by the re-check below —
-        // building the new plan on top of leftovers would mix old and new
-        // structure into an unrecoverable hybrid.
+    session.destructiveSceneWriteStarted = true
+    this.persistSession(session)
+    this.destructiveWrites.add(session.sessionId)
+    try {
+      for (const [id, node] of Object.entries(nodes)) {
+        if (!clearTypes.has(String(node.type))) continue
+        try {
+          await traceMcp('delete_node', { id, cascade: true })
+        } catch {
+          // Swallowed on purpose: usually the node was already removed by an
+          // earlier cascade. Real failures are caught by the re-check below —
+          // building the new plan on top of leftovers would mix old and new
+          // structure into an unrecoverable hybrid.
+        }
       }
+    } catch (error) {
+      throw new DestructiveSceneWriteError(sceneId, error)
     }
     const leftover = Object.values(
       snapshotSceneNodes(toolPayload(await this.callMcp(session.sessionId, 'get_scene', {}))),
     ).filter(node => clearTypes.has(String(node.type)))
     if (leftover.length > 0) {
-      throw new Error(`清除旧结构失败：${leftover.length} 个节点未能删除，已中止重建（场景未持久化，可重试）`)
+      throw new DestructiveSceneWriteError(
+        sceneId,
+        new Error(`清除旧结构失败：${leftover.length} 个节点未能删除`),
+      )
     }
     const built = await executeLayoutPlan({
       plan,
@@ -1631,25 +1721,33 @@ export class PascalAiAgent {
     // from here on (see gateTargetsForSession).
     session.programEditedByModify = true
     trace.converged = true
-    return this.finishPlanFirstModify(session, sceneId, loadedVersion, trace, {
-      okDetails: [
-        ...appliedNotes,
-        ...planNotes,
-        ...(furnReport?.results.filter(r => r.ok).map(r => r.detail) ?? []),
-        ...replay.replaced.map(name => `手动家具「${name}」已在重建后重新放置`),
-      ],
-      failedDetails: [
-        ...built.executionIssues,
-        ...furnished.missing.map(entry => `「${entry.room}」缺少${entry.label}：${entry.reason}`),
-        ...furnished.executionIssues,
-        ...(furnReport?.results.filter(r => !r.ok).map(r => r.detail) ?? []),
-        ...replay.lost.map(entry => `手动家具「${entry.name}」未能重放：${entry.reason}`),
-        ...replay.executionIssues,
-      ],
-      previousVersion: loadedVersion,
-      baselineGateFailures,
-      intentRemovals: furnReport?.results.flatMap(result => (result.removed ? [result.removed] : [])) ?? [],
-    })
+    try {
+      const result = await this.finishPlanFirstModify(session, sceneId, loadedVersion, trace, {
+        okDetails: [
+          ...appliedNotes,
+          ...planNotes,
+          ...(furnReport?.results.filter(r => r.ok).map(r => r.detail) ?? []),
+          ...replay.replaced.map(name => `手动家具「${name}」已在重建后重新放置`),
+        ],
+        failedDetails: [
+          ...built.executionIssues,
+          ...furnished.missing.map(entry => `「${entry.room}」缺少${entry.label}：${entry.reason}`),
+          ...furnished.executionIssues,
+          ...(furnReport?.results.filter(r => !r.ok).map(r => r.detail) ?? []),
+          ...replay.lost.map(entry => `手动家具「${entry.name}」未能重放：${entry.reason}`),
+          ...replay.executionIssues,
+        ],
+        previousVersion: loadedVersion,
+        baselineGateFailures,
+        intentRemovals: furnReport?.results.flatMap(result => (result.removed ? [result.removed] : [])) ?? [],
+      })
+      this.destructiveWrites.delete(session.sessionId)
+      delete session.destructiveSceneWriteStarted
+      return result
+    } catch (error) {
+      if (error instanceof DestructiveSceneWriteError) throw error
+      throw new DestructiveSceneWriteError(sceneId, error)
+    }
   }
 
   private async findLevelId(session: WorkflowSession): Promise<string | null> {
@@ -2655,6 +2753,16 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     return nullableNumber(saved.version) ?? currentVersion
   }
 
+  private async sceneBoundary(sessionId: string, sceneId: string): Promise<SceneBoundary> {
+    const status = toolPayload(await this.callMcp(sessionId, 'get_project_status', { id: sceneId }))
+    const version = nullableNumber(status.version)
+    const graphHash = nullableString(status.graphHash)
+    if (version === null || !graphHash) {
+      throw new Error(`Scene ${sceneId} did not expose an authoritative version and graph hash`)
+    }
+    return { version, graphHash }
+  }
+
   private async executeToolCall(
     sessionId: string,
     toolCall: ToolCall,
@@ -3140,13 +3248,19 @@ const IN_FLIGHT_PHASES: ReadonlySet<WorkflowSession['phase']> = new Set([
 ])
 
 export function staleSessionRecovery(
-  session: Pick<WorkflowSession, 'phase' | 'pendingModification' | 'sceneResult'>,
-): { phase: WorkflowSession['phase']; template: 'staleGenerating' | 'staleModifying' | 'staleInspecting' } | null {
+  session: Pick<WorkflowSession, 'phase' | 'pendingModification' | 'sceneResult' | 'destructiveSceneWriteStarted'>,
+): { phase: WorkflowSession['phase']; template: 'staleGenerating' | 'staleModifying' | 'staleDestructive' | 'staleInspecting' } | null {
   if (!IN_FLIGHT_PHASES.has(session.phase)) return null
   if (session.phase === 'generating') {
     return { phase: 'awaiting_confirmation', template: 'staleGenerating' }
   }
   if (session.phase === 'modifying') {
+    if (session.destructiveSceneWriteStarted) {
+      return {
+        phase: session.sceneResult ? 'completed_with_issues' : 'failed',
+        template: 'staleDestructive',
+      }
+    }
     const recovery = modifyFailureRecovery(
       Boolean(session.pendingModification),
       Boolean(session.sceneResult),

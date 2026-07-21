@@ -222,6 +222,37 @@ export const MIGRATIONS: readonly Migration[] = [
         WHERE status = 'running';
     `,
   },
+  {
+    version: 6,
+    name: 'track_fresh_scene_build_lifecycle',
+    up: `
+      CREATE TABLE scene_builds (
+        build_id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL REFERENCES ai_requests(request_id),
+        trace_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        scene_id TEXT,
+        status TEXT NOT NULL CHECK (status IN (
+          'creating', 'building', 'succeeded', 'abandoned', 'cleanup_failed', 'cleaned'
+        )),
+        expected_version INTEGER,
+        expected_graph_hash TEXT,
+        error_code TEXT,
+        cleanup_attempts INTEGER NOT NULL DEFAULT 0 CHECK (cleanup_attempts >= 0),
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        cleaned_at TEXT,
+        UNIQUE (request_id)
+      ) STRICT;
+
+      CREATE INDEX scene_builds_status_updated_idx
+        ON scene_builds(status, updated_at);
+      CREATE INDEX scene_builds_scene_idx
+        ON scene_builds(scene_id)
+        WHERE scene_id IS NOT NULL;
+    `,
+  },
 ]
 
 export function runMigrations(database: Database): void {

@@ -210,13 +210,10 @@ export type WorkflowSession = {
   // was issued for the pending structural modification, so the follow-up
   // confirm proceeds with the rebuild instead of warning again.
   modifyDriftConfirmed?: boolean
-  // Scene ids created by a fresh-build `generate()` attempt that then
-  // failed partway through construction. `session.sceneId` gets rolled
-  // back so a retry doesn't mistake the half-built wreckage for a real
-  // existing project (see `generate()`'s catch block), but the abandoned
-  // project itself is left in storage (never auto-deleted) — recorded here
-  // purely as an audit trail / for manual cleanup.
-  abandonedSceneIds?: string[]
+  // Persisted immediately before an existing scene enters delete/recreate.
+  // A restart that sees this marker must not offer automatic retry because
+  // the current MCP contract cannot restore the pre-write checkpoint.
+  destructiveSceneWriteStarted?: boolean
   // Reply language, detected from the user's most recent message each turn
   // (kana→ja, han→zh, otherwise en). Replies render through src/lang/i18n.ts
   // in this language; internal strings (prompts, diagnostics, sceneResult)

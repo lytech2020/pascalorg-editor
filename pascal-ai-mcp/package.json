@@ -10,6 +10,7 @@
     "test": "bun test",
     "check-types": "tsc --noEmit",
     "templates:check": "bun scripts/check-templates.ts",
+    "scenes:cleanup": "bun scripts/cleanup-abandoned-scenes.ts",
     "eval": "bun run eval/run-eval.ts",
     "eval:review": "bun run eval/review.ts"
   },
