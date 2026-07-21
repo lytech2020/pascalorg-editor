@@ -1,89 +1,184 @@
 import { describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { SessionStore } from './session-store'
-import type { WorkflowSession } from './types'
+import { AppDatabase } from './persistence/database'
+import {
+  ChatRequestRepository,
+  SessionVersionConflictError,
+  SqliteSessionPersistence,
+} from './persistence/session-repository'
+import type { ChatMessage, WorkflowSession } from './types'
 
-function sessionFixture(sessionId: string): WorkflowSession {
-  return { sessionId, phase: 'idle', messages: [] } as unknown as WorkflowSession
+function sessionFixture(sessionId: string, messages: ChatMessage[] = []): WorkflowSession {
+  const now = '2026-07-21T00:00:00.000Z'
+  return {
+    sessionId,
+    inputType: 'text',
+    phase: 'intake',
+    availability: 'partially_usable',
+    brief: {
+      existingCondition: [],
+      designGoals: [],
+      hardConstraints: [],
+      assumptions: [],
+      uncertainties: [],
+      conflicts: [],
+    },
+    questions: [],
+    reasons: [],
+    summary: '',
+    messages,
+    clarificationRounds: 0,
+    createdAt: now,
+    updatedAt: now,
+  }
 }
 
-describe('SessionStore.flushAll', () => {
-  test('resolves once queued writes are on disk', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'session-store-'))
-    const filePath = join(dir, 'sessions.json')
+describe('SQLite session persistence (T1.5)', () => {
+  test('restores sessions after reopen while keeping messages out of state_json', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'session-sqlite-'))
+    const filePath = join(dir, 'ai.db')
     try {
-      const store = new SessionStore(filePath)
-      store.set('s1', sessionFixture('s1'))
-      store.set('s2', sessionFixture('s2'))
-      await store.flushAll()
-      expect(existsSync(filePath)).toBe(true)
-      const persisted = JSON.parse(readFileSync(filePath, 'utf8')) as {
-        sessions: Record<string, unknown>
-      }
-      expect(Object.keys(persisted.sessions).sort()).toEqual(['s1', 's2'])
+      const database = new AppDatabase(filePath)
+      const persistence = new SqliteSessionPersistence(database)
+      const session = sessionFixture('s1', [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'world' },
+      ])
+      expect(persistence.save(session, 0)).toBe(1)
+      const state = database.connection.query(
+        'SELECT state_json FROM ai_sessions WHERE session_id = ?',
+      ).get('s1') as { state_json: string }
+      expect(state.state_json).not.toContain('messages')
+      expect((database.connection.query('SELECT COUNT(*) AS count FROM ai_messages').get() as { count: number }).count).toBe(2)
+      database.close()
+
+      const reopened = new AppDatabase(filePath)
+      const restored = new SqliteSessionPersistence(reopened).load('s1')
+      expect(restored?.version).toBe(1)
+      expect(restored?.session).toEqual(session)
+      reopened.close()
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
   })
 
-  // Shutdown must not report a clean exit when the final write was lost —
-  // steady-state writes swallow flush errors, flushAll must surface them.
-  test('rejects when the final write failed', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'session-store-'))
-    const filePath = join(dir, 'sessions.json')
+  test('compare-and-swap rejects a stale writer and preserves the winner', () => {
+    const database = new AppDatabase(':memory:')
     try {
-      const store = new SessionStore(filePath)
-      // Block the write after construction: rename(tmp, filePath) fails
-      // because the target is now a directory.
-      mkdirSync(filePath)
-      store.set('s1', sessionFixture('s1'))
-      await expect(store.flushAll()).rejects.toThrow()
+      const first = new SqliteSessionPersistence(database)
+      const second = new SqliteSessionPersistence(database)
+      first.save(sessionFixture('s1'), 0)
+      const firstRead = first.load('s1')!
+      const staleRead = second.load('s1')!
+      firstRead.session.summary = 'winner'
+      expect(first.save(firstRead.session, firstRead.version)).toBe(2)
+      staleRead.session.summary = 'stale'
+      expect(() => second.save(staleRead.session, staleRead.version)).toThrow(SessionVersionConflictError)
+      expect(first.load('s1')?.session.summary).toBe('winner')
     } finally {
+      database.close()
+    }
+  })
+
+  test('legacy sessions.json imports once, never overwrites SQLite, and remains unchanged', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'session-legacy-'))
+    const legacyPath = join(dir, 'sessions.json')
+    const legacyText = `${JSON.stringify({
+      sessions: {
+        s1: { ...sessionFixture('s1'), summary: 'legacy-loses' },
+        s2: { ...sessionFixture('s2'), summary: 'legacy-imported' },
+      },
+    }, null, 2)}\n`
+    writeFileSync(legacyPath, legacyText)
+    const database = new AppDatabase(join(dir, 'ai.db'))
+    try {
+      const persistence = new SqliteSessionPersistence(database)
+      persistence.save({ ...sessionFixture('s1'), summary: 'database-wins' }, 0)
+      expect(persistence.importLegacyFile(legacyPath)).toEqual({
+        status: 'imported', imported: 1, skipped: 1,
+      })
+      expect(persistence.importLegacyFile(legacyPath)).toEqual({
+        status: 'already_imported', imported: 0, skipped: 0,
+      })
+      expect(persistence.load('s1')?.session.summary).toBe('database-wins')
+      expect(persistence.load('s2')?.session.summary).toBe('legacy-imported')
+      expect(readFileSync(legacyPath, 'utf8')).toBe(legacyText)
+      const imports = database.connection.query('SELECT COUNT(*) AS count FROM legacy_session_imports').get() as { count: number }
+      expect(imports.count).toBe(1)
+    } finally {
+      database.close()
       rmSync(dir, { recursive: true, force: true })
     }
   })
 
-  // Regression from review: a set() issued while flushAll is already
-  // awaiting must still be flushed before flushAll resolves — a single await
-  // of the queue tail captured at call time would miss it.
-  test('covers writes issued while flushing', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'session-store-'))
-    const filePath = join(dir, 'sessions.json')
+  test('legacy import skips a session with unsafe messages without losing valid siblings', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'session-legacy-invalid-'))
+    const legacyPath = join(dir, 'sessions.json')
+    writeFileSync(legacyPath, JSON.stringify({
+      sessions: {
+        valid: sessionFixture('valid', [{ role: 'user', content: 'safe' }]),
+        unsafe: sessionFixture('unsafe', [{
+          role: 'user',
+          content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,aGVsbG8=' } }],
+        }]),
+      },
+    }))
+    const database = new AppDatabase(join(dir, 'ai.db'))
     try {
-      const store = new SessionStore(filePath)
-      store.set('s1', sessionFixture('s1'))
-      const flushing = store.flushAll()
-      store.set('s2', sessionFixture('s2'))
-      await flushing
-      const persisted = JSON.parse(readFileSync(filePath, 'utf8')) as {
-        sessions: Record<string, unknown>
-      }
-      expect(Object.keys(persisted.sessions).sort()).toEqual(['s1', 's2'])
+      const persistence = new SqliteSessionPersistence(database)
+      expect(persistence.importLegacyFile(legacyPath)).toEqual({
+        status: 'imported', imported: 1, skipped: 1,
+      })
+      expect(persistence.load('valid')?.session.messages).toEqual([{ role: 'user', content: 'safe' }])
+      expect(persistence.load('unsafe')).toBeUndefined()
     } finally {
+      database.close()
       rmSync(dir, { recursive: true, force: true })
     }
   })
 
-  test('a later successful write clears the failure', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'session-store-'))
-    const filePath = join(dir, 'sessions.json')
+  test('messages cascade on session delete while request audit remains separate', () => {
+    const database = new AppDatabase(':memory:')
     try {
-      const store = new SessionStore(filePath)
-      mkdirSync(filePath)
-      store.set('s1', sessionFixture('s1'))
-      await expect(store.flushAll()).rejects.toThrow()
-      // Unblock the target and write again: flushAll should recover.
-      rmSync(filePath, { recursive: true, force: true })
-      store.set('s2', sessionFixture('s2'))
-      await store.flushAll()
-      const persisted = JSON.parse(readFileSync(filePath, 'utf8')) as {
-        sessions: Record<string, unknown>
+      const sessions = new SqliteSessionPersistence(database)
+      sessions.save(sessionFixture('s1', [{ role: 'user', content: 'private question' }]), 0)
+      const requests = new ChatRequestRepository(database)
+      requests.start({
+        requestId: 'req-1',
+        traceId: 'trace-1',
+        clientRequestId: 'client-1',
+        sessionId: 's1',
+        kind: 'chat',
+        startedAt: '2026-07-21T00:00:00.000Z',
+      })
+      requests.finish('req-1', 'succeeded', '2026-07-21T00:00:01.000Z')
+      expect(sessions.delete('s1')).toBe(true)
+      expect((database.connection.query('SELECT COUNT(*) AS count FROM ai_messages').get() as { count: number }).count).toBe(0)
+      const request = database.connection.query('SELECT * FROM ai_requests WHERE request_id = ?').get('req-1') as {
+        status: string
+        kind: string
       }
-      expect(Object.keys(persisted.sessions).sort()).toEqual(['s1', 's2'])
+      expect(request.status).toBe('succeeded')
+      expect(request.kind).toBe('chat')
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      database.close()
+    }
+  })
+
+  test('inline image Base64 is rejected atomically', () => {
+    const database = new AppDatabase(':memory:')
+    try {
+      const persistence = new SqliteSessionPersistence(database)
+      const session = sessionFixture('s1', [{
+        role: 'user',
+        content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,aGVsbG8=' } }],
+      }])
+      expect(() => persistence.save(session, 0)).toThrow('inline image data')
+      expect(persistence.load('s1')).toBeUndefined()
+    } finally {
+      database.close()
     }
   })
 })

@@ -49,6 +49,8 @@
 - 涉及：`src/server.ts`、`src/session-store.ts`。
 - 完成标准：收到 SIGTERM/SIGINT 的正常优雅退出路径中，最后一次已接受的 `set` 要么持久化成功，要么进程以非零状态明确失败；测试不把 SIGKILL 等不可拦截退出误算为可保证场景。
 - 依据：§6.1、§7.5。
+- T1.5 后续替代说明（2026-07-21）：SessionStore 与异步 JSON write queue 已删除，session/request 改为同步 SQLite 事务；协作式退出现在等待在途 handler 完成后关闭 MCP 与数据库，不再执行独立 `flushAll()`。T0.4 的“先停接流量、超时非零退出、重复信号幂等”保证保持不变。
+- T2.1 后续替代说明（2026-07-21）：`/chat` handler 只负责持久入队并返回 202；退出顺序扩展为停止接收 HTTP/领取新任务 → drain 已领取 worker job → 关闭 MCP/SQLite。SIGKILL 后 queued 保留，过期 running lease 明确标记 `failed/process_interrupted`，不在缺少步骤幂等证明时整单重放。
 
 ---
 
@@ -68,7 +70,10 @@
 - 注意：调用点很多，可以先让 `ModelCallResult` 兼容旧返回（output 字段透传），但兼容层必须标注删除条件，不能长期形成两套返回契约。
 - 依据：§6.2。
 
-### [ ] T1.2 `ai_model_calls` 落库
+### [x] T1.2 `ai_model_calls` 落库
+- 完成于 2026-07-21。实现：①新增共享 `src/persistence/` 基础（`AppDatabase` 连接、WAL/busy timeout、事务 helper、`schema_migrations` 幂等迁移），默认独立库 `./.data/ai.db`，可由 `AI_MCP_DATABASE_FILE` 覆盖；server/CLI/eval 共用同一 composition 方式，模型客户端不依赖 SQLite。②迁移 v1 建 `ai_model_calls`：`call_id + attempt_no` 唯一，每次真实 attempt 一行；按 `request_id`、provider/model/time 建索引，供应商 request id 条件唯一。实际模型与所有 Token 均允许 NULL（供应商未返回时不伪造成请求模型或 0），另存 `requested_model`。③`SqliteModelAttemptRecorder` 消费 T1.1 事件并注入 T1.3 权威 requestId/traceId/sessionId；无 HTTP 入口的 CLI/eval 由 agent 内部为每个 chat 铸造 requestId。operation 冻结为 `extract/modify-ops/inspect/scene-agent/scene-intent/plan:intent/plan:geometry`，未知或高基数标签拒绝落库；本轮不拆 `scene-agent`。④系统 Prompt 只保存 SHA-256 与显式 `*:v1` 版本；request params 仅保存 temperature/tool 数量与模式/response format，不保存消息、Prompt、回答、图片 Base64 或供应商原始响应。⑤写入使用同步 SQLite 原子事务，避免 fire-and-forget 窗口；启动建库/迁移失败时服务不启动，运行期单条写失败时业务 fail-open，但日志明确 `persistence=failed`，recorder 状态转 degraded 且累计 failureCount，后续成功才恢复健康，绝不误报计量成功（readiness 暴露归 T2.5）。
+- 验证：新增 migration 幂等与事务回滚测试；429→成功的真实 client 重试测试按同一 requestId 查出 2 行，行数与 `onAttemptStarted` 预算计数一致，失败行 Token/实际 model 为 NULL、成功行 usage/model/provider request id 完整；另覆盖数据库写失败降级/恢复、未知 operation 拒绝和不保存 Prompt/问题原文。535 tests / 0 fail，`tsc --noEmit` 干净。
+- Claude 复审通过后的收口：migration 改为拿到 `BEGIN IMMEDIATE` 写锁后再读取已应用版本，避免 server/CLI 多进程首次启动的旧快照竞争；`invalid_response.error_summary` 只保存固定文案和错误类名，不再保存可能夹带供应商响应片段的 JSON.parse message。operation 的 SQL CHECK 暂留作第二道闸；下次新增 operation/schema migration 时重新评估移除，避免为低基数词表频繁重建表。`TelemetryStatus` 的生产消费明确归入 T2.5 readiness。
 - 内容：引入 SQLite（bun:sqlite，独立于场景库，如 `.data/ai.db`）。先把连接、migration、transaction helper 做成 `src/persistence/` 的共享基础，不能私有化在 telemetry 中，以便 T1.5 并行复用；再建 `ai_model_calls` 表，由 persistence/telemetry adapter 消费 T1.1 的 attempt 事件，模型客户端不直接依赖 SQLite。每次 attempt 一行，至少包含 operation、provider、实际 model、attempt_no、status、nullable tokens、latency、finish_reason、http_status、provider_error_code、provider_request_id、prompt_version、prompt_hash、非敏感 request params、session_id、request_id、started_at/completed_at；失败与取消同样落行。价格换算不做，先存原始量；不保存完整 Prompt、消息或原始供应商响应。
 - 涉及：新 `src/telemetry/` + `src/persistence/`、`src/openai-compatible.ts` hook 接线。
 - 完成标准：跑一个含重试的 eval case 后，能用 SQL 按服务端 `requestId` 查出全部真实 attempt，行数与 telemetry 事件和 `modelCallsTotal` 对得上；数据库故障不会被误报为“计量成功”，并有明确的请求处理/降级策略。
@@ -81,20 +86,27 @@
 - 验证：`request-context.test.ts` 4 用例（伪造 body ids 被忽略且每次唯一、合法头采纳、畸形头替换、clientRequestId 合法性）；528 测试全过、pascal-ai-mcp check-types 干净（editor 侧既有13个tsc 错误与本任务无关，改动前后计数相同）。端到端冒烟（真实服务器 + 伪造 ids + 合法 trace 头）：响应 requestId 为服务端新铸、traceId=trace-e2e-12345678、clientRequestId 回显、AI 日志两行同 ids。
 - 复审修复 2026-07-21（Codex 3 P1）：①**代理信任浏览器 trace 头**——`resolveTraceId` 删除，面向浏览器的代理**始终自铸** traceId，客户端 `x-trace-id` 不再转发（未来 BFF 须走认证的服务间边界，注释已明确）；AI 服务侧保留头校验（代理是本机可信层）。②**成功链路关联缺口**——AI `/chat` 响应增加 `x-request-id`/`x-trace-id` 头（CORS `Expose-Headers` 同步放行）；代理读取上游 `x-request-id` 记入日志并转发给浏览器；前端 `requestLogRef` 滚动保存最近 20 条 RequestRecord（clientRequestId→requestId/traceId/kind/status/at），成功、失败、取消都记录，`cancelGeneration` 补 clientRequestId 与响应头读取。③**失败响应丢 ids**——`/chat` catch 不再裸抛：返回 500 `{error:'internal_error', message, requestId, traceId, clientRequestId}` 且带 identity 头（完整错误码 envelope 仍归 T1.7）；代理 503 响应带 `x-trace-id` 头与 body traceId；前端在 `response.ok` 判断**之前**记录 ids。新增 `server.integration.test.ts`（真实服务器 + MCP 子进程：伪造 ids 不生效、响应头与 body 一致、二次调用 id 不复用），529 测试全过。未自动化部分如实说明：失败路径 500 的 ids 保留和代理层为代码审查验证（强制 agent 确定性抛错需 T1.2 的注入点；Next dev 未实测但前端/代理 tsc 零新增错误）。
 - 闭环修复 2026-07-21（复审 blocker + 2 建议）：①**集成测试隔离**——`server.integration.test.ts` 使用临时 `AI_MCP_SESSION_FILE`（mkdtemp）、随机 sessionId、`AI_MCP_PORT=0` 由 OS 分配端口且端口从子进程自身 stdout 解析（不可能误连别的服务）、健康检查前断言子进程存活；`config.parsePort` 允许 0。真实 `.data/sessions.json` 中已无测试会话残留。②**前端 fetch 异常也留痕**——`callAgent` 在拿到响应后立即用 body/响应头记录 RequestRecord（空/非 JSON body 也记录），catch 中若尚未记录则补一条仅含 clientRequestId 的 error 记录。③**context 提前到 body 解析之前**——`createRequestContext(headers)` 先铸 ids，解析成功后经 `clientRequestIdFrom` 附加 clientRequestId；400/413（解析失败、字段校验、超限）响应现在都带 identity 头与 body ids（集成测试断言畸形 JSON 的 400 带 `x-request-id`）。529 tests / 0 fail，AI check-types 干净，editor 侧仍为 13 个既有错误无新增。T1.3 闭环，进入 T1.2。
+- 413 边界补充 2026-07-21（Codex 实现、Claude 审核通过）：Bun 的传输层硬上限改为应用限制的 2 倍，使常规 Content-Length 超限进入 `readJsonBody` 并返回带 requestId/traceId 的业务 413；预检拒绝时主动取消未消费的 request body，且 cancel 失败不改变既定 413，避免连接和后续请求卡住。真实 HTTP 测试以 1 MiB 应用限制覆盖“413 身份一致 + 后续请求返回 200”。超过 2 倍硬上限的极端请求仍由 Bun 在应用代码前直接拒绝，不承诺业务 requestId。
 - 内容：① 前端每次发送只生成 `clientRequestId`（用于界面关联，未来也可作为 idempotency key 的来源）；②可信 BFF 创建/透传 `traceId`，AI API 为每次业务动作创建权威 `requestId` 并返回给前端；③ AI 服务建立显式 `RequestContext`，把 requestId/traceId/sessionId 传入所有应用步骤、trace 和结构化日志，T1.2 再写入 `ai_model_calls`。幂等语义此阶段不做（T2.2），只做贯穿标识；浏览器自报的 requestId/traceId 不能覆盖服务端值。
 - 涉及：`apps/editor/components/ai-assistant-bubble.tsx`、`apps/editor/app/api/ai/[...path]/route.ts`、`src/server.ts`、`src/agent.ts`、`src/types.ts`。
 - 完成标准：给定 AI API 返回的 requestId，能在前端状态、代理日志、AI 日志和测试 telemetry 中检索到同一请求；伪造客户端 requestId 不会覆盖服务端主键。T1.2 完成后，同一 ID 可继续检索 `ai_model_calls`。
 - 依赖：可与 T1.1 并行；T1.2 依赖本任务，不反向依赖 T1.2。
 - 依据：§5.2、§9 Phase 1。
 
-### [ ] T1.4 模板 Zod schema + schemaVersion
+### [x] T1.4 模板 Zod schema + schemaVersion
+- 完成于 2026-07-21。实现：①新增 `src/template-schema.ts` 作为唯一契约，导出严格 `TemplateRecordSchema` 与 market/quality/typology/roomProgram 枚举，同时校验房间 ID 重复、entry/connections 引用；Zod 错误格式化为 `plan.rooms[2].type` 这类精确路径。②引入 `schemaVersion: 1` 与显式 v0→v1 运行时迁移，15 份现有模板全部标记 v1；CI 的 `templates:check` 直接解析当前 Schema，不会替入库数据暗中补版本。③加载器仍逐文件隔离失败，但额外输出 files/loaded/good/bad/failed/ready 健康摘要；开发环境 warn 后可继续，生产环境遇到非法 good/未知模板或无有效 good 模板时保留 `/health` liveness，`/chat` 统一返回 503。非法 bad 参照会报告，但有效 good 库存仍在时不挡业务；完整 readiness 端点仍由 T2.5 扩展。
+- 验证：Schema/加载器/CLI 回归覆盖精确错误路径、显式版本、不支持的未来版本、good/bad 生产门控差异和 CI 缺版本失败；`templates:check --no-artifacts` 通过 15 份真实模板，`tsc --noEmit` 干净，全量 542 tests / 0 fail。
+- Claude 复审建议收口（2026-07-21）：① connections 交叉校验补自环与无向重复边拒绝，错误定位到具体 `plan.connections[i]`；②模板/房间/entry/connection 标识符不再通过 `.trim()` 静默归一，首尾空白直接报错；③新增 `AI_MCP_TEMPLATES_DIR`，启动健康检查与生成时 seed matcher 使用同一配置目录，并以真实 Bun server 集成测试验证 production 下坏 good 库保持 `/health` 200、`/chat` 503 且响应携带 request identity。
 - 内容：① 定义并导出 `TemplateRecordSchema`（Zod），替换 `JSON.parse(...) as TemplateRecord`；② 增加 `schemaVersion` 字段与迁移函数（全部现有模板补 version 1）；③ `market/quality/typology/roomProgram` 改枚举；④启动时加载全库并输出健康摘要。生产环境遇到非法 good 模板时保持 liveness 可用但 readiness=false、拒绝业务流量；开发模式可 warn 后跳过该模板，但 CI/测试必须失败，不能让坏模板悄悄进入主分支。
 - 涉及：`src/template-seed.ts`、`templates/**/*.json`、`scripts/check-templates.ts`。
 - 完成标准：故意写坏一个字段，加载即报具体路径错误而不是运行时命中才炸；`templates:check` 复用同一 schema。
 - 依赖：建议在 T0.2 之后（CI 已能拦住回归）。
 - 依据：§6.6。
 
-### [ ] T1.5 SessionStore 迁移到 SQLite
+### [x] T1.5 SessionStore 迁移到 SQLite
+- 完成于 2026-07-21。实现：①共享 migration v2 新建 `ai_sessions`、`ai_messages`、`ai_requests` 与 `legacy_session_imports`；session 状态、用户可见消息和请求审计各自单一真相源，`state_json` 不再嵌套 messages，主体列 `user_id/org_id/project_id` 先以 nullable 形式预留。②新增 `SessionStateRepository`、`SessionMessageRepository`、`ChatRequestRepository` 与 `SqliteSessionPersistence`；session 更新携带 `expectedVersion` 做 CAS，陈旧 writer 明确抛 `SessionVersionConflictError`，消息替换与状态版本更新在同一 immediate transaction 中提交，不保留旧同步 `get/set` adapter。③agent/server/CLI/eval 全部改走 SQLite；chat/confirm/cancel 按 T1.3 权威 requestId 记录 started→succeeded/failed，删除 session 级联删除消息但保留 request 审计。④旧 `sessions.json` 仅按 source path + SHA-256 一次性导入：重复启动不重复导入，数据库已有 session 优先，源文件永不回写；旧 `SessionStore` 实现删除。⑤当前消息路径本来只持久化图片占位文本，repository 再以事务级校验硬拒绝 inline `data:image/*;base64`；图片 artifact 引用与生命周期仍由 T1.6 实现，本任务不提前宣称完成。
+- 验证：新增 5 组持久化回归，覆盖重启恢复/消息拆表、双 writer CAS 冲突、legacy 幂等导入且不覆盖 DB、删除级联与 request 保留、Base64 原子拒绝；真实 server 集成测试按 requestId 查询两条 cancel 审计并验证 session version=2、`state_json` 无 messages。全量 546 tests / 0 fail，`check-types` 干净。
+- Claude 复审建议收口（2026-07-21）：①启动 sweep/getSession 遇到 stale recovery CAS 冲突时视为另一 writer 已完成恢复，记录并重载 winner，不再导致进程启动失败；T2.1 起有有效 worker lease 的 session 不参与 stale phase recovery。②`ai_requests` 成功/失败 finish 改为 fail-open 审计尾写，落库异常只记日志，不再把已成功业务改成 500 或屏蔽原始异常；请求创建仍 fail-closed。③legacy 导入对单个 session 的结构/inline Base64 错误逐项 skip，合法 sibling 仍在同次导入成功，整体解析/数据库错误继续带源路径 fail-closed。④取消动作本身成功处理时 request 记 `succeeded`；被取消的原生成任务由 T2.1 记 `cancelled`。
 - 内容：把整文件 JSON 换成 SQLite：`ai_sessions`（当前状态+version，预留 nullable user_id/org_id/project_id）、`ai_messages`（用户可见消息）、`ai_requests`（每次 chat/confirm/cancel）。旧 `sessions.json` 只作一次性迁移源。图片 Base64 不入库，改存 artifact 引用。不要把同步 `get/set` 整体替换接口永久保留下来：新增 repository 接口和带 `expectedVersion` 的事务更新/CAS（如 `updateSession`），消息和请求通过各自 repository 写入，避免 session JSON 与拆表形成两个真相源；若为降低改造风险保留旧接口，只能作为有明确删除任务的临时 adapter。
 - 涉及：`src/session-store.ts`（重写/过渡 adapter）、新 `src/persistence/` repository 与迁移脚本、`src/agent.ts` 调用点。
 - 完成标准：重启后会话恢复行为与现在一致；并发更新中只有正确 version 能提交，冲突返回明确错误并可重试；消息/请求不再嵌套复制到 session blob；sessions.json 不再增长；迁移可重复执行且不会重复导入。
@@ -122,14 +134,25 @@
 
 阶段目标 / 验收：AI 或代理重启后任务状态不丢；重复提交同一 idempotency key 不重复扣费/施工。
 
-### [ ] T2.1 /chat 改为异步任务：202 + requestId
+### [x] T2.1 /chat 改为异步任务：202 + requestId
+- 完成于 2026-07-21。migration v3 把 `ai_requests` 升级为 DB 真相源的 durable queue（queued/running/succeeded/failed/cancelled、input/result、owner、lease、heartbeat、attempt）；`POST /chat` 持久入队后立即返回 202/Location，`GET /requests/:id` 查询状态和终态结果。worker 以 `BEGIN IMMEDIATE` 原子 claim，续租 heartbeat，按 session/scene 排他，cancel 优先；取消入队会在同一事务中把该 session 尚未领取的旧任务标为 `cancelled_by_user`，已领取任务走 Abort 路径，不会出现“先取消、旧生成随后又执行”。默认全局并发 1、队深 100，普通请求超限返回 429/Retry-After；取消仅在 session 或 active request 确实存在时绕过背压，无目标 cancel 返回 404，不能借最高优先级泛洪队列。queued 在重启后继续领取；过期 running 统一 `failed/process_interrupted` 且不整单重放，等 T2.2 有 workflow step 幂等语义后再扩展恢复。
+- 数据边界：请求文本只在 queued/running 期间存在 `input_json`，终态清除；图片解码为私有 0600 临时文件，DB 仅存 id/MIME/size/SHA-256 引用，worker 临时还原 data URL 后终态删除，Base64 入库有 repository 硬拒绝。结果表保存异步客户端领取所需的 reply/sessionVersion 摘要，删除 session 时 scrub input/result 但保留请求审计；完整 `ai_artifacts` 生命周期/过期清理仍归 T1.6。删除有 active queue job 的 session 返回 409，避免 worker 随后重建已删除会话。
+- HTTP/前端：移除 Bun 无限 request timeout 与 Next 代理全量响应缓冲 workaround；代理流式转发，编辑器以 requestId 轮询终态，原 POST 断开不影响任务。前端成功/失败/取消关联日志均保留 clientRequestId→requestId/traceId。阶段级实时进度仍归 T2.3。
+- 生命周期与已知边界：过期 lease 的启动清扫不受模板门影响；生产模板门不 ready 时仅 worker 领取被禁用，既有 queued 保持不动，expired running 仍会降级。heartbeat 为 lease/3，续租丢失或异常会主动 Abort 本地执行；配置 lease 必须高于最长预期 event-loop stall。协作退出先停止领取再 drain。当前 server 是唯一常驻 writer，CLI/eval 仍走同步 direct audit 路径；worker 排他只针对 worker-owned 任务，因此 CLI 与 server 同 session 并发只靠 CAS 响亮失败，不能避免已发生的模型花费，且崩溃的 direct 行没有 lease、会永久保持 running——有多写者需求时必须让 direct 也进入 lease 协议。当前 MCP 连接面向单一 active scene，故默认并发 1；提升并发前须先完成 scene 隔离能力。无法确认是否执行过场景写入的过期 running 不会自动重试，这是安全选择而非断点续跑。
+- 验证：覆盖队列深度/取消绕过、Base64 拒绝、cancel 优先、session/scene 排他、lease 过期、DB 重开与双连接仅认领一次、图片 artifact 还原/清理；真实 server 集成覆盖 202→轮询终态、重启隔离、production 模板门不领取预存 queued 任务。AI typecheck 干净，完整测试集全过且测试数不减少。
 - 内容：`POST /chat` 立即创建 `ai_requests` 行（status=queued）返回 `202 {requestId}`；实际执行移入单进程 worker，但队列真相源必须是 DB，不能使用“内存队列 + 仅写状态”作为可靠方案。worker 通过 lease/locked_until/heartbeat 领取任务，启动时扫描 queued 与过期 lease；设置全局并发上限、每 session/scene 并发限制、最大队列深度和 429/503 backpressure。新增 `GET /requests/:id` 查询状态与结果。移除 `bunServer.timeout(request, 0)` 和 Next.js 代理的全量缓冲 workaround（§14-1 所指的两个补丁一并清理，LangGraph checkpointer 注释见 T2.6）。
 - 涉及：`src/server.ts`、`src/agent.ts`（入口拆分）、`apps/editor/app/api/ai/[...path]/route.ts`。
 - 完成标准：数分钟的生成不再依赖一条长 HTTP 连接；请求中断/代理重启后客户端凭 requestId 查到最终结果；服务在“任务已入库但尚未领取”时被 kill，重启后会继续领取；过期 running lease 不会永久变成幽灵任务；压测超过并发/队列阈值时明确拒绝而非拖垮进程。正在执行步骤的安全续跑由 T2.2 的幂等/步骤语义决定。
 - 依赖：T1.3、T1.5。
 - 依据：§5.2。
 
-### [ ] T2.2 幂等键与 workflow_steps
+### [x] T2.2 幂等键与 workflow_steps
+- 完成于 2026-07-21。migration v4 为 `ai_requests` 增加 `idempotency_key/input_hash/idempotency_subject` 及信任主体 + session + action + scene 的条件唯一索引；`POST /chat` 接受受限格式的 `idempotencyKey`，同作用域同输入返回原 request/trace 并标注 `reused:true`，同 key 改变输入返回 409。图片哈希只包含 MIME/size/SHA-256，不把 artifact id 或 Base64 纳入幂等真相源；重复上传的新临时 artifact 会立即删除。浏览器只提供 key，不能提供 `idempotency_subject`；当前 local-only composition root 使用 `local`，仓储契约与测试已支持不同可信主体隔离，TX.1 接入认证后由服务端换成用户/组织主体。
+- `workflow_steps` 按 request + stable operation + attempt 记录 running/succeeded/failed/cancelled/failed_recoverable；`GET /requests/:id` 同时返回步骤列表。当前稳定步骤为 `plan`（意图提取 + 分区 + plan validation 的同一确定性边界）、`scaffold`、`structure-openings`（执行器当前的单一写入边界）、`furniture`、`gates`、`verification`、`repair:N`、`modify`/`modify-plan`。文档不把 `intent` 或 `openings` 伪装成独立可恢复点；要进一步拆分，必须先有独立持久化输出与安全重放语义。
+- 恢复语义保守收口：queued 任务重启后可继续领取；过期 running request 标记 `failed/process_interrupted`，其 running step 同时标记 `failed_recoverable`；正常终态前也会清理遗留 running step。已完成 request 始终可用原 requestId 查询，但任何无法证明幂等的场景写入都不会自动整单重放；通用断点续跑仍不在本任务承诺内。
+- 验证：repository 单测覆盖同作用域重用/改入参冲突/不同 scene 隔离/不同可信主体隔离；真实 server 集成覆盖重复 key 只产生一条业务 request 与 409 冲突；workflow repository 覆盖 attempt 递增、终态、高基数 operation 拒绝，worker 覆盖 expired request + running step 联动恢复。当前完整测试集全过且测试数不减，`check-types` 干净。
+- Claude 复审收口（2026-07-21）：① worker 启动与每轮扫描新增终态 request + running step 的兜底对账，即使进程崩在 request 恢复提交与 step 恢复之间，下次启动也会收敛为 `failed_recoverable`；②前端将幂等键与逻辑提交而非单次 HTTP attempt 绑定，网络/轮询结果不明时恢复原输入并复用 key，已得到明确 HTTP 拒绝或终态后才清除；③补真实双进程同 key 并发测试、reused HTTP attempt→原业务 request 关联日志和 workflow operation 有限词表。`workflowSteps.start` 保持 fail-closed 是有意设计：开始记录失败时尚未施工，不应在缺失恢复边界的情况下继续写场景；finish 失败时施工已发生，才采用 fail-open + 后续对账。
+- 性能与边界收口（2026-07-21）：migration v5 为 running workflow step 增加部分索引；孤儿步骤对账改为启动强制执行、运行中至多每 60 秒执行，lease 过期清扫仍按 worker poll 频率运行。CLI/eval 的 direct request 在转终态的同一事务内先把遗留 running step 标为 `failed_recoverable`，不再依赖下次 server 启动修复；`AI_MAX_REPAIR_ROUNDS` 上限固定为 99，与 `repair:N` 有限 operation 词表一致。T2.3 尚未开始。
 - 内容：① `/chat` 接受 `idempotencyKey`，按可信主体 + action/session/scene 范围建立唯一约束，同 key 重复提交返回原 request；② 建 `workflow_steps` 表，生成/修改的每个阶段（intent、plan、structure、openings、furniture、gates、repair-N）记录开始/成功/失败/取消和补偿结果；③每步有稳定 operation key，读步骤可安全重试，写步骤必须先通过 scene version/工具幂等能力证明才能重放。进程崩溃重启后，已 completed 的请求直接可查；无法证明安全的 in-flight 写步骤标记为 failed-recoverable，不能自动重放整次施工。本任务不承诺通用断点续跑。
 - 涉及：`src/agent.ts`、`src/persistence/`。
 - 完成标准：模拟中途 kill 进程，重启后 request/step 状态正确、无永久幽灵"进行中"；同一作用域的同 key 双击发送只创建一个 request、只扣一次模型费用；不同用户/scene 的相同 key 不互相串单。
@@ -153,7 +176,7 @@
 - 顺带解决：既有备忘中的"生成中断的半成品场景不回滚"。
 
 ### [ ] T2.5 健康检查与运行生命周期
-- 内容：`/health` 拆 liveness（进程活着、响应最小化）与内部/受保护 readiness（DB 可写、模板库加载有效、MCP 可调用；模型供应商状态仅作 degraded 信息不挡 ready）；AI 侧 MCP client 增加有上限的 reconnect/circuit-breaker 与连接代次管理，旧 transport 失败后不能继续被复用，本项不要求修改 `packages/mcp` 服务端。graceful shutdown 扩展 T0.4：停止接新请求和领取新任务 → drain/续租在跑任务或标记 recoverable → flush → 关 MCP。
+- 内容：`/health` 拆 liveness（进程活着、响应最小化）与内部/受保护 readiness（DB 可写、模板库加载有效、MCP 可调用，并消费 T1.2 `SqliteModelAttemptRecorder.status()`：最近一次计量落库失败时 readiness=false，后续成功写恢复；模型供应商状态仅作 degraded 信息不挡 ready）；AI 侧 MCP client 增加有上限的 reconnect/circuit-breaker 与连接代次管理，旧 transport 失败后不能继续被复用，本项不要求修改 `packages/mcp` 服务端。graceful shutdown 扩展 T0.4：停止接新请求和领取新任务 → drain/续租在跑任务或标记 recoverable → flush → 关 MCP。
 - 涉及：`src/server.ts`、`src/mcp.ts`（连接状态暴露）。
 - 完成标准：MCP 子进程被 kill 时 readiness 变 false 且有明确脱敏错误；子进程恢复后 AI client 可在上限内重新建立连接并恢复 ready；SIGTERM 下在跑请求不产生幽灵状态。
 - 依赖：T2.1、T2.2。

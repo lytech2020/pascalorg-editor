@@ -10,6 +10,11 @@ export type JsonBodyResult =
 export async function readJsonBody(request: Request, maxBytes: number): Promise<JsonBodyResult> {
   const contentLength = Number(request.headers.get('content-length') ?? Number.NaN)
   if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    try {
+      await request.body?.cancel()
+    } catch {
+      // Disposal failure must not replace an already-established 413.
+    }
     return { ok: false, status: 413, error: 'payload_too_large' }
   }
   if (!request.body) return { ok: false, status: 400, error: 'invalid_json' }

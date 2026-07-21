@@ -399,10 +399,15 @@ describe('Codex review 修复回归（1K 偏航形态 / 独立厨房冲突形态
 // 清空整个库并把空结果缓存住。
 // ---------------------------------------------------------------------------
 
-import { copyFileSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { copyFileSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { invalidateTemplateCache, loadTemplates } from './template-seed'
+import {
+  invalidateTemplateCache,
+  loadTemplateLibrary,
+  loadTemplates,
+  templateLibraryAllowsTraffic,
+} from './template-seed'
 
 describe('模板库逐文件容错', () => {
   test('损坏 JSON 只跳过该文件，其余照常加载，失败进 seed trace', () => {
@@ -435,5 +440,36 @@ describe('模板库逐文件容错', () => {
     expect(loadTemplates(dir)).toHaveLength(0)
     invalidateTemplateCache(dir)
     expect(loadTemplates(dir)).toHaveLength(1)
+  })
+
+  test('invalid good template has an exact path and blocks production traffic', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tpl-health-good-'))
+    const source = join(import.meta.dir, '..', 'templates', 'good', 'tpl-jp-2ldk-60-tanoji.json')
+    const raw = JSON.parse(readFileSync(source, 'utf8'))
+    raw.plan.rooms[1].type = 'washroom'
+    writeFileSync(join(dir, 'invalid-good.json'), JSON.stringify(raw))
+
+    const library = loadTemplateLibrary(dir)
+    expect(library.health.ready).toBe(false)
+    expect(library.health.failures.some(failure => failure.includes('plan.rooms[1].type'))).toBe(true)
+    expect(templateLibraryAllowsTraffic(library.health, 'production')).toBe(false)
+    expect(templateLibraryAllowsTraffic(library.health, 'development')).toBe(true)
+  })
+
+  test('invalid bad reference is reported but does not block production when good templates remain', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tpl-health-bad-'))
+    copyFileSync(
+      join(import.meta.dir, '..', 'templates', 'good', 'tpl-jp-2ldk-60-tanoji.json'),
+      join(dir, 'valid-good.json'),
+    )
+    const badSource = join(import.meta.dir, '..', 'templates', 'bad', 'tpl-bad-corridor-sliver-60.json')
+    const raw = JSON.parse(readFileSync(badSource, 'utf8'))
+    raw.plan.entry.roomId = 'missing-room'
+    writeFileSync(join(dir, 'invalid-bad.json'), JSON.stringify(raw))
+
+    const library = loadTemplateLibrary(dir)
+    expect(library.health.failed).toBe(1)
+    expect(library.health.ready).toBe(true)
+    expect(templateLibraryAllowsTraffic(library.health, 'production')).toBe(true)
   })
 })

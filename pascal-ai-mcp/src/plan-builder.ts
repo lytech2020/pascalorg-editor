@@ -47,6 +47,8 @@ export type PlanBuildOptions = {
   // Strategy decision (LAYOUT_STRATEGY_DESIGN.md): injected into the Intent
   // prompt and enforced on the parsed intent before partitioning.
   strategy?: StrategyDecision
+  // Must be the same library startup health checks validated.
+  templatesDir?: string
 }
 
 export type PlanBuildSuccess = {
@@ -247,7 +249,7 @@ export async function buildLayoutPlan(
 
     const attempt = llmGeometry
       ? evaluateGeometryReply(reply, inputs.targets, profile)
-      : evaluateIntentReply(reply, inputs.targets, profile, options.strategy)
+      : evaluateIntentReply(reply, inputs.targets, profile, options.strategy, options.templatesDir)
     if (attempt.ok) return { ...attempt.result, modelCalls }
 
     lastFailures = attempt.failures
@@ -275,6 +277,7 @@ function evaluateIntentReply(
   targets: PlanTargets,
   profile: NormProfile,
   strategy?: StrategyDecision,
+  templatesDir?: string,
 ): Attempt {
   const parsed = parseLayoutIntent(reply)
   const errors = parsed.errors
@@ -292,7 +295,7 @@ function evaluateIntentReply(
   // partitioner hasn't learned. No hit (or a post-scale fatal) falls through
   // to partitionLayout below.
   const seedTrace: string[] = []
-  const seed = findTemplateSeed(intent, profile, strategy, { targets, trace: seedTrace })
+  const seed = findTemplateSeed(intent, profile, strategy, { targets, trace: seedTrace, templatesDir })
   const seedTraceField = seedTrace.length > 0 ? { seedTrace } : {}
   if (seed) {
     const extraNotes = [...seed.notes, ...(strategy?.notes ?? []), ...applied.notes]

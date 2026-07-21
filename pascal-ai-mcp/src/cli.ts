@@ -3,12 +3,23 @@ import { stdin as input, stdout as output } from 'node:process'
 import { PascalAiAgent } from './agent'
 import { loadConfig } from './config'
 import { PascalMcpClient } from './mcp'
+import { AppDatabase } from './persistence/database'
+import { ModelCallRepository } from './persistence/model-call-repository'
+import { ChatRequestRepository, SqliteSessionPersistence } from './persistence/session-repository'
+import { SqliteModelAttemptRecorder } from './telemetry/model-attempt-recorder'
+import { WorkflowStepRepository } from './persistence/workflow-step-repository'
 
 const config = loadConfig()
+const database = new AppDatabase(config.databaseFile)
+const modelAttempts = new SqliteModelAttemptRecorder(new ModelCallRepository(database))
+const sessions = new SqliteSessionPersistence(database)
+sessions.importLegacyFile(config.sessionFile)
+const requests = new ChatRequestRepository(database)
+const workflowSteps = new WorkflowStepRepository(database)
 const mcp = new PascalMcpClient(config)
 await mcp.connect()
 
-const agent = new PascalAiAgent(config, mcp)
+const agent = new PascalAiAgent(config, mcp, modelAttempts, sessions, requests, workflowSteps)
 const sessionId = process.env.AI_MCP_CLI_SESSION || 'cli'
 const rl = createInterface({ input, output })
 
@@ -34,4 +45,5 @@ try {
 } finally {
   rl.close()
   await mcp.close()
+  database.close()
 }

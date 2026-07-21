@@ -29,10 +29,17 @@ export type AppConfig = {
   // base64 inflates that to ~26.7MB plus JSON overhead, so the two limits
   // must move together (ARCHITECTURE_TASKS.md T0.3).
   maxRequestBodyBytes: number
-  // Graceful-shutdown budget: how long to wait for queued session writes
-  // before giving up and exiting non-zero.
+  // Graceful-shutdown budget: how long to wait for in-flight requests before
+  // closing the synchronous SQLite persistence and exiting non-zero.
   shutdownDrainTimeoutMs: number
   sessionFile: string
+  databaseFile: string
+  requestArtifactsDir: string
+  templatesDir: string
+  requestWorkerConcurrency: number
+  requestQueueDepth: number
+  requestLeaseMs: number
+  requestWorkerPollMs: number
   mcpMode: McpMode
   mcpUrl: string
   mcpToken?: string
@@ -59,6 +66,17 @@ export function loadConfig(): AppConfig {
     process.env.AI_MCP_SESSION_FILE?.trim() || './.data/sessions.json',
   )
   mkdirSync(dirname(sessionFile), { recursive: true })
+  const databaseFile = resolve(
+    process.env.AI_MCP_DATABASE_FILE?.trim() || './.data/ai.db',
+  )
+  mkdirSync(dirname(databaseFile), { recursive: true })
+  const requestArtifactsDir = resolve(
+    process.env.AI_MCP_REQUEST_ARTIFACTS_DIR?.trim() || './.data/request-artifacts',
+  )
+  mkdirSync(requestArtifactsDir, { recursive: true })
+  const templatesDir = resolve(
+    process.env.AI_MCP_TEMPLATES_DIR?.trim() || resolve(import.meta.dir, '..', 'templates'),
+  )
 
   const mcpMode = parseMcpMode(process.env.PASCAL_MCP_MODE)
   const aiProvider = parseAiProvider(process.env.AI_PROVIDER)
@@ -110,6 +128,16 @@ export function loadConfig(): AppConfig {
     maxRequestBodyBytes: parseIntWithDefault(process.env.AI_MCP_MAX_BODY_MB, 28) * 1024 * 1024,
     shutdownDrainTimeoutMs: parseIntWithDefault(process.env.AI_MCP_DRAIN_TIMEOUT_MS, 5_000),
     sessionFile,
+    databaseFile,
+    requestArtifactsDir,
+    templatesDir,
+    requestWorkerConcurrency: parseIntWithDefault(process.env.AI_MCP_WORKER_CONCURRENCY, 1),
+    requestQueueDepth: parseIntWithDefault(process.env.AI_MCP_MAX_QUEUE_DEPTH, 100),
+    // Heartbeats run every lease/3. Keep the lease comfortably above the
+    // longest expected event-loop stall; an owner that cannot renew loses
+    // authority and its local execution is cancelled.
+    requestLeaseMs: parseIntWithDefault(process.env.AI_MCP_REQUEST_LEASE_MS, 30_000),
+    requestWorkerPollMs: parseIntWithDefault(process.env.AI_MCP_WORKER_POLL_MS, 250),
     mcpMode,
     mcpUrl: process.env.PASCAL_MCP_URL || 'http://127.0.0.1:3917/mcp',
     mcpToken: emptyToUndefined(process.env.PASCAL_MCP_TOKEN),
@@ -129,7 +157,11 @@ export function loadConfig(): AppConfig {
     maxClarificationRounds: parseIntWithDefault(process.env.AI_MAX_CLARIFICATION_ROUNDS, 3),
     // 批次 D：structure/openings/furniture are deterministic now, so repair
     // rounds only chase decorative issues — two rounds is the budget (§5).
-    maxRepairRounds: parseIntWithDefault(process.env.AI_MAX_REPAIR_ROUNDS, 2),
+    // The hard cap matches the persisted repair:1..repair:99 operation keys.
+    maxRepairRounds: Math.min(
+      99,
+      parseIntWithDefault(process.env.AI_MAX_REPAIR_ROUNDS, 2),
+    ),
     // Absolute safety ceiling on model API calls in a single chat turn. All
     // internal loops are already individually bounded (tool rounds, phases,
     // repair/clarification rounds), so this only trips on pathological

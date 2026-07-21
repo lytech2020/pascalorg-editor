@@ -36,22 +36,14 @@ import {
 import type { NormProfile } from './norms/profile'
 import type { PartitionStrategyHint } from './layout-partitioner'
 import { validateLayoutPlan, type PlanTargets } from './plan-validator'
+import {
+  formatTemplateSchemaError,
+  parseTemplateRecord,
+  type TemplateQuality,
+  type TemplateRecord,
+} from './template-schema'
 
-export type TemplateRecord = {
-  id: string
-  meta: {
-    market: string
-    label: string
-    quality: 'good' | 'bad'
-    typology?: string
-    // Japanese room-program shorthand ('2dk', '1ldk', '1r', …) of the SOURCE
-    // listing. When both the request and the template declare one, they must
-    // match exactly — structure alone cannot tell 1R from 1K, or 1DK from a
-    // 1LDK whose hub the source drawing labels "DK".
-    roomProgram?: string
-  }
-  plan: LayoutPlan
-}
+export type { TemplateRecord } from './template-schema'
 
 export type TemplateSeedResult = {
   plan: LayoutPlan
@@ -73,7 +65,22 @@ const SERVICE_TYPES: ReadonlySet<RoomType> = new Set([
 ])
 const SITE_CONSTRAINED_TYPOLOGIES = new Set(['narrow_lot', 'l_shape'])
 
-type TemplateLibrary = { records: TemplateRecord[]; failures: string[] }
+export type TemplateLibraryHealth = {
+  ready: boolean
+  files: number
+  loaded: number
+  good: number
+  bad: number
+  failed: number
+  failures: string[]
+  blockingFailures: string[]
+}
+
+export type TemplateLibrary = {
+  records: TemplateRecord[]
+  failures: string[]
+  health: TemplateLibraryHealth
+}
 
 const templateCache = new Map<string, TemplateLibrary>()
 
@@ -99,37 +106,77 @@ export function templateFilePaths(dir: string): string[] {
   return paths.sort()
 }
 
-// Per-file fault isolation: one broken JSON must not empty the whole library
-// (and get the empty result cached until restart) — the bad file is skipped
-// and recorded, everything else keeps working. Failures surface in the seed
-// trace via findTemplateSeed.
-function loadTemplateLibrary(dir: string = DEFAULT_TEMPLATES_DIR): TemplateLibrary {
+// Per-file fault isolation keeps development usable while still making the
+// whole-library state explicit. Production gates traffic on blockingFailures;
+// CI parses the same schema without legacy migration.
+export function loadTemplateLibrary(dir: string = DEFAULT_TEMPLATES_DIR): TemplateLibrary {
   const cached = templateCache.get(dir)
   if (cached) return cached
   const records: TemplateRecord[] = []
   const failures: string[] = []
+  const blockingFailures: string[] = []
   let paths: string[] = []
   try {
     paths = templateFilePaths(dir)
   } catch (error) {
-    failures.push(`templates dir unreadable: ${dir} (${error instanceof Error ? error.message : String(error)})`)
+    const message = `templates dir unreadable: ${dir} (${error instanceof Error ? error.message : String(error)})`
+    failures.push(message)
+    blockingFailures.push(message)
+  }
+  if (paths.length === 0 && failures.length === 0) {
+    const message = `templates dir contains no template files: ${dir}`
+    failures.push(message)
+    blockingFailures.push(message)
   }
   for (const path of paths) {
+    let quality: TemplateQuality | undefined
     try {
-      const record = JSON.parse(readFileSync(path, 'utf8')) as TemplateRecord
-      if (record?.plan?.rooms && record?.meta) records.push(record)
-      else failures.push(`${path}: missing meta/plan — not a template`)
+      const raw: unknown = JSON.parse(readFileSync(path, 'utf8'))
+      quality = qualityHint(raw)
+      records.push(parseTemplateRecord(raw))
     } catch (error) {
-      failures.push(`${path}: ${error instanceof Error ? error.message : String(error)}`)
+      const message = `${path}: ${formatTemplateSchemaError(error)}`
+      failures.push(message)
+      if (quality !== 'bad') blockingFailures.push(message)
     }
   }
-  const library = { records, failures }
+  if (records.every(record => record.meta.quality !== 'good')) {
+    const message = `templates dir contains no valid good templates: ${dir}`
+    if (!failures.includes(message)) failures.push(message)
+    if (!blockingFailures.includes(message)) blockingFailures.push(message)
+  }
+  const health: TemplateLibraryHealth = {
+    ready: blockingFailures.length === 0,
+    files: paths.length,
+    loaded: records.length,
+    good: records.filter(record => record.meta.quality === 'good').length,
+    bad: records.filter(record => record.meta.quality === 'bad').length,
+    failed: failures.length,
+    failures,
+    blockingFailures,
+  }
+  const library = { records, failures, health }
   templateCache.set(dir, library)
   return library
 }
 
 export function loadTemplates(dir: string = DEFAULT_TEMPLATES_DIR): TemplateRecord[] {
   return loadTemplateLibrary(dir).records
+}
+
+export function templateLibraryAllowsTraffic(
+  health: TemplateLibraryHealth,
+  environment: string | undefined = process.env.NODE_ENV,
+): boolean {
+  return environment !== 'production' || health.ready
+}
+
+function qualityHint(raw: unknown): TemplateQuality | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined
+  const meta = (raw as Record<string, unknown>).meta
+  if (typeof meta !== 'object' || meta === null || Array.isArray(meta)) return undefined
+  const quality = (meta as Record<string, unknown>).quality
+  return quality === 'good' || quality === 'bad' ? quality : undefined
 }
 
 type HubForm = 'ldk' | 'dk' | 'separate' | 'none'

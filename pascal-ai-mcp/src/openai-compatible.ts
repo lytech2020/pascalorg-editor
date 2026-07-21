@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import type { ChatCompletionResponse, ChatMessage, OpenAiTool } from './types'
 
 // Normalized token usage. Absent fields mean the provider did not report the
@@ -11,6 +12,14 @@ export type ModelUsage = {
   reasoningTokens?: number
   cacheReadTokens?: number
   cacheCreationTokens?: number
+}
+
+export type ModelRequestParams = {
+  temperature: number
+  toolCount?: number
+  toolChoice?: string
+  parallelToolCalls?: boolean
+  responseFormat?: string
 }
 
 // One telemetry record per REAL HTTP attempt — success, HTTP error, network
@@ -46,6 +55,9 @@ export type ModelAttemptResult = {
   providerRequestId?: string
   finishReason?: string
   usage?: ModelUsage
+  promptVersion?: string
+  promptHash: string
+  requestParams: ModelRequestParams
   startedAt: string
   latencyMs: number
 }
@@ -72,6 +84,7 @@ export type RequestHooks = {
   // "plan:intent", …). Keep it low-cardinality — no session ids or round
   // numbers — so persisted attempts can be aggregated per stage.
   operation?: string
+  promptVersion?: string
 }
 
 // Uniform return contract for text/JSON model calls: the parsed output plus
@@ -151,6 +164,11 @@ export class OpenAiCompatibleClient {
       ...(this.options.provider === 'azure-openai' ? {} : { session_id: sessionId }),
       ...extras,
     })
+    const promptHash = systemPromptHash(messages)
+    const requestParams = requestParamsFrom(
+      extras,
+      hooks.temperature ?? this.options.temperature,
+    )
     const timeoutMs = this.options.requestTimeoutMs ?? 60_000
     const callId = crypto.randomUUID()
     for (let attempt = 0; attempt < 5; attempt++) {
@@ -166,7 +184,7 @@ export class OpenAiCompatibleClient {
       const finished = (
         partial: Omit<
           ModelAttemptResult,
-          'provider' | 'operation' | 'sessionKey' | 'callId' | 'requestedModel' | 'attemptNo' | 'startedAt' | 'latencyMs'
+          'provider' | 'operation' | 'sessionKey' | 'callId' | 'requestedModel' | 'attemptNo' | 'promptVersion' | 'promptHash' | 'requestParams' | 'startedAt' | 'latencyMs'
         >,
       ): void => {
         try {
@@ -177,6 +195,9 @@ export class OpenAiCompatibleClient {
             callId,
             requestedModel: this.requestedModel(),
             attemptNo: attempt + 1,
+            ...(hooks.promptVersion ? { promptVersion: hooks.promptVersion } : {}),
+            promptHash,
+            requestParams,
             startedAt,
             latencyMs: Math.round(performance.now() - startedMs),
             ...partial,
@@ -215,7 +236,7 @@ export class OpenAiCompatibleClient {
           finished({
             status: 'invalid_response',
             httpStatus,
-            errorSummary: truncate(`unreadable body: ${errorMessage(error)}`),
+            errorSummary: `unreadable response body (${errorKind(error)})`,
           })
           throw error
         }
@@ -366,8 +387,39 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+function errorKind(error: unknown): string {
+  return error instanceof Error && error.name ? error.name : 'UnknownError'
+}
+
 function truncate(text: string, max = 200): string {
   return text.length > max ? `${text.slice(0, max)}…` : text
+}
+
+function systemPromptHash(messages: ChatMessage[]): string {
+  const systemMessages = messages
+    .filter(message => message.role === 'system')
+    .map(message => message.content ?? null)
+  return createHash('sha256').update(JSON.stringify(systemMessages)).digest('hex')
+}
+
+function requestParamsFrom(
+  extras: Record<string, unknown>,
+  temperature: number,
+): ModelRequestParams {
+  const responseFormat = extras.response_format
+  const toolChoice = extras.tool_choice
+  return {
+    temperature,
+    ...(Array.isArray(extras.tools) ? { toolCount: extras.tools.length } : {}),
+    ...(typeof toolChoice === 'string' ? { toolChoice } : {}),
+    ...(typeof extras.parallel_tool_calls === 'boolean'
+      ? { parallelToolCalls: extras.parallel_tool_calls }
+      : {}),
+    ...(responseFormat !== null && typeof responseFormat === 'object'
+      && typeof (responseFormat as { type?: unknown }).type === 'string'
+      ? { responseFormat: (responseFormat as { type: string }).type }
+      : {}),
+  }
 }
 
 // Extracts the short machine-readable error code from an OpenAI-compatible

@@ -50,6 +50,24 @@ type ChatResponse = {
   clientRequestId?: string
 }
 
+type AcceptedResponse = {
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+  reused?: boolean
+  statusUrl: string
+  requestId: string
+  traceId: string
+  clientRequestId?: string
+}
+
+type RequestStatusResponse = {
+  requestId: string
+  traceId: string
+  clientRequestId?: string
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+  errorCode?: string
+  result?: ChatResponse
+}
+
 type UiMessage = { id: string; role: 'user' | 'assistant'; content: string }
 
 // Correlation record for one /chat call (T1.3): clientRequestId is ours,
@@ -62,6 +80,15 @@ type RequestRecord = {
   kind: 'chat' | 'cancel'
   status: 'ok' | 'error'
   at: string
+}
+
+type PendingSubmission = {
+  sessionId: string
+  sceneId?: string
+  message?: string
+  imageDataUrl?: string
+  action?: string
+  idempotencyKey: string
 }
 
 function aiAgentUrl(): string {
@@ -112,6 +139,8 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
   // Rolling log of recent request correlations (client id -> server ids);
   // kept in a ref (not render state) and mirrored to console.debug.
   const requestLogRef = useRef<RequestRecord[]>([])
+  const pendingChatSubmissionRef = useRef<PendingSubmission | null>(null)
+  const pendingCancelSubmissionRef = useRef<PendingSubmission | null>(null)
   const recordRequest = useCallback((record: RequestRecord) => {
     requestLogRef.current = [...requestLogRef.current.slice(-19), record]
     console.debug(
@@ -151,23 +180,22 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   })
 
-  // Fetch the persisted session directly. Used to recover the real outcome
-  // when a /chat response comes back empty or truncated even though the
-  // backend actually finished and saved the session.
-  const recoverSession = useCallback(async (): Promise<WorkflowSession | null> => {
-    if (!sessionId) return null
-    try {
-      const res = await fetch(`${aiAgentUrl()}/sessions/${encodeURIComponent(sessionId)}`, {
+  const waitForRequest = useCallback(async (requestId: string): Promise<RequestStatusResponse> => {
+    const deadline = Date.now() + 30 * 60 * 1000
+    while (Date.now() < deadline) {
+      const response = await fetch(`${aiAgentUrl()}/requests/${encodeURIComponent(requestId)}`, {
         cache: 'no-store',
       })
-      const text = await res.text()
-      if (!res.ok || !text) return null
-      const payload = JSON.parse(text) as { session: WorkflowSession | null }
-      return payload.session ?? null
-    } catch {
-      return null
+      const payload = (await response.json()) as RequestStatusResponse & { error?: string }
+      if (!response.ok)
+        throw new Error(payload.error ?? `Request status failed (${response.status})`)
+      if (payload.status !== 'queued' && payload.status !== 'running') return payload
+      await new Promise((resolve) => setTimeout(resolve, 750))
     }
-  }, [sessionId])
+    throw new Error(
+      'The AI request is still running after 30 minutes. Refresh later to check its status.',
+    )
+  }, [])
 
   const maybeRedirectToScene = useCallback(
     (body: Record<string, unknown>, target: WorkflowSession) => {
@@ -186,13 +214,25 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
 
   const callAgent = useCallback(
     async (body: Record<string, unknown>) => {
-      if (!sessionId) return
+      if (!sessionId) return false
       setBusy(true)
       setError('')
-      // Local correlation tag only — the AI service mints the authoritative
-      // requestId and returns it in the response (T1.3).
       const clientRequestId = crypto.randomUUID()
+      const submission = submissionFor(sessionId, sceneId, body)
+      const pending = pendingChatSubmissionRef.current
+      const idempotencyKey =
+        pending && sameSubmission(pending, submission)
+          ? pending.idempotencyKey
+          : crypto.randomUUID()
+      pendingChatSubmissionRef.current = { ...submission, idempotencyKey }
+      const clearPendingSubmission = () => {
+        if (pendingChatSubmissionRef.current?.idempotencyKey === idempotencyKey) {
+          pendingChatSubmissionRef.current = null
+        }
+      }
       let recorded = false
+      let requestId: string | undefined
+      let traceId: string | undefined
       try {
         const response = await fetch(`${aiAgentUrl()}/chat`, {
           method: 'POST',
@@ -200,81 +240,61 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
           body: JSON.stringify({
             sessionId,
             clientRequestId,
+            idempotencyKey,
             ...(sceneId ? { sceneId } : {}),
             ...body,
           }),
         })
-        // Read as text first — never call response.json() directly, which
-        // throws "Unexpected end of JSON input" on an empty/truncated body
-        // (e.g. a long generation whose HTTP response got cut) and hides the
-        // fact that the generation may have succeeded server-side.
-        const rawText = await response.text()
-        let payload: (ChatResponse & { error?: string }) | null = null
-        if (rawText) {
-          try {
-            payload = JSON.parse(rawText) as ChatResponse & { error?: string }
-          } catch {
-            payload = null
-          }
+        const accepted = (await response.json()) as AcceptedResponse & { error?: string }
+        requestId = accepted.requestId
+        traceId = accepted.traceId
+        if (response.status !== 202) {
+          clearPendingSubmission()
+          throw new Error(accepted.error ?? `AI request failed (${response.status})`)
         }
-
-        // Record the correlation as soon as headers are available — before the
-        // ok-check and before the empty-body handling, so failed and unusable
-        // responses (the ones that most need matching to server logs) still
-        // leave a record. The AI service includes the ids on error responses.
+        const completed = await waitForRequest(accepted.requestId)
+        clearPendingSubmission()
+        const ok = completed.status === 'succeeded' || completed.status === 'cancelled'
         recordRequest({
           clientRequestId,
-          requestId: payload?.requestId ?? response.headers.get('x-request-id') ?? undefined,
-          traceId: payload?.traceId ?? response.headers.get('x-trace-id') ?? undefined,
+          requestId: completed.requestId,
+          traceId: completed.traceId,
           kind: 'chat',
-          status: response.ok && payload ? 'ok' : 'error',
+          status: ok ? 'ok' : 'error',
           at: new Date().toISOString(),
         })
         recorded = true
-
-        if (!payload) {
-          console.warn('[ai-assistant] /chat returned an empty or non-JSON body', {
-            status: response.status,
-            contentType: response.headers.get('content-type'),
-            bodyLength: rawText.length,
-            bodySnippet: rawText.slice(0, 200),
-          })
-          const recovered = await recoverSession()
-          if (recovered) {
-            // The generation actually completed and was persisted — show it
-            // as the success it is rather than a JSON parse error.
-            setSession(recovered)
-            setMessages(mapSessionMessages(recovered))
-            maybeRedirectToScene(body, recovered)
-            return
-          }
-          throw new Error('The AI service returned an empty or truncated response. If generation may have finished, refresh the page to check the result, or try again later.')
+        if (!ok || !completed.result) {
+          throw new Error(completed.errorCode ?? `AI request ${completed.status}`)
         }
-
-        if (!response.ok) throw new Error(payload.error ?? `AI request failed (${response.status})`)
+        const payload = completed.result
         setSession(payload.session)
         setMessages((current) => [
           ...current,
           { id: crypto.randomUUID(), role: 'assistant', content: payload.reply },
         ])
         maybeRedirectToScene(body, payload.session)
+        return true
       } catch (requestError) {
         // fetch itself failed (network error, aborted stream) — nothing was
         // recorded yet, so leave at least the client-side half of the trail.
         if (!recorded) {
           recordRequest({
             clientRequestId,
+            ...(requestId ? { requestId } : {}),
+            ...(traceId ? { traceId } : {}),
             kind: 'chat',
             status: 'error',
             at: new Date().toISOString(),
           })
         }
         setError(requestError instanceof Error ? requestError.message : String(requestError))
+        return false
       } finally {
         setBusy(false)
       }
     },
-    [maybeRedirectToScene, recordRequest, recoverSession, sceneId, sessionId],
+    [maybeRedirectToScene, recordRequest, sceneId, sessionId, waitForRequest],
   )
 
   // Stop an in-flight generation/modification. Sent as a separate, concurrent
@@ -286,6 +306,19 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
     if (!sessionId || cancelling) return
     setCancelling(true)
     const clientRequestId = crypto.randomUUID()
+    const submission = submissionFor(sessionId, sceneId, { action: 'cancel' })
+    const pending = pendingCancelSubmissionRef.current
+    const idempotencyKey =
+      pending && sameSubmission(pending, submission) ? pending.idempotencyKey : crypto.randomUUID()
+    pendingCancelSubmissionRef.current = { ...submission, idempotencyKey }
+    const clearPendingSubmission = () => {
+      if (pendingCancelSubmissionRef.current?.idempotencyKey === idempotencyKey) {
+        pendingCancelSubmissionRef.current = null
+      }
+    }
+    let requestId: string | undefined
+    let traceId: string | undefined
+    let recorded = false
     try {
       const response = await fetch(`${aiAgentUrl()}/chat`, {
         method: 'POST',
@@ -293,48 +326,86 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
         body: JSON.stringify({
           sessionId,
           clientRequestId,
+          idempotencyKey,
           ...(sceneId ? { sceneId } : {}),
           action: 'cancel',
         }),
       })
+      const accepted = (await response.json()) as AcceptedResponse & { error?: string }
+      requestId = accepted.requestId
+      traceId = accepted.traceId
+      if (response.status !== 202) {
+        clearPendingSubmission()
+        throw new Error(accepted.error ?? `Cancel failed (${response.status})`)
+      }
+      const completed = await waitForRequest(accepted.requestId)
+      clearPendingSubmission()
+      const ok = completed.status === 'succeeded' || completed.status === 'cancelled'
       recordRequest({
         clientRequestId,
-        requestId: response.headers.get('x-request-id') ?? undefined,
-        traceId: response.headers.get('x-trace-id') ?? undefined,
+        requestId: completed.requestId,
+        traceId: completed.traceId,
         kind: 'cancel',
-        status: response.ok ? 'ok' : 'error',
+        status: ok ? 'ok' : 'error',
         at: new Date().toISOString(),
       })
+      recorded = true
+      if (completed.result) {
+        setSession(completed.result.session)
+        setMessages(mapSessionMessages(completed.result.session))
+      }
     } catch {
       // Best-effort: the in-flight request will still surface the outcome.
-      recordRequest({
-        clientRequestId,
-        kind: 'cancel',
-        status: 'error',
-        at: new Date().toISOString(),
-      })
+      if (!recorded) {
+        recordRequest({
+          clientRequestId,
+          ...(requestId ? { requestId } : {}),
+          ...(traceId ? { traceId } : {}),
+          kind: 'cancel',
+          status: 'error',
+          at: new Date().toISOString(),
+        })
+      }
     } finally {
       setCancelling(false)
     }
-  }, [cancelling, recordRequest, sceneId, sessionId])
+  }, [cancelling, recordRequest, sceneId, sessionId, waitForRequest])
 
   const send = useCallback(async () => {
     const message = input.trim()
     if ((!message && !imageDataUrl) || busy) return
-    setMessages((current) => [
-      ...current,
-      {
-        id: crypto.randomUUID(),
-        role: 'user',
-        content: imageDataUrl ? `${message || 'Please analyze this floor plan'}\n[Image: ${imageName}]` : message,
-      },
-    ])
-    setInput('')
     const image = imageDataUrl
+    const submittedImageName = imageName
+    const body = {
+      ...(message ? { message } : {}),
+      ...(image ? { imageDataUrl: image } : {}),
+    }
+    const pending = pendingChatSubmissionRef.current
+    const retryingAmbiguousSubmission = Boolean(
+      pending && sameSubmission(pending, submissionFor(sessionId, sceneId, body)),
+    )
+    if (!retryingAmbiguousSubmission) {
+      setMessages((current) => [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          role: 'user',
+          content: image
+            ? `${message || 'Please analyze this floor plan'}\n[Image: ${submittedImageName}]`
+            : message,
+        },
+      ])
+    }
+    setInput('')
     setImageDataUrl(null)
     setImageName('')
-    await callAgent({ ...(message ? { message } : {}), ...(image ? { imageDataUrl: image } : {}) })
-  }, [busy, callAgent, imageDataUrl, imageName, input])
+    const completed = await callAgent(body)
+    if (!completed) {
+      setInput(message)
+      setImageDataUrl(image)
+      setImageName(image ? submittedImageName : '')
+    }
+  }, [busy, callAgent, imageDataUrl, imageName, input, sceneId, sessionId])
 
   const handleImage = useCallback(async (file: File | undefined) => {
     if (!file) return
@@ -353,7 +424,9 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
       const shortSide = Math.min(bitmap.width, bitmap.height)
       bitmap.close()
       if (longSide < 1200 || shortSide < 600) {
-        setError('Image resolution too low: at least 1200px on the long side and 600px on the short side.')
+        setError(
+          'Image resolution too low: at least 1200px on the long side and 600px on the short side.',
+        )
         return
       }
       const reader = new FileReader()
@@ -370,9 +443,22 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
 
   const clearSession = useCallback(async () => {
     if (!sessionId || busy) return
-    await fetch(`${aiAgentUrl()}/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
+    const response = await fetch(`${aiAgentUrl()}/sessions/${encodeURIComponent(sessionId)}`, {
+      method: 'DELETE',
+    })
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => ({}))) as { error?: string }
+      setError(
+        payload.error === 'session_busy'
+          ? 'This session still has a queued or running AI request. Wait for it to finish before clearing.'
+          : (payload.error ?? `Could not clear session (${response.status}).`),
+      )
+      return
+    }
     const storageKey = `pascal-ai-session:${sceneId ?? 'local-editor'}`
     window.localStorage.removeItem(storageKey)
+    pendingChatSubmissionRef.current = null
+    pendingCancelSubmissionRef.current = null
     setSessionId(createSessionId(sceneId))
     setSession(null)
     setMessages([])
@@ -404,7 +490,9 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
           <div className="rounded-xl border border-border/70 bg-muted/20 p-3 text-sm">
             <p className="font-medium">Describe the home you want</p>
             <p className="mt-1 text-muted-foreground text-xs leading-5">
-              Enter the floor area, rooms, occupants, and constraints, or upload a floor plan image. I will ask follow-up questions when details are missing, and only change the scene after you confirm.
+              Enter the floor area, rooms, occupants, and constraints, or upload a floor plan image.
+              I will ask follow-up questions when details are missing, and only change the scene
+              after you confirm.
             </p>
           </div>
         )}
@@ -450,7 +538,9 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
           <div className="space-y-1 rounded-xl border border-border/70 bg-muted/20 p-3 text-xs">
             {session?.executionSteps?.map((step) => (
               <div className="flex items-center gap-2" key={step.phase}>
-                <span className={step.status === 'completed' ? 'text-green-600' : 'text-destructive'}>
+                <span
+                  className={step.status === 'completed' ? 'text-green-600' : 'text-destructive'}
+                >
                   {step.status === 'completed' ? '✓' : '×'}
                 </span>
                 <span>{step.label}</span>
@@ -492,8 +582,8 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
 
       {(session?.sceneResult?.remainingIssueCount ?? 0) > 0 && (
         <div className="mx-3 mb-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-amber-700 text-xs">
-          Automated checks still found {session?.sceneResult?.remainingIssueCount}{' '}
-          issue(s). You can open the scene to review, or keep typing change requests.
+          Automated checks still found {session?.sceneResult?.remainingIssueCount} issue(s). You can
+          open the scene to review, or keep typing change requests.
         </div>
       )}
 
@@ -566,6 +656,33 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
         </div>
       </div>
     </div>
+  )
+}
+
+function submissionFor(
+  sessionId: string,
+  sceneId: string | undefined,
+  body: Record<string, unknown>,
+): Omit<PendingSubmission, 'idempotencyKey'> {
+  return {
+    sessionId,
+    ...(sceneId ? { sceneId } : {}),
+    ...(typeof body.message === 'string' ? { message: body.message } : {}),
+    ...(typeof body.imageDataUrl === 'string' ? { imageDataUrl: body.imageDataUrl } : {}),
+    ...(typeof body.action === 'string' ? { action: body.action } : {}),
+  }
+}
+
+function sameSubmission(
+  pending: PendingSubmission,
+  next: Omit<PendingSubmission, 'idempotencyKey'>,
+): boolean {
+  return (
+    pending.sessionId === next.sessionId &&
+    pending.sceneId === next.sceneId &&
+    pending.message === next.message &&
+    pending.imageDataUrl === next.imageDataUrl &&
+    pending.action === next.action
   )
 }
 

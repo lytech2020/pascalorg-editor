@@ -28,21 +28,12 @@ import { resolveNormProfile } from '../src/norms/profile'
 import { validateLayoutPlan } from '../src/plan-validator'
 import { deriveStrategy } from '../src/strategy'
 import { templateFilePaths } from '../src/template-seed'
+import {
+  formatTemplateSchemaError,
+  TemplateRecordSchema,
+  type TemplateRecord,
+} from '../src/template-schema'
 import { renderPlanSvg } from './render-plan-svg'
-
-type Template = {
-  id: string
-  meta: {
-    market: string
-    label: string
-    source: string
-    quality: 'good' | 'bad'
-    badReasons: string[]
-    typology?: string
-    notes?: string
-  }
-  plan: LayoutPlan
-}
 
 function planMetrics(plan: LayoutPlan, profile: ReturnType<typeof resolveNormProfile>) {
   const { width, depth } = plan.footprint
@@ -96,20 +87,14 @@ if (files.length === 0) {
   problems.push(`模板目录为空或不存在：${templatesDir}`)
 }
 for (const file of files) {
-  let template: Template
+  let template: TemplateRecord
   try {
-    template = JSON.parse(readFileSync(file, 'utf8')) as Template
-    if (!Array.isArray(template?.plan?.rooms)) {
-      throw new Error('缺少 plan.rooms')
-    }
-    // Anything outside the enum would be silently ignored by the seed
-    // matcher (treated as neither good nor bad) — a disabled template must
-    // be a loud failure, not a quiet one. Full Zod schema lands with T1.4.
-    if (template.meta?.quality !== 'good' && template.meta?.quality !== 'bad') {
-      throw new Error(`meta.quality 必须是 good 或 bad，实际为 ${JSON.stringify(template.meta?.quality)}`)
-    }
+    const raw: unknown = JSON.parse(readFileSync(file, 'utf8'))
+    // CI intentionally does not run the legacy migration: every checked-in
+    // template must declare its current schemaVersion explicitly.
+    template = TemplateRecordSchema.parse(raw)
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
+    const message = formatTemplateSchemaError(error)
     problems.push(`${file}: 模板加载失败 —— ${message}`)
     console.log(`\n=== ${file}\n  LOAD FAIL  ${message}`)
     continue

@@ -34,8 +34,14 @@ import { executeLayoutPlan, toolPayload, type McpCaller, type SceneExecutionRepo
 
 // Re-exported for eval/run-eval.ts, which historically imported it from here.
 export { toolPayload }
-import type { RequestContext } from './request-context'
-import { SessionStore } from './session-store'
+import { createRequestContext, type RequestContext } from './request-context'
+import type {
+  ChatRequestWriter,
+  SessionPersistence,
+} from './persistence/session-repository'
+import { SessionVersionConflictError } from './persistence/session-repository'
+import type { WorkflowStepWriter } from './persistence/workflow-step-repository'
+import type { ModelAttemptSink } from './telemetry/model-attempt-recorder'
 import type {
   Availability,
   ChatInput,
@@ -207,9 +213,9 @@ export class PascalAiAgent {
   private readonly model?: OpenAiCompatibleClient
   private readonly fallbackModel?: OpenAiCompatibleClient
   private readonly fastModel?: OpenAiCompatibleClient
-  private readonly sessions: SessionStore
   private readonly graph: ReturnType<typeof createWorkflowGraph>
   private readonly sessionLocks = new Map<string, Promise<ChatResult>>()
+  private readonly sessionVersions = new Map<string, number>()
   // Sessions with a cancel requested while a run is in flight. The running
   // generation polls this at loop boundaries (`throwIfCancelled`) and aborts.
   private readonly cancelRequests = new Set<string>()
@@ -236,6 +242,10 @@ export class PascalAiAgent {
   constructor(
     private readonly config: AppConfig,
     private readonly mcp: PascalMcpClient,
+    private readonly modelAttempts: ModelAttemptSink,
+    private readonly sessions: SessionPersistence,
+    private readonly requests: ChatRequestWriter,
+    private readonly workflowSteps?: WorkflowStepWriter,
   ) {
     if (config.aiApiKey) {
       this.model = new OpenAiCompatibleClient({
@@ -282,12 +292,20 @@ export class PascalAiAgent {
         requestTimeoutMs: config.aiRequestTimeoutMs,
       })
     }
-    this.sessions = new SessionStore(config.sessionFile)
-    // Startup sweep: a fresh process has no in-flight work by definition —
-    // every persisted in-flight phase is a stuck leftover from the previous
-    // process and gets downgraded to a retryable state immediately.
-    for (const session of this.sessions.allSessions()) {
-      this.recoverIfStale(session)
+    // A live worker lease proves another process still owns an in-flight
+    // session. Only unleased state is stale enough to recover; CAS remains the
+    // final guard if two processes race after a lease expires.
+    for (const stored of this.sessions.all()) {
+      if (this.requests.hasLiveWorkerRequest?.(stored.session.sessionId, new Date().toISOString())) continue
+      this.sessionVersions.set(stored.session.sessionId, stored.version)
+      try {
+        this.recoverIfStale(stored.session)
+      } catch (error) {
+        if (!(error instanceof SessionVersionConflictError)) throw error
+        console.warn(`session recovery skipped after concurrent update: ${stored.session.sessionId}`)
+      } finally {
+        this.sessionVersions.delete(stored.session.sessionId)
+      }
     }
     this.graph = createWorkflowGraph({
       ingest: state => this.ingest(state),
@@ -299,6 +317,35 @@ export class PascalAiAgent {
   }
 
   async chat(input: ChatInput): Promise<ChatResult> {
+    const contextualInput = input.context
+      ? input
+      : { ...input, context: createRequestContext(new Headers()) }
+    const context = contextualInput.context!
+    this.requests.start({
+      requestId: context.requestId,
+      traceId: context.traceId,
+      ...(context.clientRequestId ? { clientRequestId: context.clientRequestId } : {}),
+      sessionId: contextualInput.sessionId,
+      kind: contextualInput.action === 'confirm'
+        ? 'confirm'
+        : contextualInput.action === 'cancel' ? 'cancel' : 'chat',
+      ...(contextualInput.sceneId ? { sceneId: contextualInput.sceneId } : {}),
+      startedAt: new Date().toISOString(),
+    })
+    try {
+      const result = await this.executeQueued(contextualInput)
+      // A handled cancellation is a successfully processed cancel action;
+      // the cancelled model attempts/session phase retain the detail.
+      this.finishRequest(context, 'succeeded')
+      return result
+    } catch (error) {
+      this.finishRequest(context, 'failed', 'internal_error')
+      throw error
+    }
+  }
+
+  async executeQueued(input: ChatInput): Promise<ChatResult> {
+    if (!input.context) throw new Error('queued chat input requires request context')
     // A cancel that arrives while a run is already in flight signals that run
     // to abort at its next loop boundary. Setting the flag here (before the
     // turn is even enqueued behind the lock) is what makes cancellation take
@@ -323,14 +370,31 @@ export class PascalAiAgent {
     }
   }
 
+  requestCancellation(sessionId: string): void {
+    if (!this.sessionLocks.has(sessionId)) return
+    this.cancelRequests.add(sessionId)
+    this.runAbortControllers.get(sessionId)?.abort()
+  }
+
   getSession(sessionId: string): WorkflowSession | undefined {
-    const session = this.sessions.get(sessionId)
-    if (!session) return undefined
+    const stored = this.sessions.load(sessionId)
+    if (!stored) return undefined
+    const session = stored.session
     // A live run holds the session lock; an in-flight phase WITHOUT a lock is
     // a stuck leftover (restart / escaped exception) — downgrade before the
     // frontend renders a forever-spinning state.
     if (this.sessionLocks.has(sessionId)) return session
-    return this.recoverIfStale(session)
+    if (this.requests.hasLiveWorkerRequest?.(sessionId, new Date().toISOString())) return session
+    this.sessionVersions.set(sessionId, stored.version)
+    try {
+      return this.recoverIfStale(session)
+    } catch (error) {
+      if (!(error instanceof SessionVersionConflictError)) throw error
+      console.warn(`session read recovery skipped after concurrent update: ${sessionId}`)
+      return this.sessions.load(sessionId)?.session ?? session
+    } finally {
+      this.sessionVersions.delete(sessionId)
+    }
   }
 
   // Applies staleSessionRecovery, appends the explanation to the transcript
@@ -342,18 +406,88 @@ export class PascalAiAgent {
     updated.phase = recovery.phase
     const reply = t(updated.language, recovery.template, {})
     updated.messages.push({ role: 'assistant', content: reply })
-    this.sessions.set(updated.sessionId, updated)
+    this.persistSession(updated)
     return updated
   }
 
   deleteSession(sessionId: string): boolean {
+    if (this.sessionLocks.has(sessionId)) return false
     return this.sessions.delete(sessionId)
   }
 
-  // Shutdown path: waits for queued session writes to hit disk; rejects if
-  // the final state could not be persisted.
-  flushSessions(): Promise<void> {
-    return this.sessions.flushAll()
+  private persistSession(session: WorkflowSession): void {
+    const expectedVersion = this.sessionVersions.get(session.sessionId)
+    if (expectedVersion === undefined) {
+      throw new Error(`session ${session.sessionId} has no loaded persistence version`)
+    }
+    const version = this.sessions.save(session, expectedVersion)
+    this.sessionVersions.set(session.sessionId, version)
+  }
+
+  private finishRequest(
+    context: RequestContext,
+    status: 'succeeded' | 'failed',
+    errorCode?: string,
+  ): void {
+    try {
+      this.requests.finish(context.requestId, status, new Date().toISOString(), errorCode)
+    } catch (error) {
+      console.error(
+        `[req ${context.requestId}] [trace ${context.traceId}] request-audit finish failed: ${errorMessage(error)}`,
+      )
+    }
+  }
+
+  private async runWorkflowStep<T>(
+    session: WorkflowSession,
+    operationKey: string,
+    work: () => Promise<T>,
+    accepts: (result: T) => boolean = () => true,
+    rejectedErrorCode = 'step_rejected',
+  ): Promise<T> {
+    const context = this.activeRequestContexts.get(session.sessionId)
+    if (!context || !this.workflowSteps) return work()
+    const step = this.workflowSteps.start({
+      requestId: context.requestId,
+      sessionId: session.sessionId,
+      ...(session.sceneId ? { sceneId: session.sceneId } : {}),
+      operationKey,
+      startedAt: new Date().toISOString(),
+    })
+    try {
+      const result = await work()
+      const accepted = accepts(result)
+      try {
+        if (!this.workflowSteps.finish(
+          step.stepId,
+          accepted ? 'succeeded' : 'failed',
+          new Date().toISOString(),
+          accepted ? undefined : rejectedErrorCode,
+        )) {
+          console.warn(`[req ${context.requestId}] workflow step ${operationKey} lost before completion`)
+        }
+      } catch (error) {
+        console.error(`[req ${context.requestId}] workflow step ${operationKey} finish failed: ${errorMessage(error)}`)
+      }
+      return result
+    } catch (error) {
+      const cancelled = error instanceof GenerationCancelledError
+      try {
+        if (!this.workflowSteps.finish(
+          step.stepId,
+          cancelled ? 'cancelled' : 'failed',
+          new Date().toISOString(),
+          cancelled ? 'cancelled_by_user' : 'step_failed',
+        )) {
+          console.warn(`[req ${context.requestId}] workflow step ${operationKey} lost before failure recording`)
+        }
+      } catch (finishError) {
+        console.error(
+          `[req ${context.requestId}] workflow step ${operationKey} failure recording failed: ${errorMessage(finishError)}`,
+        )
+      }
+      throw error
+    }
   }
 
   private async runChat(input: ChatInput): Promise<ChatResult> {
@@ -368,8 +502,18 @@ export class PascalAiAgent {
   }
 
   private async runChatInner(input: ChatInput): Promise<ChatResult> {
+    try {
+      return await this.runChatTurn(input)
+    } finally {
+      this.sessionVersions.delete(input.sessionId)
+    }
+  }
+
+  private async runChatTurn(input: ChatInput): Promise<ChatResult> {
     const now = new Date().toISOString()
-    let session = this.sessions.get(input.sessionId) ?? createSession(input, now)
+    const stored = this.sessions.load(input.sessionId)
+    this.sessionVersions.set(input.sessionId, stored?.version ?? 0)
+    let session = stored?.session ?? createSession(input, now)
     // Under the session lock the previous run has finished — an in-flight
     // phase here can only be a stuck leftover.
     session = this.recoverIfStale(session)
@@ -381,7 +525,7 @@ export class PascalAiAgent {
     if (input.action !== 'cancel' && priorTotal >= this.config.maxModelCallsPerSession) {
       const reply = t(session.language, 'sessionCallLimit', {})
       session.updatedAt = new Date().toISOString()
-      this.sessions.set(input.sessionId, session)
+      this.persistSession(session)
       return { sessionId: input.sessionId, reply, session }
     }
 
@@ -393,7 +537,7 @@ export class PascalAiAgent {
       // Fold this turn's API attempts into the session's running total.
       result.session.modelCallsTotal = priorTotal + (this.modelCallBudgets.get(input.sessionId) ?? 0)
       result.session.updatedAt = new Date().toISOString()
-      this.sessions.set(input.sessionId, result.session)
+      this.persistSession(result.session)
       return { sessionId: input.sessionId, reply: result.reply, session: result.session }
     } finally {
       this.modelCallBudgets.delete(input.sessionId)
@@ -591,7 +735,7 @@ export class PascalAiAgent {
             },
           ],
           'scene-intent',
-          { ...hooks, operation: 'scene-intent' },
+          { ...hooks, operation: 'scene-intent', promptVersion: 'scene-intent:v1' },
         ),
       )
       if (isSceneIntent(result.output.intent)) return result.output.intent
@@ -664,7 +808,7 @@ export class PascalAiAgent {
       // would leave the stored phase stuck at `awaiting_confirmation` with no
       // trace that a build was underway. This snapshot makes the in-progress
       // (and any later abandoned scene) state diagnosable after a restart.
-      this.sessions.set(session.sessionId, session)
+      this.persistSession(session)
       const generationArgs = buildGenerationArgs(session)
       if (session.sceneId) {
         const loaded = toolPayload(await this.callMcp(session.sessionId, 'load_scene', { id: session.sceneId }))
@@ -675,7 +819,11 @@ export class PascalAiAgent {
         // rebuilt, which would silently destroy the user's existing work.
         const contentNodes = await this.countActiveContentNodes(session.sessionId)
         if (shouldModifyExistingScene(contentNodes)) {
-          return await this.applyConfirmedBriefToExistingScene(session, loaded)
+          return await this.runWorkflowStep(
+            session,
+            'modify',
+            () => this.applyConfirmedBriefToExistingScene(session, loaded),
+          )
         }
         const expectedVersion = nullableNumber(loaded.version)
         if (expectedVersion !== null) generationArgs.expectedVersion = expectedVersion
@@ -684,7 +832,13 @@ export class PascalAiAgent {
       // partition → validation, all before any Pascal scene exists. A brief
       // that can't produce a valid plan fails right here — zero abandoned
       // scenes, and the confirmed requirements survive for a retry.
-      let planned = await this.buildPlanForSession(session)
+      let planned = await this.runWorkflowStep(
+        session,
+        'plan',
+        () => this.buildPlanForSession(session),
+        result => result.ok,
+        'plan_rejected',
+      )
       if (!planned.ok) {
         session.phase = 'failed'
         const { failures, failuresL10n } = planned
@@ -700,14 +854,14 @@ export class PascalAiAgent {
       }
       if (planned.intent) session.layoutIntent = planned.intent
       session.layoutPlan = planned.plan
-      this.sessions.set(session.sessionId, session)
+      this.persistSession(session)
 
       // ④ scaffolding only (project/site/building/level) — the template rooms
       // it drops in are cleared and the plan's rooms are built by the
       // deterministic executor instead.
-      const created = toolPayload(
+      const created = await this.runWorkflowStep(session, 'scaffold', async () => toolPayload(
         await this.callMcp(session.sessionId, 'create_house_from_brief', generationArgs),
-      )
+      ))
       session.sceneId = nullableString(created.projectId ?? created.sceneId ?? created.id) ?? undefined
       const levelId = nullableString(created.defaultLevelId)
       const persistAfterRound = async (valid: boolean) => {
@@ -722,12 +876,18 @@ export class PascalAiAgent {
       // replan keeps the first build (reported honestly below) rather than
       // trading a flawed scene for no scene.
       if (construction.structuralFailures.length > 0) {
-        const replanned = await this.buildPlanForSession(session, construction.structuralFailures)
+        const replanned = await this.runWorkflowStep(
+          session,
+          'plan',
+          () => this.buildPlanForSession(session, construction.structuralFailures),
+          result => result.ok,
+          'plan_rejected',
+        )
         if (replanned.ok) {
           planned = replanned
           if (replanned.intent) session.layoutIntent = replanned.intent
           session.layoutPlan = replanned.plan
-          this.sessions.set(session.sessionId, session)
+          this.persistSession(session)
           await this.clearLevelForRebuild(session, levelId)
           construction = await this.constructScenePlanFirst(session, levelId, planned.plan, { persistAfterRound })
         }
@@ -882,7 +1042,7 @@ export class PascalAiAgent {
       session.toolTrace = []
       // Persist the `modifying` phase up front so a crash mid-edit is
       // diagnosable rather than leaving the stored phase at its pre-edit value.
-      this.sessions.set(session.sessionId, session)
+      this.persistSession(session)
       const loaded = toolPayload(await this.callMcp(session.sessionId, 'load_scene', { id: sceneId }))
       // Plan-first modify (docs/MODIFY_REDESIGN.md §2): one model call
       // translates the request into ModifyOps; furniture ops run the
@@ -897,7 +1057,11 @@ export class PascalAiAgent {
       // addition is an add_room; the double-confirm for deletes already
       // happened before modify() runs.
       if (process.env.PASCAL_MODIFY_LEGACY !== '1') {
-        const fastPath = await this.tryPlanFirstModify(session, feedback, sceneId, nullableNumber(loaded.version))
+        const fastPath = await this.runWorkflowStep(
+          session,
+          'modify-plan',
+          () => this.tryPlanFirstModify(session, feedback, sceneId, nullableNumber(loaded.version)),
+        )
         if (fastPath) return fastPath
       }
       // Reaching legacy on a scene without plan snapshots deserves a note in
@@ -924,14 +1088,14 @@ export class PascalAiAgent {
       const purpose = isDeleteOperation
         ? `用户已确认对当前场景执行${operation}操作：${feedback}`
         : `用户已确认对当前场景执行${operation}操作：${feedback}\n${MODIFICATION_GUARD_PROMPT}${planSnapshot}`
-      const phase = await this.runPhaseToConvergence(
+      const phase = await this.runWorkflowStep(session, 'modify', () => this.runPhaseToConvergence(
         session,
         purpose,
         undefined,
         new Set<string>(),
         [],
         '按用户要求修改场景',
-      )
+      ))
       // create_room on an existing scene leaves coincident duplicate walls
       // along shared boundaries, exactly like fresh generation — but here the
       // original walls are read-only: only this turn's new walls may be
@@ -1087,6 +1251,7 @@ export class PascalAiAgent {
         ], `${session.sessionId}:modify:ops`, {
           ...hooks,
           operation: 'modify-ops',
+          promptVersion: 'modify-ops:v1',
           temperature: this.config.aiTemperatureGeometry,
         }).then(result => result.output),
       )
@@ -1621,7 +1786,11 @@ export class PascalAiAgent {
     for (let round = 0; round < this.config.maxToolRounds; round++) {
       this.throwIfCancelled(session.sessionId)
       const completion = await this.withModelFallback(session.sessionId, (model, hooks) =>
-        model.chat(messages, tools, `${session.sessionId}:inspect`, { ...hooks, operation: 'inspect' }),
+        model.chat(messages, tools, `${session.sessionId}:inspect`, {
+          ...hooks,
+          operation: 'inspect',
+          promptVersion: 'inspect:v1',
+        }),
       )
       const assistant = completion.choices[0]?.message
       if (!assistant) throw new Error('Model API returned no assistant message')
@@ -1685,7 +1854,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
               { role: 'user', content },
             ],
             `${session.sessionId}:extract:${attempt}`,
-            { ...hooks, operation: 'extract' },
+            { ...hooks, operation: 'extract', promptVersion: 'extract:v1' },
           ).then(result => result.output),
         )
       } catch (error) {
@@ -1800,7 +1969,11 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     for (let round = 0; round < this.config.maxToolRounds; round++) {
       this.throwIfCancelled(session.sessionId)
       const completion = await this.withModelFallback(session.sessionId, (model, hooks) =>
-        model.chat(messages, tools, `${session.sessionId}:scene`, { ...hooks, operation: 'scene-agent' }),
+        model.chat(messages, tools, `${session.sessionId}:scene`, {
+          ...hooks,
+          operation: 'scene-agent',
+          promptVersion: 'scene-agent:v1',
+        }),
       )
       const assistant = completion.choices[0]?.message
       if (!assistant) throw new Error('Model API returned no assistant message')
@@ -2084,6 +2257,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
             // plan-builder tags carry the round number ("plan:intent:2") —
             // strip it so the label stays aggregatable.
             operation: tag.replace(/:\d+$/, ''),
+            promptVersion: `${tag.replace(/:\d+$/, '')}:v1`,
             temperature,
           }).then(result => result.output),
         )
@@ -2092,6 +2266,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
         llmGeometry,
         profile,
         strategy,
+        templatesDir: this.config.templatesDir,
         ...(priorFailures?.length ? { priorFailures } : {}),
       },
     )
@@ -2169,7 +2344,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     const trace = startPhaseTrace(session, '结构与门窗施工（确定性执行器）')
     let report: SceneExecutionReport
     try {
-      report = await executeLayoutPlan({
+      report = await this.runWorkflowStep(session, 'structure-openings', () => executeLayoutPlan({
         plan,
         levelId,
         callMcp: async (name, args) => {
@@ -2181,7 +2356,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
         },
         dedupeSharedWalls: () => this.dedupeSharedWalls(session.sessionId, levelId),
         beforeCall: () => this.throwIfCancelled(session.sessionId),
-      })
+      }))
       trace.converged = true
       session.executionSteps.push({ phase: 'structure', status: 'completed', label: '按计划批量建造房间结构' })
       session.executionSteps.push({ phase: 'openings', status: 'completed', label: '按计划开门窗' })
@@ -2197,46 +2372,48 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     let furnitureCounts = { placed: 0, required: 0 }
     const furnitureTrace = startPhaseTrace(session, '家具布置（确定性执行器）')
     try {
-      const furnitureRooms = plan.rooms.map(planRoom => ({
-        id: planRoom.id,
-        name: planRoom.name,
-        type: planRoom.type,
-        polygon: planRoom.polygon,
-        zoneId: report.rooms.find(built => built.planRoomId === planRoom.id)?.zoneId ?? null,
-      }))
-      // Authoritative zone types for the gates/diagnostics: with this on the
-      // session, room names can be in any language — nothing downstream needs
-      // to guess types from 中/日/英 keywords for plan-first builds.
-      session.zoneRoomTypes = Object.fromEntries(
-        furnitureRooms
-          .filter(room => room.zoneId !== null)
-          .map(room => [room.zoneId as string, room.type]),
-      )
-      const furnished = await executeFurniturePlan({
-        rooms: furnitureRooms,
-        levelId,
-        callMcp: async (name, args) => {
-          const result = await this.callMcp(session.sessionId, name, args)
-          furnitureTrace.toolCounts[name] = (furnitureTrace.toolCounts[name] ?? 0) + 1
-          const detail = name === 'search_assets' && typeof args.query === 'string'
-            ? args.query
-            : name === 'place_item' && typeof args.catalogItemId === 'string' ? args.catalogItemId : undefined
-          furnitureTrace.toolCalls.push({ name, ok: true, ...(detail ? { detail } : {}) })
-          return result
-        },
-        beforeCall: () => this.throwIfCancelled(session.sessionId),
-        market: resolveNormProfile(this.config.normProfile).id,
+      await this.runWorkflowStep(session, 'furniture', async () => {
+        const furnitureRooms = plan.rooms.map(planRoom => ({
+          id: planRoom.id,
+          name: planRoom.name,
+          type: planRoom.type,
+          polygon: planRoom.polygon,
+          zoneId: report.rooms.find(built => built.planRoomId === planRoom.id)?.zoneId ?? null,
+        }))
+        // Authoritative zone types for the gates/diagnostics: with this on the
+        // session, room names can be in any language — nothing downstream needs
+        // to guess types from 中/日/英 keywords for plan-first builds.
+        session.zoneRoomTypes = Object.fromEntries(
+          furnitureRooms
+            .filter(room => room.zoneId !== null)
+            .map(room => [room.zoneId as string, room.type]),
+        )
+        const furnished = await executeFurniturePlan({
+          rooms: furnitureRooms,
+          levelId,
+          callMcp: async (name, args) => {
+            const result = await this.callMcp(session.sessionId, name, args)
+            furnitureTrace.toolCounts[name] = (furnitureTrace.toolCounts[name] ?? 0) + 1
+            const detail = name === 'search_assets' && typeof args.query === 'string'
+              ? args.query
+              : name === 'place_item' && typeof args.catalogItemId === 'string' ? args.catalogItemId : undefined
+            furnitureTrace.toolCalls.push({ name, ok: true, ...(detail ? { detail } : {}) })
+            return result
+          },
+          beforeCall: () => this.throwIfCancelled(session.sessionId),
+          market: resolveNormProfile(this.config.normProfile).id,
+        })
+        furnitureTrace.converged = true
+        if (furnished.placed.length > 0) toolNamesUsed.add('place_item')
+        furnitureIssues = [
+          ...furnished.missing.map(entry => `「${entry.room}」缺少${entry.label}：${entry.reason}`),
+          ...furnished.executionIssues,
+        ]
+        furnitureCounts = {
+          placed: furnished.placed.length,
+          required: furnished.placed.length + furnished.missing.length,
+        }
       })
-      furnitureTrace.converged = true
-      if (furnished.placed.length > 0) toolNamesUsed.add('place_item')
-      furnitureIssues = [
-        ...furnished.missing.map(entry => `「${entry.room}」缺少${entry.label}：${entry.reason}`),
-        ...furnished.executionIssues,
-      ]
-      furnitureCounts = {
-        placed: furnished.placed.length,
-        required: furnished.placed.length + furnished.missing.length,
-      }
       session.executionSteps.push({ phase: 'furnishing', status: 'completed', label: '按清单确定性布置家具' })
     } catch (error) {
       session.executionSteps.push({ phase: 'furnishing', status: 'failed', label: '确定性家具布置' })
@@ -2247,7 +2424,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     // (gates 1–5) belongs to the plan layer — repairing decorations on a
     // scene that is about to be cleared and rebuilt would only burn model
     // calls, so verification is skipped entirely in that case.
-    const preGates = await this.evaluateGates(session)
+    const preGates = await this.runWorkflowStep(session, 'gates', () => this.evaluateGates(session))
     const structuralFailures = preGates.report.failures
       .filter(failure => failure.gate <= 5)
       .map(failure => failure.message)
@@ -2270,7 +2447,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     // ⑦ Verification + bounded decorative repair, with the structure lock
     // active. The repair rounds start a fresh model conversation —
     // construction was model-free, so there is no prior thread to continue.
-    const result = await this.refineAndDiagnose(
+    const result = await this.runWorkflowStep(session, 'verification', () => this.refineAndDiagnose(
       session,
       `验证阶段：核对门窗宿主、家具碰撞和通行性，只修复检查发现的问题；禁止增删、移动或缩放任何房间，禁止改动已开好的门窗。\n${formatPlanSnapshot(plan)}`,
       {
@@ -2280,7 +2457,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
         lockStructure: true,
         ...(options.persistAfterRound ? { persistAfterRound: options.persistAfterRound } : {}),
       },
-    )
+    ))
     session.executionSteps.push({
       phase: 'verification',
       status: 'completed',
@@ -2288,7 +2465,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     })
     // Re-judge the gates after repairs (repair rounds may have re-hosted a
     // window or refit furniture; the lock guarantees structure is unchanged).
-    const postGates = await this.evaluateGates(session)
+    const postGates = await this.runWorkflowStep(session, 'gates', () => this.evaluateGates(session))
     return {
       ...result,
       executionIssues: report.executionIssues,
@@ -2375,13 +2552,17 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
       this.throwIfCancelled(session.sessionId)
       repairRounds++
       const repairTrace = startPhaseTrace(session, `自动修正第${repairRounds}轮`)
-      const result = await this.runSceneAgent(
+      const result = await this.runWorkflowStep(
         session,
-        `${purpose}\n自动修正第 ${repairRounds} 轮。必须先检查相关节点，再用工具修复以下具体问题；不要只解释，也不要推翻已确认需求：${JSON.stringify(diagnostics)}`,
-        conversation,
-        toolNamesUsed,
-        furnitureIssues,
-        repairTrace,
+        `repair:${repairRounds}`,
+        () => this.runSceneAgent(
+          session,
+          `${purpose}\n自动修正第 ${repairRounds} 轮。必须先检查相关节点，再用工具修复以下具体问题；不要只解释，也不要推翻已确认需求：${JSON.stringify(diagnostics)}`,
+          conversation,
+          toolNamesUsed,
+          furnitureIssues,
+          repairTrace,
+        ),
       )
       repairTrace.converged = result.converged
       conversation = result.messages
@@ -2620,8 +2801,18 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
       onAttemptStarted: () => this.chargeModelCall(sessionId),
       onAttemptFinished: result => {
         const context = this.activeRequestContexts.get(sessionId)
+        let persistence = 'failed'
+        try {
+          if (!context) throw new Error('Missing request context for model attempt')
+          this.modelAttempts.record({ ...context, sessionId }, result)
+          persistence = 'ok'
+        } catch (error) {
+          console.error(
+            `[req ${context?.requestId ?? '-'}] [trace ${context?.traceId ?? '-'}] model-attempt persistence failed: ${errorMessage(error)}`,
+          )
+        }
         console.log(
-          `[req ${context?.requestId ?? '-'}] [trace ${context?.traceId ?? '-'}] model-attempt op=${result.operation ?? '-'} call=${result.callId} n=${result.attemptNo} status=${result.status} model=${result.model ?? result.requestedModel} latency=${result.latencyMs}ms${result.usage?.totalTokens !== undefined ? ` tokens=${result.usage.totalTokens}` : ''}`,
+          `[req ${context?.requestId ?? '-'}] [trace ${context?.traceId ?? '-'}] model-attempt op=${result.operation ?? '-'} call=${result.callId} n=${result.attemptNo} status=${result.status} model=${result.model ?? result.requestedModel} latency=${result.latencyMs}ms persistence=${persistence}${result.usage?.totalTokens !== undefined ? ` tokens=${result.usage.totalTokens}` : ''}`,
         )
       },
     }
@@ -2695,7 +2886,7 @@ function createWorkflowGraph(nodes: {
     .addEdge('inspect', END)
     .addEdge('modify', END)
     // No checkpointer: every turn is invoked with the full state loaded from
-    // SessionStore (the single source of truth) and this graph runs exactly
+    // SQLite session persistence (the single source of truth) and this graph runs exactly
     // one super-step per turn, so a checkpointer would add nothing but an
     // unbounded, never-pruned in-memory store of past turns (a leak).
     .compile()

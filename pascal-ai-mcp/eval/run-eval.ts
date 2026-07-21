@@ -25,6 +25,11 @@ import { join } from 'node:path'
 import { PascalAiAgent, toolPayload } from '../src/agent'
 import { loadConfig } from '../src/config'
 import { PascalMcpClient } from '../src/mcp'
+import { AppDatabase } from '../src/persistence/database'
+import { ModelCallRepository } from '../src/persistence/model-call-repository'
+import { ChatRequestRepository, SqliteSessionPersistence } from '../src/persistence/session-repository'
+import { SqliteModelAttemptRecorder } from '../src/telemetry/model-attempt-recorder'
+import { WorkflowStepRepository } from '../src/persistence/workflow-step-repository'
 import type { ChatInput, ChatResult, PhaseToolTrace, SceneResult, WorkflowPhase } from '../src/types'
 import {
   canConfirmFromPhase,
@@ -829,9 +834,15 @@ async function main(): Promise<void> {
   }
 
   const config = loadConfig()
+  const database = new AppDatabase(config.databaseFile)
+  const modelAttempts = new SqliteModelAttemptRecorder(new ModelCallRepository(database))
+  const sessions = new SqliteSessionPersistence(database)
+  sessions.importLegacyFile(config.sessionFile)
+  const requests = new ChatRequestRepository(database)
+  const workflowSteps = new WorkflowStepRepository(database)
   const mcp = new PascalMcpClient(config)
   await mcp.connect()
-  const agent = new PascalAiAgent(config, mcp)
+  const agent = new PascalAiAgent(config, mcp, modelAttempts, sessions, requests, workflowSteps)
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
   const reportDir = join(REPORT_ROOT, timestamp)
@@ -866,6 +877,7 @@ async function main(): Promise<void> {
   console.log(`已生成 ${created.length} 个评审模板到 reviews/，手顺见 REVIEW_GUIDE.md；填好后运行 bun run eval:review 汇总。`)
 
   await mcp.close()
+  database.close()
   process.exit(summary.errorCount > 0 ? 1 : 0)
 }
 

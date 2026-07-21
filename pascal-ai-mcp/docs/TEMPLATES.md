@@ -10,6 +10,7 @@
 
 ```jsonc
 {
+  "schemaVersion": 1,            // 当前版本；仓库内模板必须显式填写
   "id": "tpl-jp-2ldk-60-tanoji",
   "meta": {
     "market": "jp",              // NormProfile id
@@ -26,6 +27,8 @@
 ```
 
 坐标要求：轴对齐、房间铺满 footprint（validator 覆盖率检查会抓漏）；精度到 0.1m 足够（照间取り图目测按比例量）。房型必须用系统 12 枚举；日本卫浴分离按方案 B（トイレ/洗面脱衣/浴室都是 `bathroom` 类型 + 名字区分）。
+
+`src/template-schema.ts` 是唯一结构契约：运行时加载器与 `templates:check` 共用 `TemplateRecordSchema`，错误会带精确字段路径（如 `plan.rooms[2].type`）。运行时保留显式的旧版迁移函数，但 CI 不会自动补版本：已入库 JSON 缺少 `schemaVersion` 会直接失败。服务启动时全量加载模板并输出健康摘要；开发环境警告后跳过单个坏文件，生产环境若 good/未知模板无效或无任何有效 good 模板，保持 liveness 但拒绝 `/chat`。
 
 ## 体检脚本
 

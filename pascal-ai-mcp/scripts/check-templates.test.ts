@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -36,17 +36,14 @@ describe('check-templates CLI', () => {
       mkdirSync(join(dir, 'good'))
       cpSync(realTemplatesDir, dir, { recursive: true })
       const sample = join(dir, 'good', 'quality-typo.json')
-      writeFileSync(
-        sample,
-        JSON.stringify({
-          id: 'tpl-quality-typo',
-          meta: { market: 'jp', label: 'typo', source: 'test', quality: 'excellent', badReasons: [] },
-          plan: { footprint: { width: 5, depth: 5 }, rooms: [] },
-        }),
-      )
+      const record = JSON.parse(readFileSync(join(realTemplatesDir, 'good', 'tpl-jp-2dk-44.json'), 'utf8'))
+      record.id = 'tpl-quality-typo'
+      record.meta.quality = 'excellent'
+      writeFileSync(sample, JSON.stringify(record))
       const { exitCode, output } = runCheck(dir)
       expect(exitCode).toBe(1)
-      expect(output).toContain('meta.quality 必须是 good 或 bad')
+      expect(output).toContain('meta.quality')
+      expect(output).toContain('expected one of "good"|"bad"')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -60,6 +57,21 @@ describe('check-templates CLI', () => {
       const { exitCode, output } = runCheck(dir)
       expect(exitCode).toBe(1)
       expect(output).toContain('模板加载失败')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('fails when a checked-in template omits schemaVersion', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tpl-check-'))
+    try {
+      mkdirSync(join(dir, 'good'))
+      const record = JSON.parse(readFileSync(join(realTemplatesDir, 'good', 'tpl-jp-2dk-44.json'), 'utf8'))
+      delete record.schemaVersion
+      writeFileSync(join(dir, 'good', 'missing-version.json'), JSON.stringify(record))
+      const { exitCode, output } = runCheck(dir)
+      expect(exitCode).toBe(1)
+      expect(output).toContain('schemaVersion')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

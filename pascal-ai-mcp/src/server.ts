@@ -1,23 +1,72 @@
-import type { Server } from 'bun'
 import { PascalAiAgent } from './agent'
 import { loadConfig } from './config'
 import { isValidImageDataUrl, readJsonBody } from './http-guards'
 import { PascalMcpClient } from './mcp'
+import { AppDatabase } from './persistence/database'
+import { ModelCallRepository } from './persistence/model-call-repository'
+import {
+  ChatRequestRepository,
+  RequestCancellationTargetNotFoundError,
+  RequestIdempotencyConflictError,
+  RequestQueueFullError,
+  SqliteSessionPersistence,
+} from './persistence/session-repository'
 import { clientRequestIdFrom, createRequestContext } from './request-context'
+import { RequestPayloadStore } from './request-payload-store'
+import { RequestWorker } from './request-worker'
+import { SqliteModelAttemptRecorder } from './telemetry/model-attempt-recorder'
+import { loadTemplateLibrary, templateLibraryAllowsTraffic } from './template-seed'
+import { WorkflowStepRepository } from './persistence/workflow-step-repository'
 
 const config = loadConfig()
+const database = new AppDatabase(config.databaseFile)
+const modelAttempts = new SqliteModelAttemptRecorder(new ModelCallRepository(database))
+const sessions = new SqliteSessionPersistence(database)
+const legacySessions = sessions.importLegacyFile(config.sessionFile)
+if (legacySessions.status === 'imported') {
+  console.log(`legacy-sessions: imported=${legacySessions.imported} skipped=${legacySessions.skipped}`)
+}
+const requests = new ChatRequestRepository(database)
+const workflowSteps = new WorkflowStepRepository(database)
+const templateLibrary = loadTemplateLibrary(config.templatesDir)
+const templatesAcceptTraffic = templateLibraryAllowsTraffic(templateLibrary.health)
+const templateHealthSummary = {
+  ready: templateLibrary.health.ready,
+  files: templateLibrary.health.files,
+  loaded: templateLibrary.health.loaded,
+  good: templateLibrary.health.good,
+  bad: templateLibrary.health.bad,
+  failed: templateLibrary.health.failed,
+}
+console.log(`template-library: ${JSON.stringify(templateHealthSummary)}`)
+if (templateLibrary.health.failures.length > 0) {
+  const log = process.env.NODE_ENV === 'production' ? console.error : console.warn
+  for (const failure of templateLibrary.health.failures) log(`template-library load failure: ${failure}`)
+}
 const mcp = new PascalMcpClient(config)
 await mcp.connect()
 
-const agent = new PascalAiAgent(config, mcp)
+const agent = new PascalAiAgent(config, mcp, modelAttempts, sessions, requests, workflowSteps)
+const requestPayloads = new RequestPayloadStore(config.requestArtifactsDir)
+const worker = new RequestWorker(requests, sessions, requestPayloads, agent, {
+  concurrency: config.requestWorkerConcurrency,
+  leaseMs: config.requestLeaseMs,
+  pollMs: config.requestWorkerPollMs,
+}, workflowSteps)
+if (templatesAcceptTraffic) worker.start()
+else worker.recoverExpired()
+// Keep Bun's transport safety cap above the application limit so ordinary
+// Content-Length violations reach readJsonBody and receive request identity.
+// Requests above this hard cap are rejected by Bun before application code.
+const transportMaxRequestBodyBytes = config.maxRequestBodyBytes * 2
 
 const server = Bun.serve({
   hostname: config.host,
   port: config.port,
-  maxRequestBodySize: config.maxRequestBodyBytes,
-  async fetch(request, bunServer: Server<undefined>): Promise<Response> {
+  maxRequestBodySize: transportMaxRequestBodyBytes,
+  async fetch(request): Promise<Response> {
     try {
-      return await handle(request, bunServer)
+      return await handle(request)
     } catch (error) {
       // Without this, an uncaught error (e.g. a bad sceneId, a hung MCP
       // call) falls through to Bun's default error response, which has no
@@ -29,7 +78,7 @@ const server = Bun.serve({
   },
 })
 
-async function handle(request: Request, bunServer: Server<undefined>): Promise<Response> {
+async function handle(request: Request): Promise<Response> {
   const url = new URL(request.url)
 
   if (request.method === 'OPTIONS') {
@@ -52,18 +101,6 @@ async function handle(request: Request, bunServer: Server<undefined>): Promise<R
   }
 
   if (request.method === 'POST' && url.pathname === '/chat') {
-    // A full generation can legitimately run for minutes (room-by-room
-    // structure phase, wall dedup, openings, furnishing, then verification
-    // with up to a few repair rounds — each its own tool-calling loop), and
-    // we only write the HTTP response once at the very end. Bun's HTTP
-    // server defaults to a 10s idle timeout and silently drops the
-    // connection if nothing is read/written on it in that window, so a slow
-    // /chat call gets its socket killed long before we're done — the
-    // request keeps running server-side and the scene still gets created,
-    // but the client sees an empty/truncated response. Disable the timeout
-    // for this endpoint specifically (0 = no timeout); the fast endpoints
-    // above keep the default.
-    bunServer.timeout(request, 0)
     // Authoritative requestId is minted here — before the body is even read,
     // so parse/validation rejections (400/413) carry ids too; body-supplied
     // ids never become the key (T1.3). The context travels with the whole
@@ -92,6 +129,15 @@ async function handle(request: Request, bunServer: Server<undefined>): Promise<R
       imageDataUrl?: string
       sceneId?: string
       action?: 'confirm' | 'cancel'
+      idempotencyKey?: string
+    }
+
+    if (body.action !== undefined && body.action !== 'confirm' && body.action !== 'cancel') {
+      return json({ error: 'invalid_action', ...identity() }, 400, identityHeaders)
+    }
+
+    if (body.idempotencyKey !== undefined && !isValidIdempotencyKey(body.idempotencyKey)) {
+      return json({ error: 'invalid_idempotency_key', ...identity() }, 400, identityHeaders)
     }
 
     if (!body.sessionId || (!body.message && !body.imageDataUrl && !body.action)) {
@@ -110,29 +156,92 @@ async function handle(request: Request, bunServer: Server<undefined>): Promise<R
       )
     }
 
-    console.log(
-      `[req ${context.requestId}] [trace ${context.traceId}] chat start session=${body.sessionId}${body.action ? ` action=${body.action}` : ''}`,
-    )
-    const chatStarted = performance.now()
+    if (!templatesAcceptTraffic) {
+      return json(
+        { error: 'template_library_unavailable', message: 'Template library is not ready', ...identity() },
+        503,
+        identityHeaders,
+      )
+    }
+
+    let imageArtifact: ReturnType<RequestPayloadStore['persistImage']> | undefined
     try {
-      const result = await agent.chat({
+      if (body.imageDataUrl) imageArtifact = requestPayloads.persistImage(body.imageDataUrl)
+      const queuedAt = new Date().toISOString()
+      const enqueued = requests.enqueue({
+        requestId: context.requestId,
+        traceId: context.traceId,
+        ...(context.clientRequestId ? { clientRequestId: context.clientRequestId } : {}),
+        sessionId: body.sessionId,
+        kind: body.action === 'confirm' ? 'confirm' : body.action === 'cancel' ? 'cancel' : 'chat',
+        ...(body.sceneId ? { sceneId: body.sceneId } : {}),
+        ...(body.idempotencyKey ? { idempotencyKey: body.idempotencyKey } : {}),
+        startedAt: queuedAt,
+      }, {
         sessionId: body.sessionId,
         ...(body.message ? { message: body.message } : {}),
-        ...(body.imageDataUrl ? { imageDataUrl: body.imageDataUrl } : {}),
+        ...(imageArtifact ? { imageArtifact } : {}),
         ...(body.sceneId ? { sceneId: body.sceneId } : {}),
         ...(body.action ? { action: body.action } : {}),
-        context,
-      })
+      }, config.requestQueueDepth)
+      if (!enqueued.created) requestPayloads.deleteImage(imageArtifact)
+      for (const cancelled of enqueued.cancelled) {
+        try {
+          requestPayloads.deleteImage(cancelled.input?.imageArtifact)
+        } catch (error) {
+          console.error(`[req ${cancelled.requestId}] cancelled artifact cleanup failed: ${errorMessage(error)}`)
+        }
+      }
+      if (enqueued.created && body.action === 'cancel') worker.requestCancellation(body.sessionId)
+      if (enqueued.created) worker.notify()
+      if (!enqueued.created) {
+        console.log(
+          `[req ${context.requestId}] [trace ${context.traceId}] idempotency reuse resolved to req=${enqueued.request.requestId} trace=${enqueued.request.traceId}`,
+        )
+      }
       console.log(
-        `[req ${context.requestId}] [trace ${context.traceId}] chat ok in ${Math.round(performance.now() - chatStarted)}ms`,
+        `[req ${enqueued.request.requestId}] [trace ${enqueued.request.traceId}] chat ${enqueued.created ? 'queued' : 'reused'} session=${body.sessionId}${body.action ? ` action=${body.action}` : ''}`,
       )
-      return json({ ...result, ...identity() }, 200, identityHeaders)
+      return json(
+        {
+          status: enqueued.request.status,
+          reused: !enqueued.created,
+          statusUrl: `/requests/${enqueued.request.requestId}`,
+          requestId: enqueued.request.requestId,
+          traceId: enqueued.request.traceId,
+          ...(context.clientRequestId ? { clientRequestId: context.clientRequestId } : {}),
+        },
+        202,
+        {
+          'x-request-id': enqueued.request.requestId,
+          'x-trace-id': enqueued.request.traceId,
+          Location: `/requests/${enqueued.request.requestId}`,
+        },
+      )
     } catch (error) {
-      console.error(
-        `[req ${context.requestId}] [trace ${context.traceId}] chat failed in ${Math.round(performance.now() - chatStarted)}ms: ${errorMessage(error)}`,
-      )
-      // The requests that most need correlating are the failed ones — never
-      // drop the ids on the error path (full error-code envelope is T1.7).
+      requestPayloads.deleteImage(imageArtifact)
+      if (error instanceof RequestQueueFullError) {
+        return json(
+          { error: 'queue_full', message: error.message, ...identity() },
+          429,
+          { ...identityHeaders, 'Retry-After': '2' },
+        )
+      }
+      if (error instanceof RequestCancellationTargetNotFoundError) {
+        return json(
+          { error: 'session_not_found', message: error.message, ...identity() },
+          404,
+          identityHeaders,
+        )
+      }
+      if (error instanceof RequestIdempotencyConflictError) {
+        return json(
+          { error: 'idempotency_conflict', message: error.message, existingRequestId: error.requestId, ...identity() },
+          409,
+          identityHeaders,
+        )
+      }
+      console.error(`[req ${context.requestId}] [trace ${context.traceId}] enqueue failed: ${errorMessage(error)}`)
       return json(
         { error: 'internal_error', message: errorMessage(error), ...identity() },
         500,
@@ -141,13 +250,44 @@ async function handle(request: Request, bunServer: Server<undefined>): Promise<R
     }
   }
 
+  const requestMatch = url.pathname.match(/^\/requests\/([^/]+)$/)
+  if (requestMatch && request.method === 'GET') {
+    const requestId = decodeURIComponent(requestMatch[1] ?? '')
+    const record = requests.find(requestId)
+    if (!record) return json({ error: 'request_not_found' }, 404)
+    const session = record.result ? agent.getSession(record.result.sessionId) : undefined
+    const steps = workflowSteps.findByRequestId(requestId)
+    return json({
+      requestId: record.requestId,
+      traceId: record.traceId,
+      ...(record.clientRequestId ? { clientRequestId: record.clientRequestId } : {}),
+      ...(record.idempotencyKey ? { idempotencyKey: record.idempotencyKey } : {}),
+      sessionId: record.sessionId,
+      kind: record.kind,
+      status: record.status,
+      runAttempts: record.runAttempts,
+      queuedAt: record.queuedAt,
+      ...(record.startedAt ? { startedAt: record.startedAt } : {}),
+      ...(record.completedAt ? { completedAt: record.completedAt } : {}),
+      ...(record.errorCode ? { errorCode: record.errorCode } : {}),
+      steps,
+      ...(record.result && session ? {
+        result: { reply: record.result.reply, session },
+      } : {}),
+    }, 200, { 'x-request-id': record.requestId, 'x-trace-id': record.traceId })
+  }
+
   const sessionMatch = url.pathname.match(/^\/sessions\/([^/]+)$/)
   if (sessionMatch && request.method === 'GET') {
     return json({ session: agent.getSession(decodeURIComponent(sessionMatch[1] ?? '')) ?? null })
   }
 
   if (sessionMatch && request.method === 'DELETE') {
-    const deleted = agent.deleteSession(decodeURIComponent(sessionMatch[1] ?? ''))
+    const sessionId = decodeURIComponent(sessionMatch[1] ?? '')
+    if (requests.hasActiveRequest(sessionId)) {
+      return json({ deleted: false, error: 'session_busy' }, 409)
+    }
+    const deleted = agent.deleteSession(sessionId)
     return json({ deleted })
   }
 
@@ -156,14 +296,14 @@ async function handle(request: Request, bunServer: Server<undefined>): Promise<R
 
 console.log(`pascal-ai-mcp listening on http://${server.hostname}:${server.port}`)
 console.log(
-  `config: provider=${config.aiProvider} model=${config.aiModel} mcpMode=${config.mcpMode} configured=${Boolean(config.aiApiKey)} maxBodyMB=${Math.round(config.maxRequestBodyBytes / 1024 / 1024)}`,
+  `config: provider=${config.aiProvider} model=${config.aiModel} mcpMode=${config.mcpMode} configured=${Boolean(config.aiApiKey)} maxBodyMB=${Math.round(config.maxRequestBodyBytes / 1024 / 1024)} transportMaxBodyMB=${Math.round(transportMaxRequestBodyBytes / 1024 / 1024)} workerConcurrency=${config.requestWorkerConcurrency} queueDepth=${config.requestQueueDepth}`,
 )
 
-// Graceful shutdown (ARCHITECTURE_TASKS.md T0.4): stop accepting new
-// requests, drain queued session writes within the configured budget, then
-// close MCP. A flush failure or timeout exits non-zero so supervisors don't
-// mistake dropped state for a clean stop. SIGKILL obviously bypasses all of
-// this — only the cooperative path is covered.
+// Graceful shutdown (ARCHITECTURE_TASKS.md T0.4/T1.5/T2.1): stop accepting
+// work and drain claimed queue jobs before closing MCP and SQLite. A drain
+// timeout exits non-zero so supervisors don't mistake dropped state for a
+// clean stop. SIGKILL bypasses this path; the expired lease is then marked
+// process_interrupted by the next worker and is deliberately not replayed.
 let shuttingDown = false
 async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) {
@@ -172,6 +312,7 @@ async function shutdown(signal: string): Promise<void> {
     process.exit(1)
   }
   shuttingDown = true
+  worker.stopAccepting()
   console.log(`received ${signal}, shutting down`)
   let exitCode = 0
   // server.stop() resolves once in-flight requests finish — exiting before
@@ -186,15 +327,21 @@ async function shutdown(signal: string): Promise<void> {
     exitCode = 1
   }
   try {
-    await withTimeout(agent.flushSessions(), config.shutdownDrainTimeoutMs, 'session flush')
+    await withTimeout(worker.drain(), config.shutdownDrainTimeoutMs, 'request worker')
   } catch (error) {
-    console.error('shutdown: failed to persist session store:', errorMessage(error))
-    exitCode = 1
+    console.error('shutdown: gave up waiting for request worker:', errorMessage(error))
+    process.exit(1)
   }
   try {
     await mcp.close()
   } catch (error) {
     console.error('shutdown: failed to close MCP client:', errorMessage(error))
+  }
+  try {
+    database.close()
+  } catch (error) {
+    console.error('shutdown: failed to close audit database:', errorMessage(error))
+    exitCode = 1
   }
   process.exit(exitCode)
 }
@@ -227,10 +374,14 @@ function corsHeaders(): Record<string, string> {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Expose-Headers': 'x-request-id, x-trace-id',
+    'Access-Control-Expose-Headers': 'x-request-id, x-trace-id, Location, Retry-After',
   }
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function isValidIdempotencyKey(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9._:-]{8,128}$/.test(value)
 }

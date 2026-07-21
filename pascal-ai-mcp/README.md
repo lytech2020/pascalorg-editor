@@ -82,7 +82,7 @@ cd pascal-ai-mcp
 bun run start
 ```
 
-The service starts even when no model key is configured; chat requests then return a recoverable configuration error. The startup log prints a config summary (provider, model, mcpMode, configured, body limit).
+The service starts even when no model key is configured; chat jobs then end with a recoverable configuration error. The startup log prints a config summary including provider, model, MCP mode, body limit, worker concurrency, and queue depth.
 
 ## Deployment boundary
 
@@ -90,25 +90,46 @@ The service has **no authentication** and is intended for local/private-network 
 
 `/chat` bodies are capped at `AI_MCP_MAX_BODY_MB` (default 28MB — sized for the editor's 20MB image limit after base64 inflation); the cap is enforced by counting the stream, so chunked requests without a Content-Length are covered too. Oversized requests get `413`; malformed JSON or invalid image data URLs (non-png/jpeg, empty or undecodable base64, wrong magic bytes) get `400`.
 
-On SIGTERM/SIGINT the server stops accepting requests, waits up to `AI_MCP_DRAIN_TIMEOUT_MS` (default 5000) for in-flight requests and queued session writes, then exits — non-zero if anything could not be drained.
+`POST /chat` is backed by the SQLite `ai_requests` queue. The worker defaults to one concurrent job (`AI_MCP_WORKER_CONCURRENCY=1`) because the current MCP connection targets one active scene; `AI_MCP_MAX_QUEUE_DEPTH` defaults to 100. A full queue returns `429` with `Retry-After`. Cancel bypasses that limit only when its session or an active target actually exists; an unknown target returns `404`. Each claimed job has a renewable lease. Losing the lease cancels local execution. After a hard process interruption, queued jobs are claimed after restart, while an expired running job is marked `failed/process_interrupted` and any running workflow step becomes `failed_recoverable`. Unsafe scene writes are never replayed automatically.
+
+Queued text is stored only while the job is active and cleared at completion. Uploaded images are decoded to private mode-0600 files under `AI_MCP_REQUEST_ARTIFACTS_DIR` (default `.data/request-artifacts`); SQLite stores only a hash/MIME/size reference and the file is deleted at the terminal state. The full expiry/cleanup command remains T1.6.
+
+On SIGTERM/SIGINT the server stops accepting HTTP requests and claiming queue jobs, waits up to `AI_MCP_DRAIN_TIMEOUT_MS` (default 5000) for handlers and claimed jobs to drain, then closes MCP and the database. A drain timeout exits non-zero.
 
 ## Endpoints
 
 - `GET /health` — liveness only, returns `{ "ok": true }`
 - `GET /tools`
-- `POST /chat`
+- `POST /chat` — enqueue work and return `202`
+- `GET /requests/:id` — query queued/running/terminal status and result
 - `GET /sessions/:id`
 - `DELETE /sessions/:id`
 
-`POST /chat` accepts:
+`POST /chat` accepts the following body and immediately returns a server-authoritative request id:
 
 ```json
 {
   "sessionId": "demo",
   "sceneId": "optional-active-scene-id",
-  "message": "设计一个85平方米的两居室"
+  "message": "设计一个85平方米的两居室",
+  "idempotencyKey": "client-generated-stable-key"
 }
 ```
+
+```json
+{
+  "status": "queued",
+  "requestId": "server-generated-uuid",
+  "traceId": "trace-id",
+  "statusUrl": "/requests/server-generated-uuid"
+}
+```
+
+Poll `statusUrl` until `status` is `succeeded`, `failed`, or `cancelled`. The status response includes persisted workflow steps; a successful response also includes `result.reply` and the current session snapshot. The editor uses this polling path, so closing the original POST connection does not lose the job.
+
+`idempotencyKey` is optional and must contain 8–128 ASCII letters, digits, `.`, `_`, `:`, or `-`. Repeating the same scoped request with identical input returns the original request id with `reused: true`; changing the input under the same key returns `409 idempotency_conflict`. The browser cannot choose the trusted identity scope. The current local-only service uses one `local` scope; an authenticated BFF must supply the user/organization scope when TX.1 is implemented.
+
+The editor keeps the key stable for the same logical submission while the POST or status-polling outcome is ambiguous. A retry of restored, unchanged input therefore resumes the original request; a definitive rejection, terminal result, changed input, or explicit new attempt gets a new key.
 
 Image input adds `imageDataUrl`. Confirmation and cancellation use:
 
@@ -116,7 +137,7 @@ Image input adds `imageDataUrl`. Confirmation and cancellation use:
 { "sessionId": "demo", "action": "confirm" }
 ```
 
-The service stores workflow sessions in `.data/sessions.json`. LangGraph also checkpoints node execution by `sessionId` for the running process.
+The service stores workflow state, user-visible messages, request records, workflow steps, and model-call usage in `.data/ai.db`. Existing `.data/sessions.json` data is imported once and is never written again. Session updates use optimistic versions so stale concurrent writers cannot overwrite newer state. Deleting a session returns `409 session_busy` while it has queued/running work; after deletion, messages and request payload/results are removed while request audit identity/status remains. LangGraph still routes node execution in the running process; SQLite is the durable source for request and step status.
 
 ## Verify
 

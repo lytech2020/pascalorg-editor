@@ -31,6 +31,21 @@ describe('readJsonBody', () => {
     expect(result).toEqual({ ok: false, status: 413, error: 'payload_too_large' })
   })
 
+  test('keeps the 413 result when cancelling the oversized body fails', async () => {
+    const body = new ReadableStream<Uint8Array>({
+      cancel() {
+        throw new Error('peer reset')
+      },
+    })
+    const request = new Request('http://localhost/chat', {
+      method: 'POST',
+      headers: { 'content-length': '2048' },
+      body,
+    })
+    const result = await readJsonBody(request, 1024)
+    expect(result).toEqual({ ok: false, status: 413, error: 'payload_too_large' })
+  })
+
   // The regression from review: a chunked body carries no Content-Length, so
   // the byte counter is the only thing standing between us and an unbounded
   // read.
