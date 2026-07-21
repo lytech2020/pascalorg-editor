@@ -52,6 +52,18 @@ type ChatResponse = {
 
 type UiMessage = { id: string; role: 'user' | 'assistant'; content: string }
 
+// Correlation record for one /chat call (T1.3): clientRequestId is ours,
+// requestId/traceId come back from the AI service. Kept for success, failure
+// and cancellation so any request can be matched to server-side logs.
+type RequestRecord = {
+  clientRequestId: string
+  requestId?: string
+  traceId?: string
+  kind: 'chat' | 'cancel'
+  status: 'ok' | 'error'
+  at: string
+}
+
 function aiAgentUrl(): string {
   if (process.env.NEXT_PUBLIC_AI_AGENT_URL) return process.env.NEXT_PUBLIC_AI_AGENT_URL
   return '/api/ai'
@@ -97,6 +109,15 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
   const [busy, setBusy] = useState(false)
   const [cancelling, setCancelling] = useState(false)
   const [error, setError] = useState('')
+  // Rolling log of recent request correlations (client id -> server ids);
+  // kept in a ref (not render state) and mirrored to console.debug.
+  const requestLogRef = useRef<RequestRecord[]>([])
+  const recordRequest = useCallback((record: RequestRecord) => {
+    requestLogRef.current = [...requestLogRef.current.slice(-19), record]
+    console.debug(
+      `[ai-assistant] ${record.kind} ${record.status} client=${record.clientRequestId} server=${record.requestId ?? '-'} trace=${record.traceId ?? '-'}`,
+    )
+  }, [])
   const fileInputRef = useRef<HTMLInputElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
 
@@ -215,12 +236,18 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
           throw new Error('The AI service returned an empty or truncated response. If generation may have finished, refresh the page to check the result, or try again later.')
         }
 
+        // Record the correlation BEFORE the ok-check: failed requests are the
+        // ones that most need matching to server logs, and the AI service
+        // includes the ids on its error responses too.
+        recordRequest({
+          clientRequestId,
+          requestId: payload.requestId ?? response.headers.get('x-request-id') ?? undefined,
+          traceId: payload.traceId ?? response.headers.get('x-trace-id') ?? undefined,
+          kind: 'chat',
+          status: response.ok ? 'ok' : 'error',
+          at: new Date().toISOString(),
+        })
         if (!response.ok) throw new Error(payload.error ?? `AI request failed (${response.status})`)
-        if (payload.requestId) {
-          console.debug(
-            `[ai-assistant] request ${clientRequestId} -> server requestId ${payload.requestId} trace ${payload.traceId ?? '-'}`,
-          )
-        }
         setSession(payload.session)
         setMessages((current) => [
           ...current,
@@ -233,7 +260,7 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
         setBusy(false)
       }
     },
-    [maybeRedirectToScene, recoverSession, sceneId, sessionId],
+    [maybeRedirectToScene, recordRequest, recoverSession, sceneId, sessionId],
   )
 
   // Stop an in-flight generation/modification. Sent as a separate, concurrent
@@ -244,18 +271,38 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
   const cancelGeneration = useCallback(async () => {
     if (!sessionId || cancelling) return
     setCancelling(true)
+    const clientRequestId = crypto.randomUUID()
     try {
-      await fetch(`${aiAgentUrl()}/chat`, {
+      const response = await fetch(`${aiAgentUrl()}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId, ...(sceneId ? { sceneId } : {}), action: 'cancel' }),
+        body: JSON.stringify({
+          sessionId,
+          clientRequestId,
+          ...(sceneId ? { sceneId } : {}),
+          action: 'cancel',
+        }),
+      })
+      recordRequest({
+        clientRequestId,
+        requestId: response.headers.get('x-request-id') ?? undefined,
+        traceId: response.headers.get('x-trace-id') ?? undefined,
+        kind: 'cancel',
+        status: response.ok ? 'ok' : 'error',
+        at: new Date().toISOString(),
       })
     } catch {
       // Best-effort: the in-flight request will still surface the outcome.
+      recordRequest({
+        clientRequestId,
+        kind: 'cancel',
+        status: 'error',
+        at: new Date().toISOString(),
+      })
     } finally {
       setCancelling(false)
     }
-  }, [cancelling, sceneId, sessionId])
+  }, [cancelling, recordRequest, sceneId, sessionId])
 
   const send = useCallback(async () => {
     const message = input.trim()

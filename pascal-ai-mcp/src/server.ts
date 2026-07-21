@@ -90,6 +90,12 @@ async function handle(request: Request, bunServer: Server<undefined>): Promise<R
       `[req ${context.requestId}] [trace ${context.traceId}] chat start session=${body.sessionId}${body.action ? ` action=${body.action}` : ''}`,
     )
     const chatStarted = performance.now()
+    const identity = {
+      requestId: context.requestId,
+      traceId: context.traceId,
+      ...(context.clientRequestId ? { clientRequestId: context.clientRequestId } : {}),
+    }
+    const identityHeaders = { 'x-request-id': context.requestId, 'x-trace-id': context.traceId }
     try {
       const result = await agent.chat({
         sessionId: body.sessionId,
@@ -102,17 +108,18 @@ async function handle(request: Request, bunServer: Server<undefined>): Promise<R
       console.log(
         `[req ${context.requestId}] [trace ${context.traceId}] chat ok in ${Math.round(performance.now() - chatStarted)}ms`,
       )
-      return json({
-        ...result,
-        requestId: context.requestId,
-        traceId: context.traceId,
-        ...(context.clientRequestId ? { clientRequestId: context.clientRequestId } : {}),
-      })
+      return json({ ...result, ...identity }, 200, identityHeaders)
     } catch (error) {
       console.error(
         `[req ${context.requestId}] [trace ${context.traceId}] chat failed in ${Math.round(performance.now() - chatStarted)}ms: ${errorMessage(error)}`,
       )
-      throw error
+      // The requests that most need correlating are the failed ones — never
+      // drop the ids on the error path (full error-code envelope is T1.7).
+      return json(
+        { error: 'internal_error', message: errorMessage(error), ...identity },
+        500,
+        identityHeaders,
+      )
     }
   }
 
@@ -186,12 +193,13 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 process.on('SIGINT', () => void shutdown('SIGINT'))
 process.on('SIGTERM', () => void shutdown('SIGTERM'))
 
-function json(payload: unknown, status = 200): Response {
+function json(payload: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(payload, null, 2), {
     status,
-      headers: {
+    headers: {
       'Content-Type': 'application/json; charset=utf-8',
       ...corsHeaders(),
+      ...headers,
     },
   })
 }
@@ -201,6 +209,7 @@ function corsHeaders(): Record<string, string> {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Expose-Headers': 'x-request-id, x-trace-id',
   }
 }
 
