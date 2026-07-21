@@ -19,9 +19,14 @@ export type ModelUsage = {
 // (ai_model_calls in T1.2); business logs and the session are not.
 export type ModelAttemptResult = {
   provider: 'openai-compatible' | 'azure-openai'
-  // Caller-supplied operation tag (e.g. "sess-1:extract:0") — groups attempts
-  // by business purpose when persisted.
-  operation: string
+  // Stable low-cardinality business label ("extract", "plan:intent", …) from
+  // RequestHooks.operation — the aggregation axis for per-stage cost stats.
+  // Absent when the caller didn't classify the call.
+  operation?: string
+  // Raw per-call correlation tag (also sent to the provider as session_id).
+  // High-cardinality — carries sessionId and retry round; keep it out of
+  // aggregation keys.
+  sessionKey: string
   // Unique id per logical model call (one request() invocation). Primary,
   // fast and fallback calls each get their own callId, so their attemptNo
   // sequences don't collide when persisted.
@@ -63,6 +68,10 @@ export type RequestHooks = {
   onAttemptStarted?: () => void
   onAttemptFinished?: (result: ModelAttemptResult) => void
   temperature?: number
+  // Stable business label for this call ("extract", "modify-ops",
+  // "plan:intent", …). Keep it low-cardinality — no session ids or round
+  // numbers — so persisted attempts can be aggregated per stage.
+  operation?: string
 }
 
 // Uniform return contract for text/JSON model calls: the parsed output plus
@@ -157,13 +166,14 @@ export class OpenAiCompatibleClient {
       const finished = (
         partial: Omit<
           ModelAttemptResult,
-          'provider' | 'operation' | 'callId' | 'requestedModel' | 'attemptNo' | 'startedAt' | 'latencyMs'
+          'provider' | 'operation' | 'sessionKey' | 'callId' | 'requestedModel' | 'attemptNo' | 'startedAt' | 'latencyMs'
         >,
       ): void => {
         try {
           hooks.onAttemptFinished?.({
             provider: this.options.provider,
-            operation: sessionId,
+            ...(hooks.operation ? { operation: hooks.operation } : {}),
+            sessionKey: sessionId,
             callId,
             requestedModel: this.requestedModel(),
             attemptNo: attempt + 1,
@@ -177,16 +187,46 @@ export class OpenAiCompatibleClient {
           console.error('onAttemptFinished hook failed:', errorMessage(error))
         }
       }
+      // Combine the per-attempt timeout with the caller's cancel signal (if
+      // any) so a user cancel aborts the in-flight request instead of
+      // waiting for it (or its retries) to finish. Saved so the body-read
+      // phase below can classify its own abort correctly.
+      const attemptSignal = anySignal(AbortSignal.timeout(timeoutMs), hooks.signal)
+      // Body reads (json()/text()) can fail after the provider already
+      // served — and billed — the request, so every outcome must still emit
+      // exactly one attempt record: caller cancel → cancelled, timeout →
+      // network_error, anything else → invalid_response.
+      const readBody = async <T>(read: () => Promise<T>, httpStatus: number): Promise<T> => {
+        try {
+          return await read()
+        } catch (error) {
+          if (hooks.signal?.aborted) {
+            finished({ status: 'cancelled', httpStatus, errorSummary: 'cancelled during body read' })
+            throw new Error('Model API request cancelled')
+          }
+          if (attemptSignal.aborted) {
+            finished({
+              status: 'network_error',
+              httpStatus,
+              errorSummary: truncate(`timed out during body read: ${errorMessage(error)}`),
+            })
+            throw error
+          }
+          finished({
+            status: 'invalid_response',
+            httpStatus,
+            errorSummary: truncate(`unreadable body: ${errorMessage(error)}`),
+          })
+          throw error
+        }
+      }
       let response: Response
       try {
         response = await fetch(this.requestUrl(), {
           method: 'POST',
           headers: this.headers(),
           body,
-          // Combine the per-attempt timeout with the caller's cancel signal
-          // (if any) so a user cancel aborts the in-flight request instead of
-          // waiting for it (or its retries) to finish.
-          signal: anySignal(AbortSignal.timeout(timeoutMs), hooks.signal),
+          signal: attemptSignal,
         })
       } catch (error) {
         // A cancel is not a transient failure — do not burn retries on it,
@@ -208,19 +248,10 @@ export class OpenAiCompatibleClient {
         continue
       }
       if (response.ok) {
-        let payload: ChatCompletionResponse
-        try {
-          payload = (await response.json()) as ChatCompletionResponse
-        } catch (error) {
-          // The provider served (and billed) this request even though the
-          // body is unusable — it must still be recorded as a real attempt.
-          finished({
-            status: 'invalid_response',
-            httpStatus: response.status,
-            errorSummary: truncate(`unparseable 2xx body: ${errorMessage(error)}`),
-          })
-          throw error
-        }
+        const payload = await readBody(
+          () => response.json() as Promise<ChatCompletionResponse>,
+          response.status,
+        )
         finished({
           status: 'ok',
           httpStatus: response.status,
@@ -234,7 +265,7 @@ export class OpenAiCompatibleClient {
         return payload
       }
 
-      const responseBody = await response.text()
+      const responseBody = await readBody(() => response.text(), response.status)
       finished({
         status: 'http_error',
         httpStatus: response.status,

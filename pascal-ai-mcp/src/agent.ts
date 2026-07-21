@@ -407,8 +407,11 @@ export class PascalAiAgent {
   private chargeModelCall(sessionId: string): void {
     const used = this.modelCallBudgets.get(sessionId)
     if (used === undefined) return
+    // Check BOTH ceilings before recording: a rejected attempt sends no HTTP
+    // request and emits no telemetry, so counting it would leave
+    // modelCallsTotal permanently one ahead of the attempt records (T1.2
+    // reconciles the two).
     const next = used + 1
-    this.modelCallBudgets.set(sessionId, next)
     if (next > this.config.maxModelCallsPerTurn) {
       throw new BudgetExceededError(this.config.maxModelCallsPerTurn)
     }
@@ -416,6 +419,7 @@ export class PascalAiAgent {
     if (priorTotal + next > this.config.maxModelCallsPerSession) {
       throw new BudgetExceededError(this.config.maxModelCallsPerSession)
     }
+    this.modelCallBudgets.set(sessionId, next)
   }
 
   private async ingest(state: WorkflowGraphState): Promise<Partial<WorkflowGraphState>> {
@@ -571,7 +575,7 @@ export class PascalAiAgent {
             },
           ],
           'scene-intent',
-          hooks,
+          { ...hooks, operation: 'scene-intent' },
         ),
       )
       if (isSceneIntent(result.output.intent)) return result.output.intent
@@ -1064,8 +1068,11 @@ export class PascalAiAgent {
               ? userContent
               : `${userContent}\n上一次输出解析失败：${parsed.errors.join('；')}。请严格按 schema 修正后重新只输出 JSON。`,
           },
-        ], `${session.sessionId}:modify:ops`, { ...hooks, temperature: this.config.aiTemperatureGeometry })
-          .then(result => result.output),
+        ], `${session.sessionId}:modify:ops`, {
+          ...hooks,
+          operation: 'modify-ops',
+          temperature: this.config.aiTemperatureGeometry,
+        }).then(result => result.output),
       )
       parsed = parseModifyOps(raw)
       // Only parse DEFECTS warrant a retry; an empty-ops answer with no
@@ -1598,7 +1605,7 @@ export class PascalAiAgent {
     for (let round = 0; round < this.config.maxToolRounds; round++) {
       this.throwIfCancelled(session.sessionId)
       const completion = await this.withModelFallback(session.sessionId, (model, hooks) =>
-        model.chat(messages, tools, `${session.sessionId}:inspect`, hooks),
+        model.chat(messages, tools, `${session.sessionId}:inspect`, { ...hooks, operation: 'inspect' }),
       )
       const assistant = completion.choices[0]?.message
       if (!assistant) throw new Error('Model API returned no assistant message')
@@ -1662,7 +1669,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
               { role: 'user', content },
             ],
             `${session.sessionId}:extract:${attempt}`,
-            hooks,
+            { ...hooks, operation: 'extract' },
           ).then(result => result.output),
         )
       } catch (error) {
@@ -1777,7 +1784,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     for (let round = 0; round < this.config.maxToolRounds; round++) {
       this.throwIfCancelled(session.sessionId)
       const completion = await this.withModelFallback(session.sessionId, (model, hooks) =>
-        model.chat(messages, tools, `${session.sessionId}:scene`, hooks),
+        model.chat(messages, tools, `${session.sessionId}:scene`, { ...hooks, operation: 'scene-agent' }),
       )
       const assistant = completion.choices[0]?.message
       if (!assistant) throw new Error('Model API returned no assistant message')
@@ -2056,8 +2063,13 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
         this.throwIfCancelled(session.sessionId)
         trace.modelCalls++
         return this.withModelFallback(session.sessionId, (model, hooks) =>
-          model.complete(messages, `${session.sessionId}:${tag}`, { ...hooks, temperature })
-            .then(result => result.output),
+          model.complete(messages, `${session.sessionId}:${tag}`, {
+            ...hooks,
+            // plan-builder tags carry the round number ("plan:intent:2") —
+            // strip it so the label stays aggregatable.
+            operation: tag.replace(/:\d+$/, ''),
+            temperature,
+          }).then(result => result.output),
         )
       },
       {

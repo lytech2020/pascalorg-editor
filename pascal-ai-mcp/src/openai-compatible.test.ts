@@ -266,20 +266,77 @@ describe('attempt telemetry (T1.1)', () => {
     })
   })
 
-  test('attempts carry the operation tag and a per-call callId', async () => {
+  test('attempts separate the stable operation label from the session key', async () => {
     globalThis.fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) =>
       Response.json({ choices: [{ message: { role: 'assistant', content: 'ok' } }] })) as typeof fetch
 
     const attempts: import('./openai-compatible').ModelAttemptResult[] = []
     const client = makeClient()
-    const hooks = { onAttemptFinished: (a: import('./openai-compatible').ModelAttemptResult) => attempts.push(a) }
+    const hooks = {
+      operation: 'extract',
+      onAttemptFinished: (a: import('./openai-compatible').ModelAttemptResult) => attempts.push(a),
+    }
     await client.complete([{ role: 'user', content: 'hi' }], 'sess-1:extract:0', hooks)
-    await client.complete([{ role: 'user', content: 'hi' }], 'sess-1:extract:0', hooks)
+    await client.complete([{ role: 'user', content: 'hi' }], 'sess-1:extract:1', hooks)
     expect(attempts).toHaveLength(2)
-    expect(attempts[0]?.operation).toBe('sess-1:extract:0')
+    // operation is the low-cardinality aggregation axis; the raw round-bearing
+    // tag lives in sessionKey.
+    expect(attempts.map(a => a.operation)).toEqual(['extract', 'extract'])
+    expect(attempts[0]?.sessionKey).toBe('sess-1:extract:0')
+    expect(attempts[1]?.sessionKey).toBe('sess-1:extract:1')
     expect(attempts[0]?.callId).toBeTruthy()
-    // Two logical calls must not share a callId even with identical tags.
+    // Two logical calls must not share a callId.
     expect(attempts[0]?.callId).not.toBe(attempts[1]?.callId)
+  })
+
+  // A hanging body whose read is aborted: the request DID reach the provider,
+  // so exactly one attempt must be recorded — classified by why it aborted.
+  function hangingBodyFetch(status: number): typeof fetch {
+    return ((_input: RequestInfo | URL, init?: RequestInit) => {
+      const signal = init?.signal
+      const stream = new ReadableStream({
+        start(controller) {
+          signal?.addEventListener(
+            'abort',
+            () => controller.error(new DOMException('aborted', 'AbortError')),
+            { once: true },
+          )
+        },
+      })
+      return Promise.resolve(new Response(stream, { status, statusText: 'x' }))
+    }) as unknown as typeof fetch
+  }
+
+  test('cancel during a 2xx body read records one cancelled attempt', async () => {
+    const controller = new AbortController()
+    globalThis.fetch = hangingBodyFetch(200)
+    const attempts: import('./openai-compatible').ModelAttemptResult[] = []
+    const pending = makeClient().complete([{ role: 'user', content: 'hi' }], 's1', {
+      signal: controller.signal,
+      onAttemptFinished: attempt => attempts.push(attempt),
+    })
+    setTimeout(() => controller.abort(), 10)
+    await expect(pending).rejects.toThrow('cancelled')
+    expect(attempts).toHaveLength(1)
+    expect(attempts[0]?.status).toBe('cancelled')
+    expect(attempts[0]?.httpStatus).toBe(200)
+  })
+
+  // Regression: cancelling while reading a non-2xx error body used to emit
+  // NOTHING for an attempt the provider had already served.
+  test('cancel during an error-body read records one cancelled attempt', async () => {
+    const controller = new AbortController()
+    globalThis.fetch = hangingBodyFetch(500)
+    const attempts: import('./openai-compatible').ModelAttemptResult[] = []
+    const pending = makeClient().complete([{ role: 'user', content: 'hi' }], 's1', {
+      signal: controller.signal,
+      onAttemptFinished: attempt => attempts.push(attempt),
+    })
+    setTimeout(() => controller.abort(), 10)
+    await expect(pending).rejects.toThrow('cancelled')
+    expect(attempts).toHaveLength(1)
+    expect(attempts[0]?.status).toBe('cancelled')
+    expect(attempts[0]?.httpStatus).toBe(500)
   })
 
   // Telemetry must never change the business outcome of a finished call.
