@@ -43,6 +43,11 @@ type WorkflowSession = {
 type ChatResponse = {
   reply: string
   session: WorkflowSession
+  // Server-authoritative ids (T1.3): requestId keys the call on the AI side;
+  // clientRequestId echoes the tag we sent for local correlation.
+  requestId?: string
+  traceId?: string
+  clientRequestId?: string
 }
 
 type UiMessage = { id: string; role: 'user' | 'assistant'; content: string }
@@ -163,11 +168,19 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
       if (!sessionId) return
       setBusy(true)
       setError('')
+      // Local correlation tag only — the AI service mints the authoritative
+      // requestId and returns it in the response (T1.3).
+      const clientRequestId = crypto.randomUUID()
       try {
         const response = await fetch(`${aiAgentUrl()}/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionId, ...(sceneId ? { sceneId } : {}), ...body }),
+          body: JSON.stringify({
+            sessionId,
+            clientRequestId,
+            ...(sceneId ? { sceneId } : {}),
+            ...body,
+          }),
         })
         // Read as text first — never call response.json() directly, which
         // throws "Unexpected end of JSON input" on an empty/truncated body
@@ -203,6 +216,11 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
         }
 
         if (!response.ok) throw new Error(payload.error ?? `AI request failed (${response.status})`)
+        if (payload.requestId) {
+          console.debug(
+            `[ai-assistant] request ${clientRequestId} -> server requestId ${payload.requestId} trace ${payload.traceId ?? '-'}`,
+          )
+        }
         setSession(payload.session)
         setMessages((current) => [
           ...current,

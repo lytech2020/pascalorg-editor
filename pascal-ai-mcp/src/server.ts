@@ -3,6 +3,7 @@ import { PascalAiAgent } from './agent'
 import { loadConfig } from './config'
 import { isValidImageDataUrl, readJsonBody } from './http-guards'
 import { PascalMcpClient } from './mcp'
+import { createRequestContext } from './request-context'
 
 const config = loadConfig()
 const mcp = new PascalMcpClient(config)
@@ -81,14 +82,38 @@ async function handle(request: Request, bunServer: Server<undefined>): Promise<R
       return json({ error: 'invalid_image', message: 'imageDataUrl must be a base64 data URL of type image/png or image/jpeg' }, 400)
     }
 
-    const result = await agent.chat({
-      sessionId: body.sessionId,
-      ...(body.message ? { message: body.message } : {}),
-      ...(body.imageDataUrl ? { imageDataUrl: body.imageDataUrl } : {}),
-      ...(body.sceneId ? { sceneId: body.sceneId } : {}),
-      ...(body.action ? { action: body.action } : {}),
-    })
-    return json(result)
+    // Authoritative requestId is minted here; body-supplied ids never become
+    // the key (T1.3). The context travels with the whole run and comes back
+    // in the response so every layer logs the same ids.
+    const context = createRequestContext(request.headers, read.body as Record<string, unknown>)
+    console.log(
+      `[req ${context.requestId}] [trace ${context.traceId}] chat start session=${body.sessionId}${body.action ? ` action=${body.action}` : ''}`,
+    )
+    const chatStarted = performance.now()
+    try {
+      const result = await agent.chat({
+        sessionId: body.sessionId,
+        ...(body.message ? { message: body.message } : {}),
+        ...(body.imageDataUrl ? { imageDataUrl: body.imageDataUrl } : {}),
+        ...(body.sceneId ? { sceneId: body.sceneId } : {}),
+        ...(body.action ? { action: body.action } : {}),
+        context,
+      })
+      console.log(
+        `[req ${context.requestId}] [trace ${context.traceId}] chat ok in ${Math.round(performance.now() - chatStarted)}ms`,
+      )
+      return json({
+        ...result,
+        requestId: context.requestId,
+        traceId: context.traceId,
+        ...(context.clientRequestId ? { clientRequestId: context.clientRequestId } : {}),
+      })
+    } catch (error) {
+      console.error(
+        `[req ${context.requestId}] [trace ${context.traceId}] chat failed in ${Math.round(performance.now() - chatStarted)}ms: ${errorMessage(error)}`,
+      )
+      throw error
+    }
   }
 
   const sessionMatch = url.pathname.match(/^\/sessions\/([^/]+)$/)

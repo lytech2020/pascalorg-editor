@@ -255,6 +255,9 @@ export type ChatInput = {
   imageDataUrl?: string
   sceneId?: string
   action?: 'confirm' | 'cancel'
+  // Request identity minted by the HTTP layer (T1.3); absent for callers
+  // outside the HTTP path (CLI, tests).
+  context?: import('./request-context').RequestContext
 }
 
 export type ChatResult = {

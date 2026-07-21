@@ -34,6 +34,7 @@ import { executeLayoutPlan, toolPayload, type McpCaller, type SceneExecutionRepo
 
 // Re-exported for eval/run-eval.ts, which historically imported it from here.
 export { toolPayload }
+import type { RequestContext } from './request-context'
 import { SessionStore } from './session-store'
 import type {
   Availability,
@@ -216,6 +217,10 @@ export class PascalAiAgent {
   // interrupt the request that's actually running (model fetch or MCP call)
   // immediately, instead of only at the next loop boundary.
   private readonly runAbortControllers = new Map<string, AbortController>()
+  // Request identity of the run currently holding each session's lock —
+  // read at telemetry time so attempt logs (and the T1.2 sink) carry the
+  // authoritative requestId/traceId (T1.3).
+  private readonly activeRequestContexts = new Map<string, RequestContext>()
   // Per-turn model-call counter, keyed by sessionId for the duration of a
   // single `runChat`. Absent when no turn is running for that session.
   private readonly modelCallBudgets = new Map<string, number>()
@@ -352,6 +357,17 @@ export class PascalAiAgent {
   }
 
   private async runChat(input: ChatInput): Promise<ChatResult> {
+    if (input.context) this.activeRequestContexts.set(input.sessionId, input.context)
+    try {
+      return await this.runChatInner(input)
+    } finally {
+      if (this.activeRequestContexts.get(input.sessionId) === input.context) {
+        this.activeRequestContexts.delete(input.sessionId)
+      }
+    }
+  }
+
+  private async runChatInner(input: ChatInput): Promise<ChatResult> {
     const now = new Date().toISOString()
     let session = this.sessions.get(input.sessionId) ?? createSession(input, now)
     // Under the session lock the previous run has finished — an in-flight
@@ -2602,6 +2618,12 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
       // attempt without spending provider money. onAttemptFinished is the
       // metering truth source — the T1.2 persistence sink subscribes there.
       onAttemptStarted: () => this.chargeModelCall(sessionId),
+      onAttemptFinished: result => {
+        const context = this.activeRequestContexts.get(sessionId)
+        console.log(
+          `[req ${context?.requestId ?? '-'}] [trace ${context?.traceId ?? '-'}] model-attempt op=${result.operation ?? '-'} call=${result.callId} n=${result.attemptNo} status=${result.status} model=${result.model ?? result.requestedModel} latency=${result.latencyMs}ms${result.usage?.totalTokens !== undefined ? ` tokens=${result.usage.totalTokens}` : ''}`,
+        )
+      },
     }
   }
 
