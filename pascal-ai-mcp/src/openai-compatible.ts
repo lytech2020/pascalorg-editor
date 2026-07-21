@@ -1,12 +1,16 @@
 import type { ChatCompletionResponse, ChatMessage, OpenAiTool } from './types'
 
 // Normalized token usage. Absent fields mean the provider did not report the
-// number — callers must not read them as 0 (T1.1).
+// number — callers must not read them as 0 (T1.1). Field names align with
+// AI_USAGE_AUDIT_DESIGN.md (cacheCreationTokens = explicit cache writes,
+// OpenRouter `cache_write_tokens`).
 export type ModelUsage = {
   inputTokens?: number
   outputTokens?: number
+  totalTokens?: number
   reasoningTokens?: number
   cacheReadTokens?: number
+  cacheCreationTokens?: number
 }
 
 // One telemetry record per REAL HTTP attempt — success, HTTP error, network
@@ -15,11 +19,20 @@ export type ModelUsage = {
 // (ai_model_calls in T1.2); business logs and the session are not.
 export type ModelAttemptResult = {
   provider: 'openai-compatible' | 'azure-openai'
+  // Caller-supplied operation tag (e.g. "sess-1:extract:0") — groups attempts
+  // by business purpose when persisted.
+  operation: string
+  // Unique id per logical model call (one request() invocation). Primary,
+  // fast and fallback calls each get their own callId, so their attemptNo
+  // sequences don't collide when persisted.
+  callId: string
   // What we asked for vs. what the provider says actually served the call.
   requestedModel: string
   model?: string
   attemptNo: number
-  status: 'ok' | 'http_error' | 'network_error' | 'cancelled'
+  // invalid_response = HTTP 2xx whose body failed to parse: the provider DID
+  // serve (and bill) the request, so it must still be recorded.
+  status: 'ok' | 'http_error' | 'network_error' | 'cancelled' | 'invalid_response'
   httpStatus?: number
   // Short provider error code (e.g. "context_length_exceeded"), never the
   // raw response body.
@@ -33,12 +46,21 @@ export type ModelAttemptResult = {
 }
 
 // Optional per-call hooks: `signal` lets a caller abort an in-flight request
-// (e.g. on user cancel); `onAttemptFinished` fires once per real HTTP
-// attempt with the full attempt result (replaces the old count-only
-// `onAttempt`); `temperature` overrides the client default for this one call
-// (plan-first temperature split, 批次 D).
+// (e.g. on user cancel); `temperature` overrides the client default for this
+// one call (plan-first temperature split, 批次 D).
+//
+// Attempt lifecycle:
+// - `onAttemptStarted` runs BEFORE the HTTP request is sent. Throwing here
+//   aborts the attempt without spending provider money — this is where the
+//   model-call budget is enforced.
+// - `onAttemptFinished` fires after every real HTTP attempt (ok, HTTP error,
+//   network failure, cancel, unparseable 2xx) with the full result. It is a
+//   synchronous fire-and-forget telemetry sink: exceptions are swallowed and
+//   logged, and a persistence consumer (T1.2) must enqueue synchronously and
+//   do async work off-band — a returned Promise is ignored.
 export type RequestHooks = {
   signal?: AbortSignal
+  onAttemptStarted?: () => void
   onAttemptFinished?: (result: ModelAttemptResult) => void
   temperature?: number
 }
@@ -121,7 +143,11 @@ export class OpenAiCompatibleClient {
       ...extras,
     })
     const timeoutMs = this.options.requestTimeoutMs ?? 60_000
+    const callId = crypto.randomUUID()
     for (let attempt = 0; attempt < 5; attempt++) {
+      // Budget gate BEFORE any money is spent: a throw here must abort the
+      // call without an HTTP request (the pre-T1.1 `onAttempt` semantics).
+      hooks.onAttemptStarted?.()
       // Every real HTTP attempt (including internal retries and, since the
       // fallback model reuses this method, fallback calls) reports one
       // ModelAttemptResult so metering reflects actual API usage rather than
@@ -129,16 +155,27 @@ export class OpenAiCompatibleClient {
       const startedAt = new Date().toISOString()
       const startedMs = performance.now()
       const finished = (
-        partial: Omit<ModelAttemptResult, 'provider' | 'requestedModel' | 'attemptNo' | 'startedAt' | 'latencyMs'>,
+        partial: Omit<
+          ModelAttemptResult,
+          'provider' | 'operation' | 'callId' | 'requestedModel' | 'attemptNo' | 'startedAt' | 'latencyMs'
+        >,
       ): void => {
-        hooks.onAttemptFinished?.({
-          provider: this.options.provider,
-          requestedModel: this.requestedModel(),
-          attemptNo: attempt + 1,
-          startedAt,
-          latencyMs: Math.round(performance.now() - startedMs),
-          ...partial,
-        })
+        try {
+          hooks.onAttemptFinished?.({
+            provider: this.options.provider,
+            operation: sessionId,
+            callId,
+            requestedModel: this.requestedModel(),
+            attemptNo: attempt + 1,
+            startedAt,
+            latencyMs: Math.round(performance.now() - startedMs),
+            ...partial,
+          })
+        } catch (error) {
+          // Telemetry must never change the business outcome of a call that
+          // already happened — the budget gate lives in onAttemptStarted.
+          console.error('onAttemptFinished hook failed:', errorMessage(error))
+        }
       }
       let response: Response
       try {
@@ -171,7 +208,19 @@ export class OpenAiCompatibleClient {
         continue
       }
       if (response.ok) {
-        const payload = (await response.json()) as ChatCompletionResponse
+        let payload: ChatCompletionResponse
+        try {
+          payload = (await response.json()) as ChatCompletionResponse
+        } catch (error) {
+          // The provider served (and billed) this request even though the
+          // body is unusable — it must still be recorded as a real attempt.
+          finished({
+            status: 'invalid_response',
+            httpStatus: response.status,
+            errorSummary: truncate(`unparseable 2xx body: ${errorMessage(error)}`),
+          })
+          throw error
+        }
         finished({
           status: 'ok',
           httpStatus: response.status,
@@ -311,11 +360,15 @@ function usageFrom(payload: ChatCompletionResponse): ModelUsage | undefined {
   const usage: ModelUsage = {
     ...(typeof raw.prompt_tokens === 'number' ? { inputTokens: raw.prompt_tokens } : {}),
     ...(typeof raw.completion_tokens === 'number' ? { outputTokens: raw.completion_tokens } : {}),
+    ...(typeof raw.total_tokens === 'number' ? { totalTokens: raw.total_tokens } : {}),
     ...(typeof raw.completion_tokens_details?.reasoning_tokens === 'number'
       ? { reasoningTokens: raw.completion_tokens_details.reasoning_tokens }
       : {}),
     ...(typeof raw.prompt_tokens_details?.cached_tokens === 'number'
       ? { cacheReadTokens: raw.prompt_tokens_details.cached_tokens }
+      : {}),
+    ...(typeof raw.prompt_tokens_details?.cache_write_tokens === 'number'
+      ? { cacheCreationTokens: raw.prompt_tokens_details.cache_write_tokens }
       : {}),
   }
   return Object.keys(usage).length > 0 ? usage : undefined

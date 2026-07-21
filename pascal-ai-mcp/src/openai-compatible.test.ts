@@ -177,21 +177,121 @@ describe('attempt telemetry (T1.1)', () => {
     expect(attempts.map(a => a.attemptNo)).toEqual([1, 2, 3, 4, 5])
   })
 
-  test('cancellation reports a single cancelled attempt without retries', async () => {
+  // The mock hangs until the request's OWN signal fires — this fails if the
+  // client never wires the caller's signal through to fetch.
+  test('cancellation aborts via the wired signal: one cancelled attempt, no retries', async () => {
     const controller = new AbortController()
-    globalThis.fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) => {
-      controller.abort()
-      throw new DOMException('aborted', 'AbortError')
+    let sawSignal = false
+    globalThis.fetch = ((_input: RequestInfo | URL, init?: RequestInit) => {
+      const signal = init?.signal
+      sawSignal = signal instanceof AbortSignal
+      return new Promise((_, reject) => {
+        signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), {
+          once: true,
+        })
+      })
     }) as unknown as typeof fetch
+
+    const attempts: import('./openai-compatible').ModelAttemptResult[] = []
+    const pending = makeClient().complete([{ role: 'user', content: 'hi' }], 's1', {
+      signal: controller.signal,
+      onAttemptFinished: attempt => attempts.push(attempt),
+    })
+    setTimeout(() => controller.abort(), 10)
+    await expect(pending).rejects.toThrow('cancelled')
+    expect(sawSignal).toBe(true)
+    expect(attempts).toHaveLength(1)
+    expect(attempts[0]?.status).toBe('cancelled')
+  })
+
+  // The budget gate must run BEFORE any provider money is spent: a throwing
+  // onAttemptStarted aborts the call with zero fetches and zero attempts.
+  test('a throwing onAttemptStarted prevents the HTTP request entirely', async () => {
+    let fetches = 0
+    globalThis.fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) => {
+      fetches++
+      return Response.json({ choices: [{ message: { role: 'assistant', content: 'ok' } }] })
+    }) as typeof fetch
 
     const attempts: import('./openai-compatible').ModelAttemptResult[] = []
     await expect(
       makeClient().complete([{ role: 'user', content: 'hi' }], 's1', {
-        signal: controller.signal,
+        onAttemptStarted: () => {
+          throw new Error('budget exceeded')
+        },
         onAttemptFinished: attempt => attempts.push(attempt),
       }),
-    ).rejects.toThrow('cancelled')
+    ).rejects.toThrow('budget exceeded')
+    expect(fetches).toBe(0)
+    expect(attempts).toHaveLength(0)
+  })
+
+  // A 2xx with an unparseable body was still served (and billed) by the
+  // provider — it must be recorded, not silently lost.
+  test('an unparseable 2xx body records an invalid_response attempt', async () => {
+    globalThis.fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response('<html>gateway soup</html>', { status: 200 })) as typeof fetch
+
+    const attempts: import('./openai-compatible').ModelAttemptResult[] = []
+    await expect(
+      makeClient().complete([{ role: 'user', content: 'hi' }], 's1', {
+        onAttemptFinished: attempt => attempts.push(attempt),
+      }),
+    ).rejects.toThrow()
     expect(attempts).toHaveLength(1)
-    expect(attempts[0]?.status).toBe('cancelled')
+    expect(attempts[0]?.status).toBe('invalid_response')
+    expect(attempts[0]?.httpStatus).toBe(200)
+    expect(attempts[0]?.errorSummary).not.toContain('gateway soup')
+  })
+
+  test('maps total_tokens and cache_write_tokens', async () => {
+    globalThis.fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      Response.json({
+        choices: [{ message: { role: 'assistant', content: 'ok' } }],
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 5,
+          total_tokens: 15,
+          prompt_tokens_details: { cached_tokens: 4, cache_write_tokens: 6 },
+        },
+      })) as typeof fetch
+
+    const result = await makeClient().complete([{ role: 'user', content: 'hi' }], 's1', {})
+    expect(result.usage).toEqual({
+      inputTokens: 10,
+      outputTokens: 5,
+      totalTokens: 15,
+      cacheReadTokens: 4,
+      cacheCreationTokens: 6,
+    })
+  })
+
+  test('attempts carry the operation tag and a per-call callId', async () => {
+    globalThis.fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      Response.json({ choices: [{ message: { role: 'assistant', content: 'ok' } }] })) as typeof fetch
+
+    const attempts: import('./openai-compatible').ModelAttemptResult[] = []
+    const client = makeClient()
+    const hooks = { onAttemptFinished: (a: import('./openai-compatible').ModelAttemptResult) => attempts.push(a) }
+    await client.complete([{ role: 'user', content: 'hi' }], 'sess-1:extract:0', hooks)
+    await client.complete([{ role: 'user', content: 'hi' }], 'sess-1:extract:0', hooks)
+    expect(attempts).toHaveLength(2)
+    expect(attempts[0]?.operation).toBe('sess-1:extract:0')
+    expect(attempts[0]?.callId).toBeTruthy()
+    // Two logical calls must not share a callId even with identical tags.
+    expect(attempts[0]?.callId).not.toBe(attempts[1]?.callId)
+  })
+
+  // Telemetry must never change the business outcome of a finished call.
+  test('a throwing onAttemptFinished does not break the call', async () => {
+    globalThis.fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      Response.json({ choices: [{ message: { role: 'assistant', content: 'ok' } }] })) as typeof fetch
+
+    const result = await makeClient().complete([{ role: 'user', content: 'hi' }], 's1', {
+      onAttemptFinished: () => {
+        throw new Error('sink exploded')
+      },
+    })
+    expect(result.output).toBe('ok')
   })
 })

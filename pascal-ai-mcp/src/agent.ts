@@ -2585,11 +2585,11 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
   private modelHooks(sessionId: string): RequestHooks {
     return {
       signal: this.runAbortControllers.get(sessionId)?.signal,
-      // Charged once per real HTTP attempt from inside the model client, so
-      // internal retries and the fallback call below are all counted. The
-      // full attempt result (usage/latency/status) is the metering truth
-      // source — the T1.2 persistence sink subscribes here.
-      onAttemptFinished: () => this.chargeModelCall(sessionId),
+      // Charged BEFORE each real HTTP attempt (internal retries and the
+      // fallback call below included): a budget throw here aborts the
+      // attempt without spending provider money. onAttemptFinished is the
+      // metering truth source — the T1.2 persistence sink subscribes there.
+      onAttemptStarted: () => this.chargeModelCall(sessionId),
     }
   }
 
@@ -2607,6 +2607,9 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
       // A cancel must not silently fall back to the secondary model — turn it
       // into a cancellation the outer generation loop understands.
       this.throwIfCancelled(sessionId)
+      // An exhausted budget is absolute for the turn/session — retrying on
+      // the fallback model would just spend more, not succeed.
+      if (primaryError instanceof BudgetExceededError) throw primaryError
       if (!this.fallbackModel) throw primaryError
       return operation(this.fallbackModel, hooks)
     }
@@ -2624,8 +2627,9 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     if (!this.fastModel) return this.withModelFallback(sessionId, operation)
     try {
       return await operation(this.fastModel, this.modelHooks(sessionId))
-    } catch {
+    } catch (fastError) {
       this.throwIfCancelled(sessionId)
+      if (fastError instanceof BudgetExceededError) throw fastError
       return this.withModelFallback(sessionId, operation)
     }
   }
