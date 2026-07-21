@@ -3,7 +3,7 @@ import { PascalAiAgent } from './agent'
 import { loadConfig } from './config'
 import { isValidImageDataUrl, readJsonBody } from './http-guards'
 import { PascalMcpClient } from './mcp'
-import { createRequestContext } from './request-context'
+import { clientRequestIdFrom, createRequestContext } from './request-context'
 
 const config = loadConfig()
 const mcp = new PascalMcpClient(config)
@@ -64,8 +64,28 @@ async function handle(request: Request, bunServer: Server<undefined>): Promise<R
     // for this endpoint specifically (0 = no timeout); the fast endpoints
     // above keep the default.
     bunServer.timeout(request, 0)
+    // Authoritative requestId is minted here — before the body is even read,
+    // so parse/validation rejections (400/413) carry ids too; body-supplied
+    // ids never become the key (T1.3). The context travels with the whole
+    // run and comes back in the response so every layer logs the same ids.
+    const context = createRequestContext(request.headers)
+    const identityHeaders = { 'x-request-id': context.requestId, 'x-trace-id': context.traceId }
+    const identity = () => ({
+      requestId: context.requestId,
+      traceId: context.traceId,
+      ...(context.clientRequestId ? { clientRequestId: context.clientRequestId } : {}),
+    })
+
     const read = await readJsonBody(request, config.maxRequestBodyBytes)
-    if (!read.ok) return json({ error: read.error, maxBytes: config.maxRequestBodyBytes }, read.status)
+    if (!read.ok) {
+      return json(
+        { error: read.error, maxBytes: config.maxRequestBodyBytes, ...identity() },
+        read.status,
+        identityHeaders,
+      )
+    }
+    const clientRequestId = clientRequestIdFrom(read.body as Record<string, unknown>)
+    if (clientRequestId) context.clientRequestId = clientRequestId
     const body = read.body as {
       sessionId?: string
       message?: string
@@ -75,27 +95,25 @@ async function handle(request: Request, bunServer: Server<undefined>): Promise<R
     }
 
     if (!body.sessionId || (!body.message && !body.imageDataUrl && !body.action)) {
-      return json({ error: 'sessionId and message, imageDataUrl, or action are required' }, 400)
+      return json(
+        { error: 'sessionId and message, imageDataUrl, or action are required', ...identity() },
+        400,
+        identityHeaders,
+      )
     }
 
     if (body.imageDataUrl && !isValidImageDataUrl(body.imageDataUrl)) {
-      return json({ error: 'invalid_image', message: 'imageDataUrl must be a base64 data URL of type image/png or image/jpeg' }, 400)
+      return json(
+        { error: 'invalid_image', message: 'imageDataUrl must be a base64 data URL of type image/png or image/jpeg', ...identity() },
+        400,
+        identityHeaders,
+      )
     }
 
-    // Authoritative requestId is minted here; body-supplied ids never become
-    // the key (T1.3). The context travels with the whole run and comes back
-    // in the response so every layer logs the same ids.
-    const context = createRequestContext(request.headers, read.body as Record<string, unknown>)
     console.log(
       `[req ${context.requestId}] [trace ${context.traceId}] chat start session=${body.sessionId}${body.action ? ` action=${body.action}` : ''}`,
     )
     const chatStarted = performance.now()
-    const identity = {
-      requestId: context.requestId,
-      traceId: context.traceId,
-      ...(context.clientRequestId ? { clientRequestId: context.clientRequestId } : {}),
-    }
-    const identityHeaders = { 'x-request-id': context.requestId, 'x-trace-id': context.traceId }
     try {
       const result = await agent.chat({
         sessionId: body.sessionId,
@@ -108,7 +126,7 @@ async function handle(request: Request, bunServer: Server<undefined>): Promise<R
       console.log(
         `[req ${context.requestId}] [trace ${context.traceId}] chat ok in ${Math.round(performance.now() - chatStarted)}ms`,
       )
-      return json({ ...result, ...identity }, 200, identityHeaders)
+      return json({ ...result, ...identity() }, 200, identityHeaders)
     } catch (error) {
       console.error(
         `[req ${context.requestId}] [trace ${context.traceId}] chat failed in ${Math.round(performance.now() - chatStarted)}ms: ${errorMessage(error)}`,
@@ -116,7 +134,7 @@ async function handle(request: Request, bunServer: Server<undefined>): Promise<R
       // The requests that most need correlating are the failed ones — never
       // drop the ids on the error path (full error-code envelope is T1.7).
       return json(
-        { error: 'internal_error', message: errorMessage(error), ...identity },
+        { error: 'internal_error', message: errorMessage(error), ...identity() },
         500,
         identityHeaders,
       )

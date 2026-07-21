@@ -178,9 +178,11 @@ function parseMcpMode(value: string | undefined): McpMode {
   return 'stdio'
 }
 
+// 0 is a valid value: the OS assigns a free port (the startup log prints the
+// resolved one) — used by the integration tests to avoid collisions.
 function parsePort(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(value || '', 10)
-  return Number.isFinite(parsed) && parsed > 0 && parsed < 65_536 ? parsed : fallback
+  return Number.isFinite(parsed) && parsed >= 0 && parsed < 65_536 ? parsed : fallback
 }
 
 function parseIntWithDefault(value: string | undefined, fallback: number): number {

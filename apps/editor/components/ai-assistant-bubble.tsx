@@ -192,6 +192,7 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
       // Local correlation tag only — the AI service mints the authoritative
       // requestId and returns it in the response (T1.3).
       const clientRequestId = crypto.randomUUID()
+      let recorded = false
       try {
         const response = await fetch(`${aiAgentUrl()}/chat`, {
           method: 'POST',
@@ -217,6 +218,20 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
           }
         }
 
+        // Record the correlation as soon as headers are available — before the
+        // ok-check and before the empty-body handling, so failed and unusable
+        // responses (the ones that most need matching to server logs) still
+        // leave a record. The AI service includes the ids on error responses.
+        recordRequest({
+          clientRequestId,
+          requestId: payload?.requestId ?? response.headers.get('x-request-id') ?? undefined,
+          traceId: payload?.traceId ?? response.headers.get('x-trace-id') ?? undefined,
+          kind: 'chat',
+          status: response.ok && payload ? 'ok' : 'error',
+          at: new Date().toISOString(),
+        })
+        recorded = true
+
         if (!payload) {
           console.warn('[ai-assistant] /chat returned an empty or non-JSON body', {
             status: response.status,
@@ -236,17 +251,6 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
           throw new Error('The AI service returned an empty or truncated response. If generation may have finished, refresh the page to check the result, or try again later.')
         }
 
-        // Record the correlation BEFORE the ok-check: failed requests are the
-        // ones that most need matching to server logs, and the AI service
-        // includes the ids on its error responses too.
-        recordRequest({
-          clientRequestId,
-          requestId: payload.requestId ?? response.headers.get('x-request-id') ?? undefined,
-          traceId: payload.traceId ?? response.headers.get('x-trace-id') ?? undefined,
-          kind: 'chat',
-          status: response.ok ? 'ok' : 'error',
-          at: new Date().toISOString(),
-        })
         if (!response.ok) throw new Error(payload.error ?? `AI request failed (${response.status})`)
         setSession(payload.session)
         setMessages((current) => [
@@ -255,6 +259,16 @@ export function AiAssistantPanel({ sceneId }: { sceneId?: string }) {
         ])
         maybeRedirectToScene(body, payload.session)
       } catch (requestError) {
+        // fetch itself failed (network error, aborted stream) — nothing was
+        // recorded yet, so leave at least the client-side half of the trail.
+        if (!recorded) {
+          recordRequest({
+            clientRequestId,
+            kind: 'chat',
+            status: 'error',
+            at: new Date().toISOString(),
+          })
+        }
         setError(requestError instanceof Error ? requestError.message : String(requestError))
       } finally {
         setBusy(false)

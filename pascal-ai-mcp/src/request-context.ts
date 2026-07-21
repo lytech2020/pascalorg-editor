@@ -18,19 +18,23 @@ export type RequestContext = {
 
 const TRACE_ID_PATTERN = /^[A-Za-z0-9-]{8,64}$/
 
+// `body` is optional so the context can be created before the body is read —
+// even a request rejected at the parse/validation stage (400/413) then
+// carries ids. Attach the clientRequestId later via clientRequestIdFrom.
 export function createRequestContext(
   headers: Headers,
-  body: Record<string, unknown>,
+  body?: Record<string, unknown>,
 ): RequestContext {
   const headerTrace = headers.get('x-trace-id')
-  const clientRequestId = body.clientRequestId
+  const clientRequestId = body ? clientRequestIdFrom(body) : undefined
   return {
     requestId: crypto.randomUUID(),
     traceId: headerTrace && TRACE_ID_PATTERN.test(headerTrace) ? headerTrace : crypto.randomUUID(),
-    ...(typeof clientRequestId === 'string' &&
-    clientRequestId.length > 0 &&
-    clientRequestId.length <= 64
-      ? { clientRequestId }
-      : {}),
+    ...(clientRequestId ? { clientRequestId } : {}),
   }
+}
+
+export function clientRequestIdFrom(body: Record<string, unknown>): string | undefined {
+  const value = body.clientRequestId
+  return typeof value === 'string' && value.length > 0 && value.length <= 64 ? value : undefined
 }
