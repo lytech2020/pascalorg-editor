@@ -56,7 +56,9 @@
 
 阶段目标 / 验收：能回答“某个用户请求调用了几次哪些模型、每次多少 Token、耗时多少，以及哪一次模型 operation/attempt 失败”。施工流程中“具体哪个 workflow step 失败”的持久化查询能力由 T2.2 补齐，不计入本阶段完成标准。
 
-### [ ] T1.1 模型响应 usage 穿线
+### [x] T1.1 模型响应 usage 穿线
+- 完成于 2026-07-18。实现：①`ChatCompletionResponse` 补 `id/model/created/usage`（`ChatCompletionUsage` 原始块，缺失字段保持缺失）；②`complete()/json()` 返回 `ModelCallResult<T>`（output + model/providerRequestId/usage/finishReason，从成功响应派生）；③`onAttempt()` 全量替换为 `onAttemptFinished(result: ModelAttemptResult)`——每次真实 HTTP attempt（成功/429、5xx/网络失败/取消）独立上报 provider、requestedModel、实际 model、attemptNo、status、httpStatus、providerErrorCode（仅从错误体解析短 code，不带原始体）、providerRequestId、finishReason、usage（缺失即 undefined 绝不写 0）、startedAt、latencyMs。未留兼容层：`onAttempt` 消费方只有 agent 的 `chargeModelCall` 一处，直接迁移；4 个 complete/json 调用点以 `.output` 解包，行为不变。附带：`retryBaseDelayMs` 可配置（默认 2000 不变，测试调 1ms 走完 5 attempt 路径）。
+- 验证：新增 attempt telemetry 5 用例（成功含 usage 映射、usage 缺失为 undefined、429 重试两条独立记录含 providerErrorCode、网络失败 5 条记录、取消单条不重试）；517 测试全过（原 497 不减少）、check-types 干净。T1.2 的 persistence sink 从 `modelHooks.onAttemptFinished` 处接入。
 - 内容：① `ChatCompletionResponse` 补 `usage`（input/output/reasoning/cache tokens）、`id`、`model`、`created`；② `openai-compatible.ts` 的 `complete()/json()` 返回统一 `ModelCallResult<T>`（结构见评估 §6.2 代码块）；③把仅计数的 `onAttempt()` 扩展为 attempt 生命周期事件（如 `onAttemptStarted` + `onAttemptFinished`，或一个可 begin/finalize 的 telemetry sink），每次真实 HTTP attempt——包括网络错误、429/5xx、取消和内部重试——都产生独立结果，记录 status、attemptNo、latency、HTTP/供应商错误码，成功时再补 usage/finishReason/providerRequestId。Token 未返回时必须为 `null/undefined`，不能写 0。
 - 涉及：`src/types.ts`、`src/openai-compatible.ts` 及全部调用点（agent.ts、plan-builder.ts 等）。
 - 完成标准：单测注入“成功、429 后重试、网络失败、取消”四种情形，telemetry sink 对每个真实 attempt 都收到一条完整且脱敏的结果；成功调用能读取真实 token/model，失败调用也有状态和耗时；当前完整测试集全过且测试数不减少。普通业务日志和 session 不作为模型调用真相源。

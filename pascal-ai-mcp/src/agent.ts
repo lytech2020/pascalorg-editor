@@ -574,7 +574,7 @@ export class PascalAiAgent {
           hooks,
         ),
       )
-      if (isSceneIntent(result.intent)) return result.intent
+      if (isSceneIntent(result.output.intent)) return result.output.intent
     } catch {
       // Deterministic routing remains available when the model is temporarily unavailable.
     }
@@ -1064,7 +1064,8 @@ export class PascalAiAgent {
               ? userContent
               : `${userContent}\n上一次输出解析失败：${parsed.errors.join('；')}。请严格按 schema 修正后重新只输出 JSON。`,
           },
-        ], `${session.sessionId}:modify:ops`, { ...hooks, temperature: this.config.aiTemperatureGeometry }),
+        ], `${session.sessionId}:modify:ops`, { ...hooks, temperature: this.config.aiTemperatureGeometry })
+          .then(result => result.output),
       )
       parsed = parseModifyOps(raw)
       // Only parse DEFECTS warrant a retry; an empty-ops answer with no
@@ -1662,7 +1663,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
             ],
             `${session.sessionId}:extract:${attempt}`,
             hooks,
-          ),
+          ).then(result => result.output),
         )
       } catch (error) {
         lastError = error
@@ -2055,7 +2056,8 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
         this.throwIfCancelled(session.sessionId)
         trace.modelCalls++
         return this.withModelFallback(session.sessionId, (model, hooks) =>
-          model.complete(messages, `${session.sessionId}:${tag}`, { ...hooks, temperature }),
+          model.complete(messages, `${session.sessionId}:${tag}`, { ...hooks, temperature })
+            .then(result => result.output),
         )
       },
       {
@@ -2584,8 +2586,10 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     return {
       signal: this.runAbortControllers.get(sessionId)?.signal,
       // Charged once per real HTTP attempt from inside the model client, so
-      // internal retries and the fallback call below are all counted.
-      onAttempt: () => this.chargeModelCall(sessionId),
+      // internal retries and the fallback call below are all counted. The
+      // full attempt result (usage/latency/status) is the metering truth
+      // source — the T1.2 persistence sink subscribes here.
+      onAttemptFinished: () => this.chargeModelCall(sessionId),
     }
   }
 

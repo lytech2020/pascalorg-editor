@@ -32,11 +32,26 @@ export type ChatCompletionMessage = {
   tool_calls?: ToolCall[]
 }
 
+// Raw OpenAI-compatible usage block. Field presence varies by provider —
+// absent numbers stay absent (never coerced to 0) so metering can tell
+// "provider reported zero" from "provider reported nothing" (T1.1).
+export type ChatCompletionUsage = {
+  prompt_tokens?: number
+  completion_tokens?: number
+  total_tokens?: number
+  prompt_tokens_details?: { cached_tokens?: number }
+  completion_tokens_details?: { reasoning_tokens?: number }
+}
+
 export type ChatCompletionResponse = {
+  id?: string
+  model?: string
+  created?: number
   choices: Array<{
     message: ChatCompletionMessage
     finish_reason?: string
   }>
+  usage?: ChatCompletionUsage
 }
 
 export type OpenAiTool = {
