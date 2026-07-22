@@ -20,6 +20,21 @@ export class AppDatabase {
     return this.connection.transaction(work)()
   }
 
+  isWritable(): boolean {
+    try {
+      this.connection.transaction(() => {
+        this.connection.query(`
+          UPDATE schema_migrations
+          SET applied_at = applied_at
+          WHERE version = (SELECT MAX(version) FROM schema_migrations)
+        `).run()
+      }).immediate()
+      return true
+    } catch {
+      return false
+    }
+  }
+
   close(): void {
     this.connection.close()
   }

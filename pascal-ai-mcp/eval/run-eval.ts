@@ -31,6 +31,9 @@ import { ChatRequestRepository, SqliteSessionPersistence } from '../src/persiste
 import { SqliteModelAttemptRecorder } from '../src/telemetry/model-attempt-recorder'
 import { WorkflowStepRepository } from '../src/persistence/workflow-step-repository'
 import { SceneBuildRepository } from '../src/persistence/scene-build-repository'
+import { AiAuditRepository } from '../src/persistence/audit-repository'
+import { SqliteCheckpointSaver } from '../src/persistence/sqlite-checkpoint-saver'
+import { WORKFLOW_GRAPH_VERSION } from '../src/workflow-identity'
 import type { ChatInput, ChatResult, PhaseToolTrace, SceneResult, WorkflowPhase } from '../src/types'
 import {
   canConfirmFromPhase,
@@ -842,9 +845,24 @@ async function main(): Promise<void> {
   const requests = new ChatRequestRepository(database)
   const workflowSteps = new WorkflowStepRepository(database)
   const sceneBuilds = new SceneBuildRepository(database)
+  const audits = new AiAuditRepository(database)
+  const checkpointSaver = new SqliteCheckpointSaver(database, {
+    graphVersion: WORKFLOW_GRAPH_VERSION,
+    ttlMs: config.workflowCheckpointTtlMs,
+  })
   const mcp = new PascalMcpClient(config)
   await mcp.connect()
-  const agent = new PascalAiAgent(config, mcp, modelAttempts, sessions, requests, workflowSteps, sceneBuilds)
+  const agent = new PascalAiAgent(
+    config,
+    mcp,
+    modelAttempts,
+    sessions,
+    requests,
+    workflowSteps,
+    sceneBuilds,
+    checkpointSaver,
+    audits,
+  )
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
   const reportDir = join(REPORT_ROOT, timestamp)
@@ -878,6 +896,7 @@ async function main(): Promise<void> {
   console.log(`\n报告已写入 ${reportDir}`)
   console.log(`已生成 ${created.length} 个评审模板到 reviews/，手顺见 REVIEW_GUIDE.md；填好后运行 bun run eval:review 汇总。`)
 
+  checkpointSaver.close()
   await mcp.close()
   database.close()
   process.exit(summary.errorCount > 0 ? 1 : 0)

@@ -11,6 +11,7 @@
 - 涉及 `packages/core` 场景 schema 的任务（⚠️SCHEMA 标记）属于 editor 仓库层面改动，需先读 `wiki/architecture/node-schemas.md` 并考虑存量场景兼容。
 - 线上 eval 消耗真实模型费用，只在任务完成标准要求时跑；日常回归用 `bun test`。
 - `requestId` 由 AI API 创建并作为业务请求主键；浏览器只能创建 `clientRequestId` / `idempotencyKey`，不得决定服务端主键。`traceId` 由可信 BFF 或 AI API 创建，不能信任浏览器自报的身份与追踪字段。
+- T2.6 采用 LangGraph 持久化方案后新增服务端 `workflowRunId`：`sessionId` 表示整段会话，`requestId` 表示一次 API/队列动作，`workflowRunId` 表示可跨 chat/confirm/modify 请求暂停与恢复的一轮工作流，`traceId` 只作链路追踪。四者不得互相冒充。
 - 验收标准不写死测试数量；统一表述为“当前完整测试集全过且测试数不减少”，避免任务清单随新增测试失效。
 - 任何日志、错误响应和 telemetry 都不得包含 API Key、Authorization、Cookie、完整 Prompt/回复、图片 Base64 或供应商原始错误体。
 
@@ -92,6 +93,7 @@
 - 完成标准：给定 AI API 返回的 requestId，能在前端状态、代理日志、AI 日志和测试 telemetry 中检索到同一请求；伪造客户端 requestId 不会覆盖服务端主键。T1.2 完成后，同一 ID 可继续检索 `ai_model_calls`。
 - 依赖：可与 T1.1 并行；T1.2 依赖本任务，不反向依赖 T1.2。
 - 依据：§5.2、§9 Phase 1。
+- T2.6 演进说明（2026-07-22）：保留本任务的 `requestId` 语义，不把它改造成 LangGraph thread id；T2.6 新增独立 `workflowRunId` 作为 graph `thread_id`，后续 confirm/modify 请求以新的 requestId 关联并恢复原 workflow run。
 
 ### [x] T1.4 模板 Zod schema + schemaVersion
 - 完成于 2026-07-21。实现：①新增 `src/template-schema.ts` 作为唯一契约，导出严格 `TemplateRecordSchema` 与 market/quality/typology/roomProgram 枚举，同时校验房间 ID 重复、entry/connections 引用；Zod 错误格式化为 `plan.rooms[2].type` 这类精确路径。②引入 `schemaVersion: 1` 与显式 v0→v1 运行时迁移，15 份现有模板全部标记 v1；CI 的 `templates:check` 直接解析当前 Schema，不会替入库数据暗中补版本。③加载器仍逐文件隔离失败，但额外输出 files/loaded/good/bad/failed/ready 健康摘要；开发环境 warn 后可继续，生产环境遇到非法 good/未知模板或无有效 good 模板时保留 `/health` liveness，`/chat` 统一返回 503。非法 bad 参照会报告，但有效 good 库存仍在时不挡业务；完整 readiness 端点仍由 T2.5 扩展。
@@ -113,9 +115,11 @@
 - 依赖：T1.3。与 T1.2 共用同一 SQLite/migration 基础，但两项业务实现可以并行；T1.5 不以 `ai_model_calls` 完成为前提。
 - 依据：§6.1、§8.1。
 - 顺带解决：既有备忘中的"sessions.json 单文件无清理策略会一直涨"。
+- T2.6 状态所有权（2026-07-22）：`ai_sessions`/`ai_messages` 继续是业务会话、用户可见消息与 LayoutPlan 的唯一真相源；LangGraph checkpoint 只保存执行游标、interrupt、最小节点输出引用和对应 session version，不复制完整消息、图片、Prompt、回复或整个 WorkflowSession。若未来要迁移业务状态所有权，必须另立 migration/切换任务，不能在 T2.6 中悄悄形成第二套会话状态。
 
 ### [ ] T1.6 附件引用化与基本删除语义（最小版）
-- 内容：只实现当前本机/内网阶段必要的数据卫生：① `ai_artifacts` 保存私有文件引用、hash、MIME、大小和可配置过期时间，不保存 Base64/永久公开 URL；②定义基础 session 删除语义（删除消息与短期附件，去标识化用量/状态可保留，场景历史不被聊天删除连带破坏）；③提供幂等清理命令处理过期附件和失败删除。本任务不包含字段/信封加密、KMS、客服原文访问审计、备份级删除或法务留存周期，这些移到 TX.3。
+- 内容：只实现当前本机/内网阶段必要的数据卫生：① `ai_artifacts` 保存私有文件引用、hash、MIME、大小和可配置过期时间，不保存 Base64/永久公开 URL；②定义基础 session 删除语义（删除消息、短期附件及关联 LangGraph workflow thread/checkpoint，去标识化用量/状态可保留，场景历史不被聊天删除连带破坏）；③提供幂等清理命令处理过期附件、过期 checkpoint 和失败删除。checkpoint state 必须采用最小引用模型，不得把 Base64、完整消息、Prompt/回复或场景快照作为绕过本任务的第二份内容存储。本任务不包含字段/信封加密、KMS、客服原文访问审计、备份级删除或法务留存周期，这些移到 TX.3。
+- 与 T2.6e 的边界：T1.6 负责通用 session 删除级联、TTL/prune 执行器、失败重试和数据不可再访问的产品语义；T2.6e 负责 LangGraph 特有的 graph-version mismatch 策略、把 workflow thread 接入该通用删除器以及故障注入验证。任何会写持久 checkpoint 的 T2.6b–d 代码，在最小 checkpoint 删除与 TTL 路径就绪前只能用于无真实用户数据的测试/开发环境，不得部署到保留真实用户数据的环境。
 - 涉及：`src/persistence/`、`src/server.ts` 上传入口、文件存储 adapter、删除/清理命令。
 - 完成标准：上传图片只在 DB 留引用；删除 session 后当前数据目录中的消息与短期附件不可再由应用访问，去标识化用量仍可汇总；重复执行删除/清理不会报错或产生孤儿记录。
 - 依赖：T1.5；可与阶段 2 并行，不阻塞 T2.1。对外生产标准由 TX.1 + TX.3 完成。
@@ -132,7 +136,7 @@
 
 ## 阶段 2：长任务可靠性（评估 §9 Phase 2）
 
-阶段目标 / 验收：AI 或代理重启后任务状态不丢；重复提交同一 idempotency key 不重复扣费/施工。
+阶段目标 / 验收：AI 或代理重启后请求、步骤和会话状态不丢；重复提交同一 idempotency key 不重复扣费/施工。T2.1–T2.3 已完成“状态可查与安全失败”，T2.6 进一步承担纯计算/读取节点的执行游标恢复；受 T2.4 能力限制的外部场景写入仍不得自动重放。
 
 ### [x] T2.1 /chat 改为异步任务：202 + requestId
 - 完成于 2026-07-21。migration v3 把 `ai_requests` 升级为 DB 真相源的 durable queue（queued/running/succeeded/failed/cancelled、input/result、owner、lease、heartbeat、attempt）；`POST /chat` 持久入队后立即返回 202/Location，`GET /requests/:id` 查询状态和终态结果。worker 以 `BEGIN IMMEDIATE` 原子 claim，续租 heartbeat，按 session/scene 排他，cancel 优先；取消入队会在同一事务中把该 session 尚未领取的旧任务标为 `cancelled_by_user`，已领取任务走 Abort 路径，不会出现“先取消、旧生成随后又执行”。默认全局并发 1、队深 100，普通请求超限返回 429/Retry-After；取消仅在 session 或 active request 确实存在时绕过背压，无目标 cancel 返回 404，不能借最高优先级泛洪队列。queued 在重启后继续领取；过期 running 统一 `failed/process_interrupted` 且不整单重放，等 T2.2 有 workflow step 幂等语义后再扩展恢复。
@@ -145,6 +149,7 @@
 - 完成标准：数分钟的生成不再依赖一条长 HTTP 连接；请求中断/代理重启后客户端凭 requestId 查到最终结果；服务在“任务已入库但尚未领取”时被 kill，重启后会继续领取；过期 running lease 不会永久变成幽灵任务；压测超过并发/队列阈值时明确拒绝而非拖垮进程。正在执行步骤的安全续跑由 T2.2 的幂等/步骤语义决定。
 - 依赖：T1.3、T1.5。
 - 依据：§5.2。
+- T2.6 演进说明（2026-07-22）：`ai_requests` 继续是排队、认领、lease/heartbeat、取消、背压和终态的唯一真相源；LangGraph checkpointer 不取代 worker，也不得自行认领或重放请求。worker 认领 request 后启动/恢复其 `workflowRunId`，只有持有有效 lease 的 owner 可以推进 graph；lease 丢失仍先中止执行，再由新 owner 按节点恢复策略决定是否恢复。
 
 ### [x] T2.2 幂等键与 workflow_steps
 - 完成于 2026-07-21。migration v4 为 `ai_requests` 增加 `idempotency_key/input_hash/idempotency_subject` 及信任主体 + session + action + scene 的条件唯一索引；`POST /chat` 接受受限格式的 `idempotencyKey`，同作用域同输入返回原 request/trace 并标注 `reused:true`，同 key 改变输入返回 409。图片哈希只包含 MIME/size/SHA-256，不把 artifact id 或 Base64 纳入幂等真相源；重复上传的新临时 artifact 会立即删除。浏览器只提供 key，不能提供 `idempotency_subject`；当前 local-only composition root 使用 `local`，仓储契约与测试已支持不同可信主体隔离，TX.1 接入认证后由服务端换成用户/组织主体。
@@ -158,6 +163,7 @@
 - 完成标准：模拟中途 kill 进程，重启后 request/step 状态正确、无永久幽灵"进行中"；同一作用域的同 key 双击发送只创建一个 request、只扣一次模型费用；不同用户/scene 的相同 key 不互相串单。
 - 依赖：T2.1。
 - 依据：§5.2。
+- T2.6 演进说明（2026-07-22）：本任务“不承诺通用断点续跑”的历史结论保持有效；T2.6 将 checkpoint 节点边界与现有 stable operation 对齐，并只对已有独立持久化输出、可证明安全的纯计算/读取节点开放自动恢复。`workflow_steps` 继续作为用户进度和审计投影，不由原始 checkpoint 替代；graph 事件通过 repository 更新它。任何无法证明幂等的 `structure-openings`、`furniture`、`modify` 等场景写节点仍落 `failed_recoverable`。
 
 ### [x] T2.3 前端进度事件
 - 完成于 2026-07-21。采用现有 `GET /requests/:id` 的可恢复快照轮询，而非新增 SSE 长连接：响应在 request 状态和 `workflow_steps` 之外补当前持久化 `sessionPhase`，前端每 750ms 拉取一次，把 queued、plan、scaffold、structure-openings、furniture、gates、verification、repair:N、modify/modify-plan 映射为用户可读的实时阶段和逐步状态；重复 operation 只展示最新 attempt，失败/取消/可恢复失败有不同图标。最终 `session.executionSteps` 仍作为完成后的结果摘要，两者不形成第二套任务真相源。
@@ -170,6 +176,7 @@
 - 依赖：T2.1、T2.2。
 - 依据：§5.2。
 - 顺带解决：既有备忘中的"运行中无进度流"。
+- T2.6 演进说明（2026-07-22）：前端契约保持不变，只读取 `ai_requests + workflow_steps + sessionPhase`；checkpoint 是内部恢复实现，不能成为 UI 的第二套进度协议。将来若采用 LangGraph stream/event，也必须先投影到现有持久化契约，刷新与断线恢复不得依赖进程内事件。
 
 ### [ ] T2.4 场景写入的版本边界与失败清理
 - 进展（2026-07-21，MCP 约束内安全部分已完成）：能力矩阵见 `SCENE_WRITE_SAFETY.md`。migration v6 新增 `scene_builds`，fresh build 在创建前登记 request/trace/session，拿到 sceneId 后立即记录，并持续刷新权威 version + graphHash；失败、取消及父 request 已终态的崩溃残留统一标记 abandoned，`GET /requests/:id` 返回脱敏的 sceneBuild 状态/sceneId/清理次数。`bun run scenes:cleanup -- --execute` 仅在 version 与 graphHash 同时未变化时带 `expectedVersion` 删除，场景已不存在视为幂等成功，已保存边界变化、边界缺失、CAS 冲突或 MCP 错误均保留为 cleanup_failed，绝不强删；命令默认仅 dry-run，执行前必须停正常流量并确认场景无人编辑，因为未保存的浏览器草稿不受 store version CAS 保护。
@@ -181,28 +188,56 @@
 - 依赖：T2.2。
 - 依据：§5.2、§8.2。
 - 顺带解决：既有备忘中的"生成中断的半成品场景不回滚"。
+- T2.6 约束（2026-07-22）：LangGraph checkpoint 只能恢复 AI 进程内的执行状态，不能恢复或撤销 MCP 已提交的外部场景副作用，也不能填平 MCP 创建成功与 AI DB 记录之间的跨库缝隙。在“不修改 `packages/mcp`”约束下，T2.6 不会让本任务变为完成；跨越场景写入的 graph 节点必须继续使用现有 fencing/scene_builds，并在边界不明确时失败为 `failed_recoverable`，禁止根据 checkpoint 盲目重放。
 
-### [ ] T2.5 健康检查与运行生命周期
+### [x] T2.5 健康检查与运行生命周期
+- 完成于 2026-07-22。`GET /health` 保持无认证、最小化 liveness；新增受 `AI_MCP_READINESS_TOKEN` Bearer 鉴权保护的 `GET /ready`，逐项报告 SQLite 写事务、模板库、MCP、计量 recorder 与模型配置状态。DB、模板、MCP 或最近一次计量写入异常会返回 503；模型 API key 缺失只作为 degraded 信息，不阻断 ready。readiness 不返回原始异常、主机名、凭据或 provider 响应。
+- AI 侧 `PascalMcpClient` 增加连接状态、连接代次、有上限指数退避和 circuit cooldown。启动时 MCP 不可用不会拖垮 HTTP liveness；旧连接关闭或请求失败后立即退休，旧代次的迟到回调不能污染新连接。只读健康探测可在冷却后重连；失败的写工具调用绝不在新连接上自动重放，由原请求失败并交给现有 workflow/scene-build 恢复边界处理。全程未修改 `packages/mcp`。
+- 队列只在 MCP ready 时领取普通工作；MCP 故障前已经接收的请求保留 queued，取消请求仍可优先领取和执行，恢复 ready 后主动唤醒 worker。产品决策（2026-07-22）：MCP 已明确不可用时，新 chat/confirm 不继续接单，快速返回 503 + `Retry-After`，由前端保留幂等键后重试；持久队列保障“已接收任务不丢失”，不用于在依赖长期不可用时无限积压新任务。关闭顺序保持“停止领取 → 停 HTTP 并等待在途请求 → drain 已领取任务（期间 lease heartbeat 继续）→ 关闭 MCP → 关闭 SQLite”；超时非零退出，遗留 running request 由既有 lease 恢复为 `process_interrupted`，不会成为永久幽灵状态。
+- 验证：MCP client 单测覆盖初次重试上限、启动降级后恢复、运行中连接关闭后换代、旧回调隔离和写调用不重放；真实 server 子进程测试覆盖 MCP 子进程退出时 `/ready` 503、重新拉起后恢复 200 且 generation 增长；worker 测试覆盖依赖不可用时暂停普通任务但允许取消，以及 stopAccepting 后 drain 到持久化终态；数据库测试覆盖 readiness 写事务。完整测试与 `check-types` 全绿，`packages/mcp` diff 为空。
+- 后续优化（不阻塞 T2.5）：①按观测数据决定是否给 `/chat` 的 MCP ping 增加短期健康缓存，减少正常热路径往返；②按 readiness 探测频率决定是否给 SQLite 写探测增加短 TTL，避免高频 no-op 写；③部署清单必须把 `AI_MCP_READINESS_TOKEN` 标为必配项，未配置时 `/ready` 有意始终返回 401，避免内部状态被匿名暴露。
 - 内容：`/health` 拆 liveness（进程活着、响应最小化）与内部/受保护 readiness（DB 可写、模板库加载有效、MCP 可调用，并消费 T1.2 `SqliteModelAttemptRecorder.status()`：最近一次计量落库失败时 readiness=false，后续成功写恢复；模型供应商状态仅作 degraded 信息不挡 ready）；AI 侧 MCP client 增加有上限的 reconnect/circuit-breaker 与连接代次管理，旧 transport 失败后不能继续被复用，本项不要求修改 `packages/mcp` 服务端。graceful shutdown 扩展 T0.4：停止接新请求和领取新任务 → drain/续租在跑任务或标记 recoverable → flush → 关 MCP。
 - 涉及：`src/server.ts`、`src/mcp.ts`（连接状态暴露）。
 - 完成标准：MCP 子进程被 kill 时 readiness 变 false 且有明确脱敏错误；子进程恢复后 AI client 可在上限内重新建立连接并恢复 ready；SIGTERM 下在跑请求不产生幽灵状态。
 - 依赖：T2.1、T2.2。
 - 依据：§7.5。
+- T2.6 演进说明（2026-07-22）：接入持久化 checkpointer 后，受保护 `/ready` 增加 checkpoint store 的最小读写探测；shutdown 在 worker drain 后关闭 checkpointer，再关闭 MCP/共享数据库。checkpoint 不健康时不得接收会产生不可恢复 graph 状态的新业务请求，liveness 仍保持最小可用。
 
-### [ ] T2.6 LangGraph 去留决策
-- 内容：二选一并执行：(a) 接入 checkpointer 让 graph 真正承担持久化工作流；(b) 移除 LangGraph，5 个 node 改为 application service 的显式路由（当前每回合单 super-step、状态整体从 session 加载，graph 只是路由包装）。结合 T2.2 的 workflow_steps 现状判断，倾向 (b)。
-- 涉及：`src/agent.ts#createWorkflowGraph` 及 5 个 node 方法、`package.json` 依赖。
-- 完成标准：决策写进本文件（此条目下），代码与决策一致；测试全过。
-- 依赖：T2.2 完成后再决策（届时持久化机制已明朗）。
+### [x] T2.6 LangGraph 持久化工作流（决定采用方案 A）
+- 决策（2026-07-22）：保留 LangGraph/StateGraph，采用持久化 checkpointer，为后续多阶段生成、人工确认、暂停恢复、分支调试和新 workflow 提供统一执行框架；不采用“仅因当前 graph 较薄而移除依赖”的方案 B。当前代码仍是“每回合携带完整 session、ingest 后只运行一个大节点”的单 super-step 路由，**在完成以下拆分前不能仅添加 `compile({checkpointer})` 并宣称完成**，否则只会复制业务状态且没有安全恢复价值。
+- 状态所有权：①`ai_requests` 唯一负责请求队列、lease、取消、背压和终态；②`workflow_steps` 唯一负责稳定 operation 的进度/审计投影；③`ai_sessions`/`ai_messages` 唯一负责业务会话、用户消息与当前方案；④LangGraph checkpoint 只负责执行游标、interrupt、待执行 task、最小节点输出引用与 session version。checkpointer 不是队列、会话库或审计表，原始 checkpoint 不直接暴露给前端。
+- 标识模型：新增服务端 `workflowRunId` 并作为 LangGraph `thread_id`。一个 session 可先后拥有多个 workflow run；一个 workflow run 可跨最初 chat、澄清/confirm、后续继续执行等多个 request。`ai_requests` 需要持久关联 nullable `workflow_run_id`；不在 `ai_sessions` 增加可变的“当前 workflow”字段，也不使用进程内 map 作为真相源。新 chat/modify 在非等待确认阶段创建新 workflowRunId；confirm 仅在权威 session phase 为对应 awaiting 状态时，从该 session 最新的受信 `ai_requests.workflow_run_id` 派生并恢复原 run。浏览器不能指定/劫持 workflowRunId，关联不唯一、缺失或 phase 不匹配时明确拒绝而非猜测。graph/config 另带 `checkpoint_ns`/`graph_version`，避免不同拓扑版本误读旧 checkpoint。
+- 恢复边界：先把 graph 拆到与 T2.2 对齐且有独立输出的节点（至少 route/plan，以及后续可安全拆出的 validation/gates）；节点从 repository 按 sessionId/version 加载业务状态并提交结果，checkpoint 不内嵌完整 WorkflowSession。纯计算和只读节点可在崩溃后自动恢复；模型节点恢复前必须用 request/step 幂等记录防止重复扣费；任何 MCP 场景写节点在 T2.4 缺少正式幂等/restore 能力时不得自动重放，状态不明确就 `failed_recoverable`。
+- 人工确认：`awaiting_confirmation` / `awaiting_modification_confirmation` 可逐步迁移为 LangGraph `interrupt()`；恢复使用同一 workflowRunId，但 confirm 本身仍是新的 requestId、经过 durable queue/lease 后才可 `Command({resume: ...})`。interrupt 成功持久化后，当前 request 正常转终态并释放 lease，workflow run 进入“合法停泊”而不是 running；既有 stale-session recovery 必须识别 awaiting phase + 可读 checkpoint，不能把它误判成崩溃残留。长期未确认的停泊 run 使用 T1.6 的 TTL/清理机制收敛，checkpoint 缺失或过期时返回稳定的不可恢复状态。cancel 终结 request/workflow 并中止 owner，是否立即删除 checkpoint 按 T1.6 的留存策略执行。
+- 持久化适配器：先做小型技术验证再决定使用官方 SQLite saver 还是基于现有 `AppDatabase` 的 adapter；必须明确 migration 所有权、同库/跨库事务缝隙、Bun 兼容、多进程锁和关闭顺序，不能把另一套 SQLite 文件当成天然原子事务。当前本机阶段可用 SQLite，未来对外生产部署不得把本地 SQLite saver 写成不可替换的 application 依赖。
+- 隐私与生命周期：checkpoint 只存 ID、版本、节点状态及必要的小型结构化输出；禁止保存 Base64、完整 Prompt/回复、供应商原始响应或完整 scene。必须有按 workflowRunId/session 删除、终态 TTL/批量 prune、graph version 不兼容的 fail-closed/人工处理策略；普通日志只记录 workflowRunId/checkpointId 的脱敏关联。
+- 分步交付：
+  - [x] T2.6a 决策与 ADR 级边界写入本清单（本次文档修订）。
+  - [x] T2.6b `workflowRunId` 数据模型、graph version、持久化 checkpointer adapter 与生命周期/readiness。
+  - [x] T2.6c 精简 graph state，并把 route/plan 等安全边界拆成可持久恢复节点；现有 session/request/workflow_steps 契约保持单一真相源。
+  - [x] T2.6d confirmation interrupt/resume、取消和进程重启恢复；场景写入仍遵守 T2.4 的 fail-recoverable 边界。
+  - [x] T2.6e 把 workflow thread 接入 T1.6 通用删除/TTL，补 graph-version mismatch 运维路径及完整故障注入测试。
+- T2.6b 完成于 2026-07-22：migration v7 为 `ai_requests` 增加 nullable `workflow_run_id/graph_version`，并在同一 `AppDatabase` 中建立 checkpoint、pending writes、健康探针与过期索引；服务端按权威 session phase + 历史 request 派生 workflowRunId，澄清/确认链路复用旧 run，新工作流新建 run，phase 不匹配或缺少既有关联的 confirm 明确返回 409，浏览器不能指定该 ID。新增 `SqliteCheckpointSaver` adapter，覆盖 graph version fail-closed、LangGraph 子图 namespace、整 thread 滑动 TTL/prune、按 session 删除 checkpoint 且保留 request 审计、readiness 与 shutdown；真实最小 StateGraph 已验证跨数据库重开恢复。该阶段尚未把旧的完整 WorkflowSession graph 接入 saver，后由 T2.6c 以精简 state 替换，避免制造第二套业务真相源。
+- T2.6c–e 完成于 2026-07-22：生产 graph 改为只持久化 `sessionId/sessionVersion/requestId/phase/next` 的精简状态，业务消息、方案、Prompt、回复、图片与场景仍只从既有 repository 读取；route/plan/construct 成为明确节点，稳定 operation 继续投影到 `workflow_steps`。clarification/confirmation 使用真实 `interrupt()`/`Command(resume)`，数据库重开后以同一 workflowRunId 恢复；checkpoint 缺失、session/version 不一致或 graph version 不兼容均返回稳定错误，不猜测关联。worker 对过期 lease 只在“plan 已成功、checkpoint 唯一待执行 construct、尚无非安全 step 或 scene_build”时保留 payload 并重新入队；若 session 已提交终态则只补齐 request 终态，避免重复执行；任何已进入或无法排除 MCP 场景写入的情况仍标为 `process_interrupted/failed_recoverable`，绝不依 checkpoint 重放施工。
+- 生命周期与验证：session 删除通过数据库级关联删除整个 workflow thread 及 pending writes，同时保留 request 审计；`data:cleanup` 默认只报告，`--execute` 才清理过期 thread，graph-version 不兼容还需显式 `--delete-incompatible`。自动化覆盖真实 StateGraph 跨数据库重开、interrupt/resume、plan 后 construct 故障重试、checkpoint 内容不含消息原文、删除/TTL/version mismatch、缺 checkpoint 稳定失败、过期 lease 的安全 requeue/终态补齐/不安全失败。这里完成的是 T1.6 的 checkpoint 接线与最小清理入口；附件登记、失败重试等 T1.6 其余内容仍保持未完成。
+- 限制保持不变：T2.6 只恢复 AI 进程内的安全执行边界，并未获得 MCP checkpoint/restore、幂等 creation key 或 publish-swap 能力，因此 T2.4 继续未完成；`structure-openings`、`furniture`、`modify` 等外部写入不自动续跑。本轮没有修改 `packages/mcp`。
+- 涉及：`src/agent.ts#createWorkflowGraph`、`src/workflow-state.ts`、`src/persistence/`、`src/request-worker.ts`、`src/server.ts`、`src/config.ts`；不修改 `packages/mcp`。T3.3 应把具体 LangGraph saver/runtime 放在 adapter，application 只依赖 workflow runtime/checkpoint port。
+- 完成标准：①进程在安全节点之间被 kill，重启后由原 workflowRunId 继续且不重复模型计费/步骤/施工；②确认 interrupt 跨重启可恢复，新的 confirm request 与原 workflow run 可追踪关联；③状态所有权与删除/TTL/graph-version 策略有自动化测试；④在场景写入边界 kill 时明确停为 `failed_recoverable`，不盲目重放 MCP 调用；⑤当前完整测试集全过且测试数不减少，`packages/mcp` diff 为空。
+- 依赖：T2.2 已完成；T2.6b/c 可开始。涉及外部场景副作用的自动恢复依赖 T2.4 正式能力，在“不修改 MCP”期间有意不做。
+- 参考：LangGraph 官方 persistence、interrupts 与 checkpointer 接口文档；具体版本 API 在实现时以锁文件版本为准，不能照搬其他版本示例。
 - 依据：§5.2、§14-1。
 
-### [ ] T2.7 工具调用、场景变更与验证审计
+### [x] T2.7 工具调用、场景变更与验证审计
 - 内容：补齐 `ai_tool_calls`、`ai_scene_changes`、`ai_validation_results` 的最小表与写入链路。每次写工具调用记录 request/step/operation key、工具名、脱敏参数摘要、状态、错误码和耗时；场景变更记录 before/after scene version、变更类型、节点数量和大型 diff artifact 引用；validator/gates 记录被验证版本、结果、问题摘要和 repair round。普通读工具默认只记摘要，不把完整场景或工具返回塞入日志/数据库文本列。审计从 SceneGateway/工具调用 adapter 统一产生，业务工作流不各自拼 SQL。
 - 涉及：`src/persistence/`、SceneGateway/工具调用 adapter、validator/gates 接线。
 - 完成标准：给定 requestId，可按顺序还原“模型调用 → 工具写入 → scene version 变化 → 验证/修复”的摘要链；失败和取消同样有记录；大型场景数据仅通过 artifact 引用，审计写入失败有明确处理策略。
 - 依赖：T1.5、T2.2、T2.4 的 scene version/capability 决策。
 - 排序：属于阶段 2 末尾的审计完备性增强，不阻塞 T2.3 前端进度流、T2.5 生命周期治理或可靠性主线验收。
 - 依据：评估 §6.1、§8.1；`AI_USAGE_AUDIT_DESIGN.md` §5.4–§5.8。
+- T2.6 关联：checkpoint 用于恢复而不是审计，不能替代本任务。审计表可增加 `workflow_run_id`、graph node/step 和 checkpoint_id 作为关联字段，但稳定查询仍以 requestId/operation/scene version 为主，避免绑定 LangGraph 内部序列化格式。
+- 完成于 2026-07-22：migration v8 建立 `ai_tool_calls`、`ai_scene_changes`、`ai_validation_results` 及 request/scene 查询索引；`AiOperationAuditor` 包住 agent 唯一 MCP 调用入口，统一关联 requestId、workflowRunId、workflow step、operation 与 scene。读写工具都只保存参数字段名、数组长度和对象键数量，不保存参数值、完整 scene 或工具原始响应；成功写调用额外记录变更类型、节点数量和可观测到的 before/after version，版本不可得时保持 NULL 而不猜测。completion gates 与集中 diagnostics 出口记录验证状态、数量型问题摘要和 repair round；`artifact_ref` 仅为将来外置大型 diff 预留，当前实现不把大型 diff 落入数据库。
+- 审计失败策略：工具调用前的 start 记录 fail-closed，保证无法建立审计起点时不执行外部工具；工具已经返回后的 finish/scene-change 与验证摘要写入 fail-open，只记录脱敏错误类别，避免事后簿记失败反向改变已发生的业务结果。进程中断留下的 `running` 工具行表示结果未知，不自动伪造成功或重放写工具。自动化覆盖成功读写、失败、取消、版本链、验证/repair 关联、参数与响应不泄漏，以及 start/finish 两侧的失败策略。本轮未修改 `packages/mcp`。
+- 已知边界：scene version 只从既有工具响应机会性捕获，不为审计额外发起 MCP 查询；进程重启或跨进程接手后的早期变更因此可能保持 NULL，直到 status/save 等响应重新建立版本基线。版本与 session→scene 的内存提示采用 1024 项有界 LRU，淘汰只降低审计完整度，不改变业务执行。验证摘要在 adapter 内再次限制为有限的计数、布尔值和安全枚举，避免未来调用方误传用户文本。
 
 ---
 
@@ -224,7 +259,7 @@
 - 依据：§6.3。
 
 ### [ ] T3.3 agent.ts 拆分（application/domain/ports/adapters）
-- 内容：按评估 §6.4 的目录结构分批拆：第一批 ports（model-client、scene-gateway、workflow-store）+ adapters 提取，agent.ts 只依赖接口；第二批 generate/modify/inspect 三条工作流拆成独立 application service；第三批房名/面积/动线等辅助算法沉入 domain。每批独立提交、测试全过再下一批，不做一次性大爆炸重构。
+- 内容：按评估 §6.4 的目录结构分批拆：第一批 ports（model-client、scene-gateway、workflow-store、workflow-runtime/checkpointer）+ adapters 提取，具体 LangGraph StateGraph/saver 只存在于 adapter/composition root，application 只依赖可替换的 workflow runtime port；第二批 generate/modify/inspect 三条工作流拆成独立 application service；第三批房名/面积/动线等辅助算法沉入 domain。每批独立提交、测试全过再下一批，不做一次性大爆炸重构。
 - 涉及：`src/agent.ts`（行数下降作为趋势指标，不把 `<800` 当架构验收门槛）、新 `src/domain|application|ports|adapters/`。
 - 完成标准：domain 目录零依赖 HTTP/MCP/DB/LangGraph；application 只依赖 ports，不直接依赖具体 adapter；依赖边界测试进 CI；`bun test` 全过且 eval 抽查 2–3 个 case 结果不变。
 - 依赖：建议在 T2.x 落定后做（异步化会改 agent 入口，先拆会白拆一部分）。
@@ -310,7 +345,7 @@
 - 依赖：TX.1、T1.2。
 
 ### [ ] TX.3 生产级内容隐私与留存治理
-- 内容：在 T1.6 最小数据卫生之上补齐对外 SaaS 能力：消息和敏感工具参数使用字段/信封加密，密钥进入正式 KMS/轮换流程；附件使用服务端加密和短期签名 URL；查看原文需要权限、理由和访问审计；删除覆盖缓存、索引、对象存储和备份策略；正式留存周期由产品/法务按目标市场与合同确认并版本化。
+- 内容：在 T1.6 最小数据卫生之上补齐对外 SaaS 能力：消息、checkpoint 中不可避免的敏感小型状态和敏感工具参数使用字段/信封加密，密钥进入正式 KMS/轮换流程；附件使用服务端加密和短期签名 URL；查看原文需要权限、理由和访问审计；删除覆盖 checkpoint/checkpoint writes、缓存、索引、对象存储和备份策略；正式留存周期由产品/法务按目标市场与合同确认并版本化。
 - 涉及：`src/persistence/`、artifact storage adapter、BFF/权限层、运维与隐私文档。
 - 完成标准：越权主体无法读取其他用户内容；密钥轮换与删除任务可测试、失败可重试并告警；普通日志/APM/Sentry 不含敏感原文；留存策略有负责人和版本记录。
 - 依赖：TX.1、T1.6。任何形式对外开放前必须完成，不阻塞当前本机/内网可靠性主线。
@@ -328,13 +363,17 @@ T0.1 → T0.2 → T0.3 → T0.4   （一周内可全部完成的小任务）
           ├→ T1.2            （模型调用计量，共享 persistence 基础）
           └→ T1.5            （session/request 持久化，可与 T1.2 并行）
 T0.2 ──────→ T1.4            （模板 schema，可并行）
-T1.5 → T2.1 → T2.2 → T2.3   （优先解决长请求与进度体验）
+T1.5 → T2.1 → T2.2 → T2.3 → T2.5
+                 └────────→ T2.6a（已决策 A）→ T2.6b → T2.6c → T2.6d → T2.6e
 ```
 
-T1.6、T1.7 可在 T1.5/T1.3 后并行，不阻塞阶段 2 主线；T1.2 仍应尽早完成，以便后续用真实数据验证成本和模板效果。T2.7 排在阶段 2 末尾，不阻塞 T2.3/T2.5。阶段 3 的 T3.1（房间语义）需要先完成 ADR 并解除 packages/mcp 约束，可以在做阶段 2 时提前讨论，但不要先写 schema。
+T2.6a 只依赖 T2.2；图中 T2.3/T2.5 先完成是当前实施顺序便利，不是技术阻塞关系。T1.6、T1.7 可在 T1.5/T1.3 后并行；T1.6 的删除/TTL 实现必须覆盖 T2.6 checkpoint，且写 checkpoint 的能力不得早于最小删除/TTL 一起进入真实数据环境。T1.2 仍应尽早完成，以便后续用真实数据验证成本和模板效果。T2.7 排在 T2.6 之后做关联审计补全，不阻塞 T2.3/T2.5。T2.6 只推进 AI 进程内的安全恢复，不解除 T2.4 的 MCP 能力阻塞。阶段 3 的 T3.1（房间语义）需要先完成 ADR 并解除 packages/mcp 约束，可以提前讨论，但不要先写 schema。
 
 ## 变更记录
 
 - 2026-07-17：初版，依据 ARCHITECTURE_ASSESSMENT.md（含复核）拆分。
 - 2026-07-17：Codex 复核修订：纠正 requestId 归属与 T1.2/T1.3 依赖；补齐失败 attempt 计量、隐私留存、错误脱敏、持久队列租约/容量保护；移除危险的 delete-node 回滚建议；把空间语义改为 ADR 先行；拆分模板命中与人工修改量闭环。
 - 2026-07-17：Claude/Codex 交叉复核修订：收窄阶段 1 验收到模型 operation/attempt；T1.6 降为本地最小数据卫生，生产隐私治理移至 TX.3；解除 T1.5 对 T1.2 和身份架构的隐性阻塞；明确 T2.7 不挡可靠性与进度主线。
+- 2026-07-22：T2.6 选择方案 A（保留 LangGraph 并接入持久化工作流），拆为状态所有权/标识、checkpointer、节点拆分、interrupt 恢复和留存五段；补充 T1.3/T1.5/T1.6、T2.1–T2.5/T2.7、T3.3/TX.3 的演进关系，并明确不修改 `packages/mcp` 时场景写入不可自动重放。
+- 2026-07-22：依据交叉审核收口 T2.6a：T1.6 拥有通用删除/TTL、T2.6e 拥有 graph 接线/version mismatch/故障验证；明确 checkpoint 写入与删除能力的部署时序、session→workflowRunId 从权威 phase + `ai_requests` 派生，以及 interrupt 无 lease 停泊的 stale/TTL 语义。
+- 2026-07-22：完成 T2.6b–e：精简持久 graph state、route/plan/construct 节点、跨重启 interrupt/resume、仅安全 plan 边界自动 requeue、终态补齐、checkpoint 删除/TTL/version mismatch 运维与故障注入；外部场景写入继续 fail-recoverable，`packages/mcp` 保持零改动。

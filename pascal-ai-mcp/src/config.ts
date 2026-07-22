@@ -34,6 +34,7 @@ export type AppConfig = {
   shutdownDrainTimeoutMs: number
   sessionFile: string
   databaseFile: string
+  workflowCheckpointTtlMs: number
   requestArtifactsDir: string
   templatesDir: string
   requestWorkerConcurrency: number
@@ -46,6 +47,10 @@ export type AppConfig = {
   mcpCommand: string
   mcpArgs: string[]
   mcpRequestTimeoutMs: number
+  mcpReconnectMaxAttempts: number
+  mcpReconnectBaseDelayMs: number
+  mcpCircuitCooldownMs: number
+  readinessToken?: string
   pascalDataDir?: string
   maxToolRounds: number
   maxClarificationRounds: number
@@ -129,6 +134,10 @@ export function loadConfig(): AppConfig {
     shutdownDrainTimeoutMs: parseIntWithDefault(process.env.AI_MCP_DRAIN_TIMEOUT_MS, 5_000),
     sessionFile,
     databaseFile,
+    workflowCheckpointTtlMs: parseIntWithDefault(
+      process.env.AI_MCP_CHECKPOINT_TTL_DAYS,
+      30,
+    ) * 24 * 60 * 60 * 1000,
     requestArtifactsDir,
     templatesDir,
     requestWorkerConcurrency: parseIntWithDefault(process.env.AI_MCP_WORKER_CONCURRENCY, 1),
@@ -152,6 +161,16 @@ export function loadConfig(): AppConfig {
       process.env.PASCAL_MCP_REQUEST_TIMEOUT_MS || process.env.AI_MCP_REQUEST_TIMEOUT_MS,
       120_000,
     ),
+    mcpReconnectMaxAttempts: parseIntWithDefault(process.env.PASCAL_MCP_RECONNECT_ATTEMPTS, 3),
+    mcpReconnectBaseDelayMs: parseIntWithDefault(
+      process.env.PASCAL_MCP_RECONNECT_BASE_DELAY_MS,
+      250,
+    ),
+    mcpCircuitCooldownMs: parseIntWithDefault(
+      process.env.PASCAL_MCP_CIRCUIT_COOLDOWN_MS,
+      2_000,
+    ),
+    readinessToken: emptyToUndefined(process.env.AI_MCP_READINESS_TOKEN),
     pascalDataDir: emptyToUndefined(process.env.PASCAL_DATA_DIR),
     maxToolRounds: parseIntWithDefault(process.env.AI_MCP_MAX_TOOL_ROUNDS, 12),
     maxClarificationRounds: parseIntWithDefault(process.env.AI_MAX_CLARIFICATION_ROUNDS, 3),

@@ -1043,6 +1043,7 @@ function workflowStepLabel(operationKey: string): string {
   }
   return (
     {
+      route: 'Routing the request',
       plan: 'Planning the layout',
       scaffold: 'Creating the scene',
       'structure-openings': 'Building rooms, walls, doors, and windows',

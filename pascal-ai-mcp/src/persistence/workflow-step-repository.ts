@@ -31,9 +31,11 @@ export interface WorkflowStepWriter {
   finish(stepId: string, status: Exclude<WorkflowStepStatus, 'running'>, completedAt: string, errorCode?: string): boolean
   failRunningForRequest(requestId: string, completedAt: string, errorCode: string): number
   failOrphanedRunningSteps(completedAt: string): number
+  findByRequestId?(requestId: string): WorkflowStepRecord[]
 }
 
 const WORKFLOW_OPERATION_KEYS = new Set([
+  'route',
   'plan',
   'scaffold',
   'structure-openings',

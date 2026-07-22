@@ -14,6 +14,10 @@ export type RequestContext = {
   traceId: string
   // Browser-side correlation tag; echo-only, never a key.
   clientRequestId?: string
+  // Server-owned logical workflow identity. Added after a request is
+  // persisted; browser input can never choose it.
+  workflowRunId?: string
+  graphVersion?: string
 }
 
 const TRACE_ID_PATTERN = /^[A-Za-z0-9-]{8,64}$/

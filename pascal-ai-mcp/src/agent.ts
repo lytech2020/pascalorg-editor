@@ -1,4 +1,3 @@
-import { END, START, StateGraph } from '@langchain/langgraph'
 import { evaluateCompletionGates, type GateFailure, type GateReport, type GateWall } from './completion-gates'
 import type { AppConfig } from './config'
 import { detectLanguage, issueText, t, type Lang } from './lang/i18n'
@@ -37,12 +36,20 @@ export { toolPayload }
 import { createRequestContext, type RequestContext } from './request-context'
 import type {
   ChatRequestWriter,
+  ChatRequestRecord,
   SessionPersistence,
 } from './persistence/session-repository'
 import { SessionVersionConflictError } from './persistence/session-repository'
 import type { WorkflowStepWriter } from './persistence/workflow-step-repository'
+import type { WorkflowStepRecord } from './persistence/workflow-step-repository'
 import type { SceneBoundary, SceneBuildWriter } from './persistence/scene-build-repository'
+import type { AiAuditWriter, AuditIdentity } from './persistence/audit-repository'
+import {
+  CheckpointGraphVersionMismatchError,
+  type SqliteCheckpointSaver,
+} from './persistence/sqlite-checkpoint-saver'
 import type { ModelAttemptSink } from './telemetry/model-attempt-recorder'
+import { AiOperationAuditor } from './telemetry/ai-operation-audit'
 import type {
   Availability,
   ChatInput,
@@ -58,7 +65,12 @@ import type {
   ToolCall,
   WorkflowSession,
 } from './types'
-import { WorkflowState, type WorkflowGraphState } from './workflow-state'
+import {
+  type DurableWorkflowGraphState,
+  type WorkflowGraphState,
+} from './workflow-state'
+import { WORKFLOW_GRAPH_VERSION } from './workflow-identity'
+import { DurableWorkflowRuntime } from './durable-workflow'
 
 const EMPTY_BRIEF: DesignBrief = {
   existingCondition: [],
@@ -138,6 +150,13 @@ class BudgetExceededError extends Error {
   constructor(limit: number) {
     super(`Model call count exceeded the safety limit (${limit}) for this task; stopped automatically to avoid waste`)
     this.name = 'BudgetExceededError'
+  }
+}
+
+export class WorkflowResumeBoundaryError extends Error {
+  constructor(readonly code: string) {
+    super(`workflow cannot resume safely: ${code}`)
+    this.name = 'WorkflowResumeBoundaryError'
   }
 }
 
@@ -222,7 +241,8 @@ export class PascalAiAgent {
   private readonly model?: OpenAiCompatibleClient
   private readonly fallbackModel?: OpenAiCompatibleClient
   private readonly fastModel?: OpenAiCompatibleClient
-  private readonly graph: ReturnType<typeof createWorkflowGraph>
+  private readonly workflow: DurableWorkflowRuntime
+  private readonly toolAuditor: AiOperationAuditor
   private readonly sessionLocks = new Map<string, Promise<ChatResult>>()
   private readonly sessionVersions = new Map<string, number>()
   // Sessions with a cancel requested while a run is in flight. The running
@@ -236,6 +256,7 @@ export class PascalAiAgent {
   // read at telemetry time so attempt logs (and the T1.2 sink) carry the
   // authoritative requestId/traceId (T1.3).
   private readonly activeRequestContexts = new Map<string, RequestContext>()
+  private readonly activeWorkflowSteps = new Map<string, WorkflowStepRecord>()
   // Per-turn model-call counter, keyed by sessionId for the duration of a
   // single `runChat`. Absent when no turn is running for that session.
   private readonly modelCallBudgets = new Map<string, number>()
@@ -244,6 +265,7 @@ export class PascalAiAgent {
   // the turn rather than only at the next turn's boundary.
   private readonly sessionPriorTotals = new Map<string, number>()
   private readonly destructiveWrites = new Set<string>()
+  private readonly activeTurnInputs = new Map<string, ChatInput>()
   // Lazily-fetched, process-lifetime cache of the MCP `pascal://agent-guide`
   // resource. Read once; failures are swallowed so a missing/renamed
   // resource never breaks the main generation flow.
@@ -257,7 +279,10 @@ export class PascalAiAgent {
     private readonly requests: ChatRequestWriter,
     private readonly workflowSteps: WorkflowStepWriter | undefined,
     private readonly sceneBuilds: SceneBuildWriter,
+    private readonly checkpointSaver: SqliteCheckpointSaver,
+    audits: AiAuditWriter,
   ) {
+    this.toolAuditor = new AiOperationAuditor(audits)
     if (config.aiApiKey) {
       this.model = new OpenAiCompatibleClient({
         provider: config.aiProvider,
@@ -307,7 +332,7 @@ export class PascalAiAgent {
     // session. Only unleased state is stale enough to recover; CAS remains the
     // final guard if two processes race after a lease expires.
     for (const stored of this.sessions.all()) {
-      if (this.requests.hasLiveWorkerRequest?.(stored.session.sessionId, new Date().toISOString())) continue
+      if (this.requests.hasLiveWorkerRequest?.(stored.session.sessionId)) continue
       this.sessionVersions.set(stored.session.sessionId, stored.version)
       try {
         this.recoverIfStale(stored.session)
@@ -318,13 +343,12 @@ export class PascalAiAgent {
         this.sessionVersions.delete(stored.session.sessionId)
       }
     }
-    this.graph = createWorkflowGraph({
-      ingest: state => this.ingest(state),
-      evaluate: state => this.evaluate(state),
-      generate: state => this.generate(state),
-      inspect: state => this.inspect(state),
-      modify: state => this.modify(state),
-    })
+    this.workflow = new DurableWorkflowRuntime({
+      route: state => this.routeDurableWorkflow(state),
+      legacy: state => this.runLegacyWorkflowNode(state),
+      plan: state => this.runPlanWorkflowNode(state),
+      construct: state => this.runConstructWorkflowNode(state),
+    }, checkpointSaver)
   }
 
   async chat(input: ChatInput): Promise<ChatResult> {
@@ -332,7 +356,7 @@ export class PascalAiAgent {
       ? input
       : { ...input, context: createRequestContext(new Headers()) }
     const context = contextualInput.context!
-    this.requests.start({
+    context.workflowRunId = this.requests.start({
       requestId: context.requestId,
       traceId: context.traceId,
       ...(context.clientRequestId ? { clientRequestId: context.clientRequestId } : {}),
@@ -343,6 +367,7 @@ export class PascalAiAgent {
       ...(contextualInput.sceneId ? { sceneId: contextualInput.sceneId } : {}),
       startedAt: new Date().toISOString(),
     })
+    context.graphVersion = WORKFLOW_GRAPH_VERSION
     try {
       const result = await this.executeQueued(contextualInput)
       // A handled cancellation is a successfully processed cancel action;
@@ -387,6 +412,50 @@ export class PascalAiAgent {
     this.runAbortControllers.get(sessionId)?.abort()
   }
 
+  async expiredRequestRecovery(
+    request: ChatRequestRecord,
+  ): Promise<'resume' | 'complete' | 'fail_recoverable'> {
+    if (!request.workflowRunId || request.graphVersion !== WORKFLOW_GRAPH_VERSION) {
+      return 'fail_recoverable'
+    }
+    try {
+      const snapshot = await this.workflow.snapshot(request.workflowRunId)
+      const stored = this.sessions.load(request.sessionId)
+      if (
+        snapshot
+        && snapshot.values.requestId === request.requestId
+        && stored
+        && stored.version > snapshot.values.sessionVersion
+        && isTerminalWorkflowPhase(stored.session.phase)
+      ) {
+        const runningStep = this.workflowSteps?.findByRequestId?.(request.requestId)
+          .some(step => step.status === 'running') ?? false
+        if (!runningStep) return 'complete'
+      }
+      if (
+        !snapshot
+        || snapshot.interrupted
+        || snapshot.next.length !== 1
+        || snapshot.next[0] !== 'construct'
+        || snapshot.values.requestId !== request.requestId
+        || snapshot.values.sessionId !== request.sessionId
+      ) {
+        return 'fail_recoverable'
+      }
+      const steps = this.workflowSteps?.findByRequestId?.(request.requestId) ?? []
+      const planCompleted = steps.some(step =>
+        step.operationKey === 'plan' && step.status === 'succeeded')
+      const unsafeProgress = steps.some(step =>
+        step.operationKey !== 'route' && step.operationKey !== 'plan')
+      const sceneBuildStarted = this.sceneBuilds.findByRequestId?.(request.requestId) !== undefined
+      return planCompleted && !unsafeProgress && !sceneBuildStarted
+        ? 'resume'
+        : 'fail_recoverable'
+    } catch {
+      return 'fail_recoverable'
+    }
+  }
+
   getSession(sessionId: string): WorkflowSession | undefined {
     const stored = this.sessions.load(sessionId)
     if (!stored) return undefined
@@ -395,7 +464,7 @@ export class PascalAiAgent {
     // a stuck leftover (restart / escaped exception) — downgrade before the
     // frontend renders a forever-spinning state.
     if (this.sessionLocks.has(sessionId)) return session
-    if (this.requests.hasLiveWorkerRequest?.(sessionId, new Date().toISOString())) return session
+    if (this.requests.hasLiveWorkerRequest?.(sessionId)) return session
     this.sessionVersions.set(sessionId, stored.version)
     try {
       return this.recoverIfStale(session)
@@ -470,6 +539,8 @@ export class PascalAiAgent {
       operationKey,
       startedAt: new Date().toISOString(),
     })
+    const previousStep = this.activeWorkflowSteps.get(session.sessionId)
+    this.activeWorkflowSteps.set(session.sessionId, step)
     try {
       const result = await work()
       const accepted = accepts(result)
@@ -503,16 +574,25 @@ export class PascalAiAgent {
         )
       }
       throw error
+    } finally {
+      if (this.activeWorkflowSteps.get(session.sessionId) === step) {
+        if (previousStep) this.activeWorkflowSteps.set(session.sessionId, previousStep)
+        else this.activeWorkflowSteps.delete(session.sessionId)
+      }
     }
   }
 
   private async runChat(input: ChatInput): Promise<ChatResult> {
     if (input.context) this.activeRequestContexts.set(input.sessionId, input.context)
+    if (input.context) this.activeTurnInputs.set(input.context.requestId, input)
     try {
       return await this.runChatInner(input)
     } finally {
       if (this.activeRequestContexts.get(input.sessionId) === input.context) {
         this.activeRequestContexts.delete(input.sessionId)
+      }
+      if (input.context && this.activeTurnInputs.get(input.context.requestId) === input) {
+        this.activeTurnInputs.delete(input.context.requestId)
       }
     }
   }
@@ -526,13 +606,27 @@ export class PascalAiAgent {
   }
 
   private async runChatTurn(input: ChatInput): Promise<ChatResult> {
+    const context = input.context
+    if (!context?.workflowRunId || context.graphVersion !== WORKFLOW_GRAPH_VERSION) {
+      throw new Error('durable workflow identity is missing or incompatible')
+    }
     const now = new Date().toISOString()
     const stored = this.sessions.load(input.sessionId)
     this.sessionVersions.set(input.sessionId, stored?.version ?? 0)
+    let snapshot
+    try {
+      snapshot = await this.workflow.snapshot(context.workflowRunId)
+    } catch (error) {
+      if (error instanceof CheckpointGraphVersionMismatchError) {
+        throw new WorkflowResumeBoundaryError('workflow_graph_version_mismatch')
+      }
+      throw error
+    }
     let session = stored?.session ?? createSession(input, now)
-    // Under the session lock the previous run has finished — an in-flight
-    // phase here can only be a stuck leftover.
-    session = this.recoverIfStale(session)
+    const resumingPreparedPlan = snapshot?.next.length === 1
+      && snapshot.next[0] === 'construct'
+      && snapshot.values.requestId === context.requestId
+    if (!resumingPreparedPlan) session = this.recoverIfStale(session)
     if (input.sceneId) session.sceneId = input.sceneId
 
     // Per-session cumulative cost ceiling. Cancel is always allowed through so
@@ -549,18 +643,224 @@ export class PascalAiAgent {
     this.sessionPriorTotals.set(input.sessionId, priorTotal)
     this.runAbortControllers.set(input.sessionId, new AbortController())
     try {
-      const result = await this.graph.invoke({ input, session, reply: '', next: 'evaluate' })
-      // Fold this turn's API attempts into the session's running total.
-      result.session.modelCallsTotal = priorTotal + (this.modelCallBudgets.get(input.sessionId) ?? 0)
-      result.session.updatedAt = new Date().toISOString()
-      this.persistSession(result.session)
-      return { sessionId: input.sessionId, reply: result.reply, session: result.session }
+      if (input.action === 'cancel' && snapshot && !snapshot.interrupted) {
+        const result = await this.runLegacyTurnAndPersist(input, session)
+        await this.checkpointSaver.deleteThread(context.workflowRunId)
+        return result
+      }
+      if (snapshot) {
+        if (snapshot.values.sessionId !== input.sessionId) {
+          throw new WorkflowResumeBoundaryError('workflow_session_mismatch')
+        }
+        if (snapshot.values.sessionVersion !== (stored?.version ?? 0)) {
+          throw new WorkflowResumeBoundaryError('workflow_session_version_mismatch')
+        }
+        if (snapshot.interrupted && snapshot.next.includes('wait')) {
+          await this.workflow.resume(context.workflowRunId, context.requestId)
+        } else if (
+          snapshot.next.length === 1
+          && snapshot.next[0] === 'construct'
+          && snapshot.values.requestId === context.requestId
+        ) {
+          await this.workflow.retryPending(context.workflowRunId)
+        } else {
+          throw new WorkflowResumeBoundaryError('workflow_not_resumable')
+        }
+      } else {
+        if (
+          input.action === 'confirm'
+          || session.phase === 'clarifying'
+          || session.phase === 'awaiting_confirmation'
+          || session.phase === 'awaiting_modification_confirmation'
+        ) {
+          throw new WorkflowResumeBoundaryError('workflow_checkpoint_unavailable')
+        }
+        await this.workflow.start({
+          sessionId: input.sessionId,
+          sessionVersion: stored?.version ?? 0,
+          requestId: context.requestId,
+          phase: session.phase,
+          next: 'legacy',
+        }, context.workflowRunId)
+      }
+      const completed = this.sessions.load(input.sessionId)
+      if (!completed) throw new Error(`session ${input.sessionId} was not persisted`)
+      this.sessionVersions.set(input.sessionId, completed.version)
+      return {
+        sessionId: input.sessionId,
+        reply: latestAssistantReply(completed.session),
+        session: completed.session,
+      }
     } finally {
       this.modelCallBudgets.delete(input.sessionId)
       this.sessionPriorTotals.delete(input.sessionId)
       this.runAbortControllers.delete(input.sessionId)
       this.cancelRequests.delete(input.sessionId)
     }
+  }
+
+  private async routeDurableWorkflow(
+    state: DurableWorkflowGraphState,
+  ): Promise<Partial<DurableWorkflowGraphState>> {
+    const input = this.activeTurnInputs.get(state.requestId)
+    if (!input || input.sessionId !== state.sessionId) {
+      throw new WorkflowResumeBoundaryError('workflow_request_input_unavailable')
+    }
+    const stored = this.sessions.load(state.sessionId)
+    if ((stored?.version ?? 0) !== state.sessionVersion) {
+      throw new WorkflowResumeBoundaryError('workflow_session_version_mismatch')
+    }
+    const canPrepareFreshPlan = input.action === 'confirm'
+      && (stored?.session.phase === 'clarifying'
+        || stored?.session.phase === 'awaiting_confirmation')
+      && !stored.session.sceneId
+    const next = canPrepareFreshPlan ? 'plan' as const : 'legacy' as const
+    const context = input.context
+    if (!context || !this.workflowSteps) {
+      return { phase: stored?.session.phase ?? state.phase, next }
+    }
+    const step = this.workflowSteps.start({
+      requestId: context.requestId,
+      sessionId: state.sessionId,
+      ...(stored?.session.sceneId ? { sceneId: stored.session.sceneId } : {}),
+      operationKey: 'route',
+      startedAt: new Date().toISOString(),
+    })
+    try {
+      this.workflowSteps.finish(step.stepId, 'succeeded', new Date().toISOString())
+    } catch (error) {
+      console.error(`[req ${context.requestId}] workflow route finish failed: ${errorMessage(error)}`)
+    }
+    return { phase: stored?.session.phase ?? state.phase, next }
+  }
+
+  private async runLegacyWorkflowNode(
+    state: DurableWorkflowGraphState,
+  ): Promise<Partial<DurableWorkflowGraphState>> {
+    const input = this.workflowInput(state)
+    const stored = this.sessions.load(state.sessionId)
+    if ((stored?.version ?? 0) !== state.sessionVersion) {
+      throw new WorkflowResumeBoundaryError('workflow_session_version_mismatch')
+    }
+    const session = stored?.session ?? createSession(input, new Date().toISOString())
+    const result = await this.runLegacyTurnAndPersist(input, session)
+    return {
+      sessionVersion: this.loadedSessionVersion(state.sessionId),
+      phase: result.session.phase,
+      next: 'finish',
+    }
+  }
+
+  private async runPlanWorkflowNode(
+    state: DurableWorkflowGraphState,
+  ): Promise<Partial<DurableWorkflowGraphState>> {
+    const input = this.workflowInput(state)
+    const session = structuredClone(this.loadWorkflowSession(state))
+    const ingestPlan = planIngestAction(input, session)
+    if (ingestPlan.kind !== 'route' || ingestPlan.next !== 'generate') {
+      throw new WorkflowResumeBoundaryError('workflow_plan_route_mismatch')
+    }
+    session.executionSteps = []
+    session.toolTrace = []
+    this.persistNodeSession(session)
+    const planned = await this.runWorkflowStep(
+      session,
+      'plan',
+      () => this.buildPlanForSession(session),
+      result => result.ok,
+      'plan_rejected',
+    )
+    if (!planned.ok) {
+      session.phase = 'failed'
+      const reply = t(session.language, 'planRejected', {
+        rounds: planned.modelCalls,
+        list: planned.failures
+          .map((failure, index) =>
+            `- ${renderPlanFailure(failure, planned.failuresL10n[index] ?? null, session.language ?? 'en')}`)
+          .join('\n'),
+      })
+      session.messages.push({ role: 'assistant', content: reply })
+      this.persistNodeSession(session)
+      return {
+        sessionVersion: this.loadedSessionVersion(session.sessionId),
+        phase: session.phase,
+        next: 'finish',
+      }
+    }
+    if (planned.intent) session.layoutIntent = planned.intent
+    session.layoutPlan = planned.plan
+    this.persistNodeSession(session)
+    return {
+      sessionVersion: this.loadedSessionVersion(session.sessionId),
+      phase: session.phase,
+      next: 'construct',
+    }
+  }
+
+  private async runConstructWorkflowNode(
+    state: DurableWorkflowGraphState,
+  ): Promise<Partial<DurableWorkflowGraphState>> {
+    const session = this.loadWorkflowSession(state)
+    const result = await this.generate({
+      input: this.workflowInput(state),
+      session,
+      reply: '',
+      next: 'generate',
+    }, true)
+    if (!result.session) throw new Error('construct node did not return a session')
+    this.persistNodeSession(result.session)
+    return {
+      sessionVersion: this.loadedSessionVersion(session.sessionId),
+      phase: result.session.phase,
+      next: 'finish',
+    }
+  }
+
+  private async runLegacyTurnAndPersist(
+    input: ChatInput,
+    session: WorkflowSession,
+  ): Promise<ChatResult> {
+    let state: WorkflowGraphState = { input, session, reply: '', next: 'evaluate' }
+    state = { ...state, ...await this.ingest(state) }
+    if (state.next === 'evaluate') state = { ...state, ...await this.evaluate(state) }
+    else if (state.next === 'generate') state = { ...state, ...await this.generate(state) }
+    else if (state.next === 'inspect') state = { ...state, ...await this.inspect(state) }
+    else if (state.next === 'modify') state = { ...state, ...await this.modify(state) }
+    const result = state
+    this.persistNodeSession(result.session)
+    return { sessionId: input.sessionId, reply: result.reply, session: result.session }
+  }
+
+  private workflowInput(state: DurableWorkflowGraphState): ChatInput {
+    const input = this.activeTurnInputs.get(state.requestId)
+    if (!input || input.sessionId !== state.sessionId) {
+      throw new WorkflowResumeBoundaryError('workflow_request_input_unavailable')
+    }
+    return input
+  }
+
+  private loadWorkflowSession(state: DurableWorkflowGraphState): WorkflowSession {
+    const stored = this.sessions.load(state.sessionId)
+    if (!stored) throw new WorkflowResumeBoundaryError('workflow_session_missing')
+    if (stored.version !== state.sessionVersion) {
+      throw new WorkflowResumeBoundaryError('workflow_session_version_mismatch')
+    }
+    this.sessionVersions.set(state.sessionId, stored.version)
+    return stored.session
+  }
+
+  private persistNodeSession(session: WorkflowSession): void {
+    const prior = this.sessionPriorTotals.get(session.sessionId) ?? session.modelCallsTotal ?? 0
+    const used = this.modelCallBudgets.get(session.sessionId) ?? 0
+    session.modelCallsTotal = prior + used
+    session.updatedAt = new Date().toISOString()
+    this.persistSession(session)
+  }
+
+  private loadedSessionVersion(sessionId: string): number {
+    const version = this.sessionVersions.get(sessionId)
+    if (version === undefined) throw new Error(`session ${sessionId} has no loaded persistence version`)
+    return version
   }
 
   private throwIfCancelled(sessionId: string): void {
@@ -573,7 +873,48 @@ export class PascalAiAgent {
   // is uniform.
   private callMcp(sessionId: string, name: string, args: Record<string, unknown>): Promise<unknown> {
     const signal = this.runAbortControllers.get(sessionId)?.signal
-    return this.mcp.callTool(name, args, { signal })
+    const identity = this.auditIdentity(sessionId)
+    if (!identity) return this.mcp.callTool(name, args, { signal })
+    const sceneId = this.toolAuditor.sceneFor(sessionId)
+      ?? this.sessions.load(sessionId)?.session.sceneId
+    return this.toolAuditor.callTool({
+      ...identity,
+      ...(sceneId ? { sceneId } : {}),
+    }, name, args, () => this.mcp.callTool(name, args, { signal }))
+  }
+
+  private auditIdentity(sessionId: string): AuditIdentity | undefined {
+    const context = this.activeRequestContexts.get(sessionId)
+    if (!context) return undefined
+    const step = this.activeWorkflowSteps.get(sessionId)
+    return {
+      requestId: context.requestId,
+      ...(context.workflowRunId ? { workflowRunId: context.workflowRunId } : {}),
+      ...(step ? { workflowStepId: step.stepId } : {}),
+      sessionId,
+      operationKey: step?.operationKey ?? 'request',
+    }
+  }
+
+  private recordValidation(
+    session: WorkflowSession,
+    validator: string,
+    status: 'passed' | 'failed' | 'unavailable',
+    issueCount: number,
+    summary: Record<string, unknown>,
+  ): void {
+    const identity = this.auditIdentity(session.sessionId)
+    if (!identity) return
+    const sceneId = session.sceneId ?? this.toolAuditor.sceneFor(session.sessionId)
+    const repairMatch = identity.operationKey.match(/^repair:(\d+)$/)
+    this.toolAuditor.recordValidation(
+      { ...identity, ...(sceneId ? { sceneId } : {}) },
+      validator,
+      status,
+      issueCount,
+      summary,
+      repairMatch ? Number(repairMatch[1]) : undefined,
+    )
   }
 
   // Counts one model API attempt against both the per-turn and the cumulative
@@ -804,7 +1145,10 @@ export class PascalAiAgent {
     return { session, reply, next: 'finish' }
   }
 
-  private async generate(state: WorkflowGraphState): Promise<Partial<WorkflowGraphState>> {
+  private async generate(
+    state: WorkflowGraphState,
+    preparedPlan = false,
+  ): Promise<Partial<WorkflowGraphState>> {
     const session = structuredClone(state.session)
     // If this attempt goes down the fresh-build branch (no existing scene,
     // or `session.sceneId` gets overwritten by a newly created project
@@ -818,14 +1162,16 @@ export class PascalAiAgent {
     const priorSceneId = session.sceneId
     let freshBuildId: string | undefined
     try {
-      session.executionSteps = []
-      session.toolTrace = []
+      if (!preparedPlan) {
+        session.executionSteps = []
+        session.toolTrace = []
+      }
       // Persist the `generating` phase up front. Session state is otherwise
       // only written at the very end of the turn, so a crash mid-generation
       // would leave the stored phase stuck at `awaiting_confirmation` with no
       // trace that a build was underway. This snapshot makes the in-progress
       // (and any later abandoned scene) state diagnosable after a restart.
-      this.persistSession(session)
+      if (!preparedPlan) this.persistSession(session)
       const generationArgs = buildGenerationArgs(session)
       if (session.sceneId) {
         const loaded = toolPayload(await this.callMcp(session.sessionId, 'load_scene', { id: session.sceneId }))
@@ -849,29 +1195,33 @@ export class PascalAiAgent {
       // partition → validation, all before any Pascal scene exists. A brief
       // that can't produce a valid plan fails right here — zero abandoned
       // scenes, and the confirmed requirements survive for a retry.
-      let planned = await this.runWorkflowStep(
-        session,
-        'plan',
-        () => this.buildPlanForSession(session),
-        result => result.ok,
-        'plan_rejected',
-      )
-      if (!planned.ok) {
-        session.phase = 'failed'
-        const { failures, failuresL10n } = planned
-        const reply = t(session.language, 'planRejected', {
-          rounds: planned.modelCalls,
-          list: failures
-            .map((failure, index) =>
-              `- ${renderPlanFailure(failure, failuresL10n[index] ?? null, session.language ?? 'en')}`)
-            .join('\n'),
-        })
-        session.messages.push({ role: 'assistant', content: reply })
-        return { session, reply, next: 'finish' }
+      let activePlan = preparedPlan ? session.layoutPlan : undefined
+      if (!activePlan) {
+        const planned = await this.runWorkflowStep(
+          session,
+          'plan',
+          () => this.buildPlanForSession(session),
+          result => result.ok,
+          'plan_rejected',
+        )
+        if (!planned.ok) {
+          session.phase = 'failed'
+          const { failures, failuresL10n } = planned
+          const reply = t(session.language, 'planRejected', {
+            rounds: planned.modelCalls,
+            list: failures
+              .map((failure, index) =>
+                `- ${renderPlanFailure(failure, failuresL10n[index] ?? null, session.language ?? 'en')}`)
+              .join('\n'),
+          })
+          session.messages.push({ role: 'assistant', content: reply })
+          return { session, reply, next: 'finish' }
+        }
+        if (planned.intent) session.layoutIntent = planned.intent
+        activePlan = planned.plan
+        session.layoutPlan = activePlan
+        this.persistSession(session)
       }
-      if (planned.intent) session.layoutIntent = planned.intent
-      session.layoutPlan = planned.plan
-      this.persistSession(session)
 
       if (!priorSceneId && this.sceneBuilds) {
         const context = this.activeRequestContexts.get(session.sessionId)
@@ -908,7 +1258,7 @@ export class PascalAiAgent {
         }
       }
       await this.clearLevelForRebuild(session, levelId)
-      let construction = await this.constructScenePlanFirst(session, levelId, planned.plan, { persistAfterRound })
+      let construction = await this.constructScenePlanFirst(session, levelId, activePlan, { persistAfterRound })
 
       // §5 失败分流：structural gate failures go back to the plan layer once.
       // The acceptance facts are quoted into a fresh intent prompt; if the
@@ -924,12 +1274,12 @@ export class PascalAiAgent {
           'plan_rejected',
         )
         if (replanned.ok) {
-          planned = replanned
           if (replanned.intent) session.layoutIntent = replanned.intent
-          session.layoutPlan = replanned.plan
+          activePlan = replanned.plan
+          session.layoutPlan = activePlan
           this.persistSession(session)
           await this.clearLevelForRebuild(session, levelId)
-          construction = await this.constructScenePlanFirst(session, levelId, planned.plan, { persistAfterRound })
+          construction = await this.constructScenePlanFirst(session, levelId, activePlan, { persistAfterRound })
         }
       }
 
@@ -2370,6 +2720,27 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     )
     trace.converged = result.ok
     if (result.seedTrace?.length) trace.notes = result.seedTrace
+    if (result.ok) {
+      this.recordValidation(
+        session,
+        'layout-plan',
+        result.validation.fatal.length === 0 ? 'passed' : 'failed',
+        result.validation.fatal.length + result.validation.warnings.length,
+        {
+          fatalCount: result.validation.fatal.length,
+          warningCount: result.validation.warnings.length,
+          score: result.validation.score,
+        },
+      )
+    } else {
+      this.recordValidation(
+        session,
+        'layout-plan',
+        'failed',
+        result.failures.length,
+        { fatalCount: result.failures.length, warningCount: 0 },
+      )
+    }
     return result
   }
 
@@ -2409,6 +2780,16 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     const layoutQuality = computeLayoutQuality(zones, walls, {
       ...(planTargets.totalAreaSqm !== undefined ? { targetTotalAreaSqm: planTargets.totalAreaSqm } : {}),
     }).score
+    this.recordValidation(
+      session,
+      'completion-gates',
+      report.passed ? 'passed' : 'failed',
+      report.failures.length,
+      {
+        failedGates: [...new Set(report.failures.map(failure => failure.gate))].sort(),
+        failureKinds: [...new Set(report.failures.map(failure => failure.id))].sort(),
+      },
+    )
     return { report, layoutQuality }
   }
 
@@ -2879,7 +3260,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
       ...checkAreaRequirements(zones, session.brief),
     ]
     const strayWallIds = findStrayWindows(zones, walls)
-    return {
+    const diagnostics = {
       validation: {
         valid: validationPayload.valid === true,
         errors: validationErrors,
@@ -2897,6 +3278,25 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
       strayWallIds,
       mismatchL10n: mismatchFindings.map(finding => finding.l10n),
     }
+    const issueCounts = {
+      validationErrors: diagnostics.validation.errors.length,
+      verificationIssues: diagnostics.verificationIssues.length,
+      collisions: diagnostics.collisions.length,
+      doorlessRooms: diagnostics.doorlessRooms.length,
+      strayWindows: diagnostics.strayWindows.length,
+      requirementMismatches: diagnostics.requirementMismatches.length,
+      isolatedBedrooms: diagnostics.isolatedBedrooms.length,
+      furniturePlacementIssues: diagnostics.furniturePlacementIssues.length,
+    }
+    const issueCount = Object.values(issueCounts).reduce((sum, count) => sum + count, 0)
+    this.recordValidation(
+      session,
+      'scene-diagnostics',
+      issueCount === 0 ? 'passed' : 'failed',
+      issueCount,
+      issueCounts,
+    )
+    return diagnostics
   }
 
   private modelHooks(sessionId: string): RequestHooks {
@@ -2968,40 +3368,12 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
   }
 }
 
-function createWorkflowGraph(nodes: {
-  ingest: (state: WorkflowGraphState) => Promise<Partial<WorkflowGraphState>>
-  evaluate: (state: WorkflowGraphState) => Promise<Partial<WorkflowGraphState>>
-  generate: (state: WorkflowGraphState) => Promise<Partial<WorkflowGraphState>>
-  inspect: (state: WorkflowGraphState) => Promise<Partial<WorkflowGraphState>>
-  modify: (state: WorkflowGraphState) => Promise<Partial<WorkflowGraphState>>
-}) {
-  return new StateGraph(WorkflowState)
-    .addNode('ingest', nodes.ingest)
-    .addNode('evaluate', nodes.evaluate)
-    .addNode('generate', nodes.generate)
-    .addNode('inspect', nodes.inspect)
-    .addNode('modify', nodes.modify)
-    .addEdge(START, 'ingest')
-    .addConditionalEdges('ingest', state => state.next, {
-      evaluate: 'evaluate',
-      generate: 'generate',
-      inspect: 'inspect',
-      modify: 'modify',
-      finish: END,
-    })
-    .addEdge('evaluate', END)
-    .addEdge('generate', END)
-    .addEdge('inspect', END)
-    .addEdge('modify', END)
-    // No checkpointer: every turn is invoked with the full state loaded from
-    // SQLite session persistence (the single source of truth) and this graph runs exactly
-    // one super-step per turn, so a checkpointer would add nothing but an
-    // unbounded, never-pruned in-memory store of past turns (a leak).
-    .compile()
-}
-
 function isCompletedPhase(phase: WorkflowSession['phase']): boolean {
   return phase === 'completed' || phase === 'completed_with_issues'
+}
+
+function isTerminalWorkflowPhase(phase: WorkflowSession['phase']): boolean {
+  return isCompletedPhase(phase) || phase === 'failed' || phase === 'cancelled'
 }
 
 /**
@@ -5043,6 +5415,14 @@ function isCollision(value: unknown): value is { aId: string; bId: string; kind:
   if (!value || typeof value !== 'object') return false
   const record = value as Record<string, unknown>
   return typeof record.aId === 'string' && typeof record.bId === 'string' && typeof record.kind === 'string'
+}
+
+function latestAssistantReply(session: WorkflowSession): string {
+  for (let index = session.messages.length - 1; index >= 0; index--) {
+    const message = session.messages[index]
+    if (message?.role === 'assistant' && typeof message.content === 'string') return message.content
+  }
+  return ''
 }
 
 function errorMessage(error: unknown): string {

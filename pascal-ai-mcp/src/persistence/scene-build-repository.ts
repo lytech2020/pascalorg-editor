@@ -38,6 +38,7 @@ export interface SceneBuildWriter {
   succeed(buildId: string, boundary: SceneBoundary, completedAt: string): void
   abandon(buildId: string, errorCode: string, completedAt: string): void
   abandonOrphaned(activeStatusesAt: string): number
+  findByRequestId?(requestId: string): SceneBuildRecord | undefined
 }
 
 export type SceneBoundary = { version: number; graphHash: string }

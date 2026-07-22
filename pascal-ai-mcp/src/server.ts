@@ -10,6 +10,7 @@ import {
   RequestIdempotencyConflictError,
   RequestQueueFullError,
   SqliteSessionPersistence,
+  WorkflowRunResolutionError,
 } from './persistence/session-repository'
 import { clientRequestIdFrom, createRequestContext } from './request-context'
 import { RequestPayloadStore } from './request-payload-store'
@@ -18,9 +19,20 @@ import { SqliteModelAttemptRecorder } from './telemetry/model-attempt-recorder'
 import { loadTemplateLibrary, templateLibraryAllowsTraffic } from './template-seed'
 import { WorkflowStepRepository } from './persistence/workflow-step-repository'
 import { SceneBuildRepository } from './persistence/scene-build-repository'
+import { SqliteCheckpointSaver } from './persistence/sqlite-checkpoint-saver'
+import { AiAuditRepository } from './persistence/audit-repository'
+import { WORKFLOW_GRAPH_VERSION } from './workflow-identity'
 
 const config = loadConfig()
 const database = new AppDatabase(config.databaseFile)
+const checkpointSaver = new SqliteCheckpointSaver(database, {
+  graphVersion: WORKFLOW_GRAPH_VERSION,
+  ttlMs: config.workflowCheckpointTtlMs,
+})
+const prunedCheckpoints = checkpointSaver.pruneExpired()
+if (prunedCheckpoints > 0) {
+  console.log(`langgraph-checkpoints: pruned=${prunedCheckpoints}`)
+}
 const modelAttempts = new SqliteModelAttemptRecorder(new ModelCallRepository(database))
 const sessions = new SqliteSessionPersistence(database)
 const legacySessions = sessions.importLegacyFile(config.sessionFile)
@@ -30,6 +42,7 @@ if (legacySessions.status === 'imported') {
 const requests = new ChatRequestRepository(database)
 const workflowSteps = new WorkflowStepRepository(database)
 const sceneBuilds = new SceneBuildRepository(database)
+const audits = new AiAuditRepository(database)
 const templateLibrary = loadTemplateLibrary(config.templatesDir)
 const templatesAcceptTraffic = templateLibraryAllowsTraffic(templateLibrary.health)
 const templateHealthSummary = {
@@ -46,17 +59,35 @@ if (templateLibrary.health.failures.length > 0) {
   for (const failure of templateLibrary.health.failures) log(`template-library load failure: ${failure}`)
 }
 const mcp = new PascalMcpClient(config)
-await mcp.connect()
+try {
+  await mcp.connect()
+} catch {
+  console.error(`mcp startup degraded: ${mcp.status().lastErrorCode ?? 'connection_error'}`)
+}
 
-const agent = new PascalAiAgent(config, mcp, modelAttempts, sessions, requests, workflowSteps, sceneBuilds)
+const agent = new PascalAiAgent(
+  config,
+  mcp,
+  modelAttempts,
+  sessions,
+  requests,
+  workflowSteps,
+  sceneBuilds,
+  checkpointSaver,
+  audits,
+)
 const requestPayloads = new RequestPayloadStore(config.requestArtifactsDir)
 const worker = new RequestWorker(requests, sessions, requestPayloads, agent, {
   concurrency: config.requestWorkerConcurrency,
   leaseMs: config.requestLeaseMs,
   pollMs: config.requestWorkerPollMs,
+  canClaim: () => mcp.status().ready || requests.hasQueuedCancel(),
 }, workflowSteps, sceneBuilds)
+mcp.onStatusChange(status => {
+  if (status.ready) worker.notify()
+})
 if (templatesAcceptTraffic) worker.start()
-else worker.recoverExpired()
+else await worker.recoverExpired()
 // Keep Bun's transport safety cap above the application limit so ordinary
 // Content-Length violations reach readJsonBody and receive request identity.
 // Requests above this hard cap are rejected by Bun before application code.
@@ -96,6 +127,31 @@ async function handle(request: Request): Promise<Response> {
   // internal readiness endpoint lands with T2.5.
   if (request.method === 'GET' && url.pathname === '/health') {
     return json({ ok: true })
+  }
+
+  if (request.method === 'GET' && url.pathname === '/ready') {
+    if (!readinessAuthorized(request)) return json({ error: 'unauthorized' }, 401)
+    const mcpReady = await mcp.checkReady()
+    if (mcpReady) worker.notify()
+    const databaseReady = database.isWritable()
+    const checkpointReady = checkpointSaver.isWritable()
+    const telemetry = modelAttempts.status()
+    const ready = databaseReady && checkpointReady && templatesAcceptTraffic && mcpReady && telemetry.ok
+    return json({
+      ready,
+      checks: {
+        database: { ready: databaseReady },
+        checkpoints: { ready: checkpointReady, graphVersion: WORKFLOW_GRAPH_VERSION },
+        templates: { ...templateHealthSummary, acceptsTraffic: templatesAcceptTraffic },
+        mcp: mcp.status(),
+        telemetry: { ready: telemetry.ok, failureCount: telemetry.failureCount },
+        modelProvider: {
+          ready: true,
+          configured: Boolean(config.aiApiKey),
+          degraded: !config.aiApiKey,
+        },
+      },
+    }, ready ? 200 : 503)
   }
 
   if (request.method === 'GET' && url.pathname === '/tools') {
@@ -166,6 +222,15 @@ async function handle(request: Request): Promise<Response> {
       )
     }
 
+
+    if (body.action !== 'cancel' && !(await mcp.checkReady())) {
+      return json(
+        { error: 'mcp_unavailable', message: 'Pascal MCP is not ready', ...identity() },
+        503,
+        { ...identityHeaders, 'Retry-After': '2' },
+      )
+    }
+
     let imageArtifact: ReturnType<RequestPayloadStore['persistImage']> | undefined
     try {
       if (body.imageDataUrl) imageArtifact = requestPayloads.persistImage(body.imageDataUrl)
@@ -211,6 +276,7 @@ async function handle(request: Request): Promise<Response> {
           statusUrl: `/requests/${enqueued.request.requestId}`,
           requestId: enqueued.request.requestId,
           traceId: enqueued.request.traceId,
+          ...(enqueued.request.workflowRunId ? { workflowRunId: enqueued.request.workflowRunId } : {}),
           ...(context.clientRequestId ? { clientRequestId: context.clientRequestId } : {}),
         },
         202,
@@ -243,6 +309,13 @@ async function handle(request: Request): Promise<Response> {
           identityHeaders,
         )
       }
+      if (error instanceof WorkflowRunResolutionError) {
+        return json(
+          { error: 'workflow_not_resumable', reason: error.reason, message: error.message, ...identity() },
+          409,
+          identityHeaders,
+        )
+      }
       console.error(`[req ${context.requestId}] [trace ${context.traceId}] enqueue failed: ${errorMessage(error)}`)
       return json(
         { error: 'internal_error', message: errorMessage(error), ...identity() },
@@ -266,6 +339,8 @@ async function handle(request: Request): Promise<Response> {
       ...(record.clientRequestId ? { clientRequestId: record.clientRequestId } : {}),
       ...(record.idempotencyKey ? { idempotencyKey: record.idempotencyKey } : {}),
       sessionId: record.sessionId,
+      ...(record.workflowRunId ? { workflowRunId: record.workflowRunId } : {}),
+      ...(record.graphVersion ? { graphVersion: record.graphVersion } : {}),
       kind: record.kind,
       status: record.status,
       runAttempts: record.runAttempts,
@@ -346,6 +421,12 @@ async function shutdown(signal: string): Promise<void> {
     process.exit(1)
   }
   try {
+    checkpointSaver.close()
+  } catch (error) {
+    console.error('shutdown: failed to close checkpoint saver:', errorMessage(error))
+    exitCode = 1
+  }
+  try {
     await mcp.close()
   } catch (error) {
     console.error('shutdown: failed to close MCP client:', errorMessage(error))
@@ -397,4 +478,9 @@ function errorMessage(error: unknown): string {
 
 function isValidIdempotencyKey(value: unknown): value is string {
   return typeof value === 'string' && /^[A-Za-z0-9._:-]{8,128}$/.test(value)
+}
+
+function readinessAuthorized(request: Request): boolean {
+  if (!config.readinessToken) return false
+  return request.headers.get('authorization') === `Bearer ${config.readinessToken}`
 }

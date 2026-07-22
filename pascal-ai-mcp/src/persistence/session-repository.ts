@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import type { ChatMessage, WorkflowSession } from '../types'
+import { createWorkflowRunId, WORKFLOW_GRAPH_VERSION } from '../workflow-identity'
 import type { AppDatabase } from './database'
 
 export type StoredSession = { session: WorkflowSession; version: number }
@@ -305,6 +306,8 @@ export type ChatRequestRecord = {
   traceId: string
   clientRequestId?: string
   sessionId: string
+  workflowRunId?: string
+  graphVersion?: string
   kind: ChatRequestKind
   status: ChatRequestStatus
   sceneId?: string
@@ -337,9 +340,9 @@ export type ChatRequestStart = {
 }
 
 export interface ChatRequestWriter {
-  start(record: ChatRequestStart): void
+  start(record: ChatRequestStart): string
   finish(requestId: string, status: ChatRequestStatus, completedAt: string, errorCode?: string): void
-  hasLiveWorkerRequest?(sessionId: string, now: string): boolean
+  hasLiveWorkerRequest?(sessionId: string): boolean
 }
 
 export class RequestQueueFullError extends Error {
@@ -363,6 +366,15 @@ export class RequestIdempotencyConflictError extends Error {
   }
 }
 
+export class WorkflowRunResolutionError extends Error {
+  constructor(readonly reason: 'phase_mismatch' | 'missing_workflow') {
+    super(reason === 'phase_mismatch'
+      ? 'the session is not waiting for workflow continuation'
+      : 'the session has no workflow run to resume')
+    this.name = 'WorkflowRunResolutionError'
+  }
+}
+
 export type EnqueueResult = {
   request: ChatRequestRecord
   created: boolean
@@ -374,6 +386,7 @@ export class ChatRequestRepository implements ChatRequestWriter {
   private readonly finishStatement
   private readonly reconcileDirectStepsStatement
   private readonly findStatement
+  private readonly bySessionStatement
   private readonly activeCountStatement
   private readonly enqueueStatement
   private readonly queuedBySessionStatement
@@ -384,10 +397,14 @@ export class ChatRequestRepository implements ChatRequestWriter {
   private readonly completeStatement
   private readonly expiredStatement
   private readonly failExpiredStatement
+  private readonly requeueExpiredStatement
   private readonly liveWorkerBySessionStatement
   private readonly activeBySessionStatement
   private readonly cancellationTargetStatement
   private readonly findIdempotentStatement
+  private readonly queuedCancelStatement
+  private readonly sessionPhaseStatement
+  private readonly latestWorkflowRunStatement
 
   constructor(private readonly database: AppDatabase) {
     this.startStatement = database.connection.prepare(`
@@ -395,9 +412,10 @@ export class ChatRequestRepository implements ChatRequestWriter {
         request_id, trace_id, client_request_id, session_id, kind,
         status, scene_id, input_json, result_json, error_code,
         owner_instance_id, lease_expires_at, heartbeat_at, run_attempts,
-        queued_at, started_at, completed_at, idempotency_key, input_hash, idempotency_subject
+        queued_at, started_at, completed_at, idempotency_key, input_hash, idempotency_subject,
+        workflow_run_id, graph_version
       ) VALUES (?, ?, ?, ?, ?, 'running', ?, NULL, NULL, NULL,
-        'direct', NULL, NULL, 1, ?, ?, NULL, NULL, NULL, 'local')
+        'direct', NULL, NULL, 1, ?, ?, NULL, NULL, NULL, 'local', ?, ?)
     `)
     this.finishStatement = database.connection.prepare(`
       UPDATE ai_requests
@@ -414,6 +432,9 @@ export class ChatRequestRepository implements ChatRequestWriter {
     this.findStatement = database.connection.prepare(`
       SELECT * FROM ai_requests WHERE request_id = ?
     `)
+    this.bySessionStatement = database.connection.prepare(`
+      SELECT * FROM ai_requests WHERE session_id = ? ORDER BY queued_at, request_id
+    `)
     this.activeCountStatement = database.connection.prepare(`
       SELECT COUNT(*) AS count FROM ai_requests
       WHERE status = 'queued'
@@ -424,9 +445,10 @@ export class ChatRequestRepository implements ChatRequestWriter {
         request_id, trace_id, client_request_id, session_id, kind,
         status, scene_id, input_json, result_json, error_code,
         owner_instance_id, lease_expires_at, heartbeat_at, run_attempts,
-        queued_at, started_at, completed_at, idempotency_key, input_hash, idempotency_subject
+        queued_at, started_at, completed_at, idempotency_key, input_hash, idempotency_subject,
+        workflow_run_id, graph_version
       ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, NULL, NULL,
-        NULL, NULL, NULL, 0, ?, NULL, NULL, ?, ?, ?)
+        NULL, NULL, NULL, 0, ?, NULL, NULL, ?, ?, ?, ?, ?)
     `)
     this.queuedBySessionStatement = database.connection.prepare(`
       SELECT * FROM ai_requests
@@ -493,6 +515,12 @@ export class ChatRequestRepository implements ChatRequestWriter {
           lease_expires_at = NULL, heartbeat_at = NULL
       WHERE request_id = ? AND status = 'running' AND owner_instance_id = ?
     `)
+    this.requeueExpiredStatement = database.connection.prepare(`
+      UPDATE ai_requests
+      SET status = 'queued', owner_instance_id = NULL,
+          lease_expires_at = NULL, heartbeat_at = NULL, error_code = NULL
+      WHERE request_id = ? AND status = 'running' AND owner_instance_id = ?
+    `)
     this.liveWorkerBySessionStatement = database.connection.prepare(`
       SELECT 1 FROM ai_requests
       WHERE session_id = ?
@@ -501,7 +529,6 @@ export class ChatRequestRepository implements ChatRequestWriter {
           OR (
             status = 'running'
             AND owner_instance_id LIKE 'worker:%'
-            AND lease_expires_at > ?
           )
         )
       LIMIT 1
@@ -531,19 +558,38 @@ export class ChatRequestRepository implements ChatRequestWriter {
         AND idempotency_key = ?
       LIMIT 1
     `)
+    this.queuedCancelStatement = database.connection.prepare(`
+      SELECT 1 FROM ai_requests WHERE status = 'queued' AND kind = 'cancel' LIMIT 1
+    `)
+    this.sessionPhaseStatement = database.connection.prepare(`
+      SELECT phase FROM ai_sessions WHERE session_id = ?
+    `)
+    this.latestWorkflowRunStatement = database.connection.prepare(`
+      SELECT workflow_run_id
+      FROM ai_requests
+      WHERE session_id = ? AND workflow_run_id IS NOT NULL
+      ORDER BY queued_at DESC, request_id DESC
+      LIMIT 1
+    `)
   }
 
-  start(record: ChatRequestStart): void {
-    this.startStatement.run(
-      record.requestId,
-      record.traceId,
-      record.clientRequestId ?? null,
-      record.sessionId,
-      record.kind,
-      record.sceneId ?? null,
-      record.startedAt,
-      record.startedAt,
-    )
+  start(record: ChatRequestStart): string {
+    return this.database.connection.transaction(() => {
+      const workflowRunId = this.resolveWorkflowRunId(record.sessionId, record.kind)
+      this.startStatement.run(
+        record.requestId,
+        record.traceId,
+        record.clientRequestId ?? null,
+        record.sessionId,
+        record.kind,
+        record.sceneId ?? null,
+        record.startedAt,
+        record.startedAt,
+        workflowRunId,
+        WORKFLOW_GRAPH_VERSION,
+      )
+      return workflowRunId
+    }).immediate()
   }
 
   finish(requestId: string, status: ChatRequestStatus, completedAt: string, errorCode?: string): void {
@@ -596,6 +642,7 @@ export class ChatRequestRepository implements ChatRequestWriter {
           }
         }
       }
+      const workflowRunId = this.resolveWorkflowRunId(record.sessionId, record.kind)
       this.enqueueStatement.run(
         record.requestId,
         record.traceId,
@@ -608,6 +655,8 @@ export class ChatRequestRepository implements ChatRequestWriter {
         record.idempotencyKey ?? null,
         inputHash,
         idempotencySubject,
+        workflowRunId,
+        WORKFLOW_GRAPH_VERSION,
       )
       const created = this.find(record.requestId)
       if (!created) throw new Error(`request ${record.requestId} was not persisted`)
@@ -618,6 +667,10 @@ export class ChatRequestRepository implements ChatRequestWriter {
   find(requestId: string): ChatRequestRecord | undefined {
     const row = this.findStatement.get(requestId) as RequestRow | undefined
     return row ? requestRecordFromRow(row) : undefined
+  }
+
+  findBySessionId(sessionId: string): ChatRequestRecord[] {
+    return (this.bySessionStatement.all(sessionId) as RequestRow[]).map(requestRecordFromRow)
   }
 
   claimNext(ownerInstanceId: string, now: string, leaseExpiresAt: string): ChatRequestRecord | undefined {
@@ -676,12 +729,51 @@ export class ChatRequestRepository implements ChatRequestWriter {
     }).immediate()
   }
 
-  hasLiveWorkerRequest(sessionId: string, now: string): boolean {
-    return this.liveWorkerBySessionStatement.get(sessionId, now) !== null
+  expiredWorkerRequests(now: string): ChatRequestRecord[] {
+    return (this.expiredStatement.all(now) as RequestRow[]).map(requestRecordFromRow)
+  }
+
+  failExpiredWorkerRequest(
+    requestId: string,
+    ownerInstanceId: string,
+    completedAt: string,
+  ): boolean {
+    return this.failExpiredStatement.run(completedAt, requestId, ownerInstanceId).changes === 1
+  }
+
+  requeueExpiredWorkerRequest(requestId: string, ownerInstanceId: string): boolean {
+    return this.requeueExpiredStatement.run(requestId, ownerInstanceId).changes === 1
+  }
+
+  hasLiveWorkerRequest(sessionId: string): boolean {
+    return this.liveWorkerBySessionStatement.get(sessionId) !== null
   }
 
   hasActiveRequest(sessionId: string): boolean {
     return this.activeBySessionStatement.get(sessionId) !== null
+  }
+
+  hasQueuedCancel(): boolean {
+    return this.queuedCancelStatement.get() !== null
+  }
+
+  private resolveWorkflowRunId(sessionId: string, kind: ChatRequestKind): string {
+    const phase = (this.sessionPhaseStatement.get(sessionId) as { phase: WorkflowSession['phase'] } | undefined)?.phase
+    const resumablePhase = phase === 'clarifying'
+      || phase === 'awaiting_confirmation'
+      || phase === 'awaiting_modification_confirmation'
+    if (kind === 'confirm' && !resumablePhase) {
+      throw new WorkflowRunResolutionError('phase_mismatch')
+    }
+    const shouldResume = kind === 'confirm' || kind === 'cancel' || resumablePhase
+    if (shouldResume) {
+      const latest = this.latestWorkflowRunStatement.get(sessionId) as { workflow_run_id: string } | undefined
+      if (latest?.workflow_run_id) return latest.workflow_run_id
+      if (kind === 'confirm' || resumablePhase) {
+        throw new WorkflowRunResolutionError('missing_workflow')
+      }
+    }
+    return createWorkflowRunId()
   }
 }
 
@@ -690,6 +782,8 @@ type RequestRow = {
   trace_id: string
   client_request_id: string | null
   session_id: string
+  workflow_run_id: string | null
+  graph_version: string | null
   kind: ChatRequestKind
   status: ChatRequestStatus
   scene_id: string | null
@@ -714,6 +808,8 @@ function requestRecordFromRow(row: RequestRow): ChatRequestRecord {
     traceId: row.trace_id,
     ...(row.client_request_id ? { clientRequestId: row.client_request_id } : {}),
     sessionId: row.session_id,
+    ...(row.workflow_run_id ? { workflowRunId: row.workflow_run_id } : {}),
+    ...(row.graph_version ? { graphVersion: row.graph_version } : {}),
     kind: row.kind,
     status: row.status,
     ...(row.scene_id ? { sceneId: row.scene_id } : {}),

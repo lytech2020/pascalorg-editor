@@ -7,6 +7,7 @@ import {
   ChatRequestRepository,
   SessionVersionConflictError,
   SqliteSessionPersistence,
+  WorkflowRunResolutionError,
 } from './persistence/session-repository'
 import type { ChatMessage, WorkflowSession } from './types'
 
@@ -177,6 +178,72 @@ describe('SQLite session persistence (T1.5)', () => {
       }])
       expect(() => persistence.save(session, 0)).toThrow('inline image data')
       expect(persistence.load('s1')).toBeUndefined()
+    } finally {
+      database.close()
+    }
+  })
+
+  test('workflowRunId resumes clarifying work and changes for a new workflow', () => {
+    const database = new AppDatabase(':memory:')
+    try {
+      const sessions = new SqliteSessionPersistence(database)
+      const session = sessionFixture('s1')
+      sessions.save(session, 0)
+      const requests = new ChatRequestRepository(database)
+      const first = requests.enqueue({
+        requestId: 'req-1', traceId: 'trace-1', sessionId: 's1', kind: 'chat',
+        startedAt: '2026-07-22T00:00:00.000Z',
+      }, { sessionId: 's1', message: 'first clarification' }, 10).request
+
+      const clarifying = sessions.load('s1')!
+      clarifying.session.phase = 'clarifying'
+      sessions.save(clarifying.session, clarifying.version)
+      const second = requests.enqueue({
+        requestId: 'req-2', traceId: 'trace-2', sessionId: 's1', kind: 'chat',
+        startedAt: '2026-07-22T00:00:01.000Z',
+      }, { sessionId: 's1', message: 'second clarification' }, 10).request
+      expect(first.workflowRunId).toMatch(/^[0-9a-f-]{36}$/)
+      expect(second.workflowRunId).toBe(first.workflowRunId)
+
+      const stored = sessions.load('s1')!
+      stored.session.phase = 'completed'
+      sessions.save(stored.session, stored.version)
+      const next = requests.enqueue({
+        requestId: 'req-3', traceId: 'trace-3', sessionId: 's1', kind: 'chat',
+        startedAt: '2026-07-22T00:00:02.000Z',
+      }, { sessionId: 's1', message: 'new workflow' }, 10).request
+      expect(next.workflowRunId).not.toBe(first.workflowRunId)
+    } finally {
+      database.close()
+    }
+  })
+
+  test('workflow continuation rejects a phase mismatch or a missing workflow association', () => {
+    const database = new AppDatabase(':memory:')
+    try {
+      const sessions = new SqliteSessionPersistence(database)
+      const requests = new ChatRequestRepository(database)
+      sessions.save(sessionFixture('completed'), 0)
+      expect(() => requests.enqueue({
+        requestId: 'req-invalid-phase',
+        traceId: 'trace-invalid-phase',
+        sessionId: 'completed',
+        kind: 'confirm',
+        startedAt: '2026-07-22T00:00:00.000Z',
+      }, { sessionId: 'completed', action: 'confirm' }, 10)).toThrow(WorkflowRunResolutionError)
+
+      const awaiting = sessionFixture('legacy-awaiting')
+      awaiting.phase = 'awaiting_confirmation'
+      sessions.save(awaiting, 0)
+      expect(() => requests.enqueue({
+        requestId: 'req-missing-workflow',
+        traceId: 'trace-missing-workflow',
+        sessionId: 'legacy-awaiting',
+        kind: 'confirm',
+        startedAt: '2026-07-22T00:00:01.000Z',
+      }, { sessionId: 'legacy-awaiting', action: 'confirm' }, 10)).toThrow(
+        'the session has no workflow run to resume',
+      )
     } finally {
       database.close()
     }

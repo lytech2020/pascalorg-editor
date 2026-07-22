@@ -19,6 +19,8 @@ describe('AppDatabase migrations', () => {
         { version: 4, name: 'add_request_idempotency_and_workflow_steps' },
         { version: 5, name: 'index_running_workflow_steps' },
         { version: 6, name: 'track_fresh_scene_build_lifecycle' },
+        { version: 7, name: 'add_langgraph_workflow_checkpoints' },
+        { version: 8, name: 'add_tool_scene_validation_audit' },
       ])
       expect(
         first.connection.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ai_model_calls'").get(),
@@ -28,7 +30,7 @@ describe('AppDatabase migrations', () => {
       const reopened = new AppDatabase(file)
       expect(
         reopened.connection.query('SELECT COUNT(*) AS count FROM schema_migrations').get(),
-      ).toEqual({ count: 6 })
+      ).toEqual({ count: 8 })
       reopened.close()
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -48,6 +50,13 @@ describe('AppDatabase migrations', () => {
     } finally {
       database.close()
     }
+  })
+
+  test('readiness verifies a real SQLite write transaction', () => {
+    const database = new AppDatabase(':memory:')
+    expect(database.isWritable()).toBe(true)
+    database.close()
+    expect(database.isWritable()).toBe(false)
   })
 
   test('orphan recovery scans only the partial running-step index', () => {

@@ -177,6 +177,7 @@ describe('durable request queue (T2.1)', () => {
       expect(requests.enqueue(
         start('req-cancel', 's1', 'cancel'), input('s1', 'cancel'), 1,
       ).cancelled.map(record => record.requestId)).toEqual(['req-1'])
+      expect(requests.hasQueuedCancel()).toBe(true)
       expect(requests.find('req-1')).toMatchObject({
         status: 'cancelled', errorCode: 'cancelled_by_user',
       })
@@ -235,7 +236,7 @@ describe('durable request queue (T2.1)', () => {
     }
   })
 
-  test('expired request recovery marks its running workflow step failed-recoverable', () => {
+  test('expired request recovery marks its running workflow step failed-recoverable', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'request-step-recovery-'))
     const database = new AppDatabase(join(dir, 'ai.db'))
     try {
@@ -256,7 +257,7 @@ describe('durable request queue (T2.1)', () => {
         { concurrency: 1, leaseMs: 1_000, pollMs: 10 },
         steps,
       )
-      worker.recoverExpired()
+      await worker.recoverExpired()
       expect(requests.find('req-step')).toMatchObject({
         status: 'failed', errorCode: 'process_interrupted',
       })
@@ -269,7 +270,85 @@ describe('durable request queue (T2.1)', () => {
     }
   })
 
-  test('a later startup repairs a step left running after request recovery committed', () => {
+  test('an expired request at a verified durable plan boundary is requeued with its input', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'request-durable-resume-'))
+    const database = new AppDatabase(join(dir, 'ai.db'))
+    try {
+      const requests = new ChatRequestRepository(database)
+      const sessions = new SqliteSessionPersistence(database)
+      requests.enqueue(start('req-resume-plan', 's1'), input('s1'), 10)
+      requests.claimNext(
+        'worker:dead',
+        '2026-07-21T00:00:00.000Z',
+        '2026-07-21T00:00:01.000Z',
+      )
+      const worker = new RequestWorker(
+        requests,
+        sessions,
+        new RequestPayloadStore(join(dir, 'artifacts')),
+        {
+          executeQueued: async () => { throw new Error('not called') },
+          requestCancellation: () => undefined,
+          expiredRequestRecovery: async () => 'resume',
+        },
+        { concurrency: 1, leaseMs: 1_000, pollMs: 10 },
+      )
+      await worker.recoverExpired()
+      expect(requests.find('req-resume-plan')).toMatchObject({
+        status: 'queued',
+        input: { sessionId: 's1', message: 'message-s1' },
+        runAttempts: 1,
+      })
+    } finally {
+      database.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('an expired lease after session commit is finalized without replaying execution', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'request-durable-terminal-'))
+    const database = new AppDatabase(join(dir, 'ai.db'))
+    try {
+      const requests = new ChatRequestRepository(database)
+      const sessions = new SqliteSessionPersistence(database)
+      const completed = sessionFixture('s1')
+      completed.phase = 'completed'
+      completed.messages.push({ role: 'assistant', content: 'already finished' })
+      sessions.save(completed, 0)
+      requests.enqueue(start('req-terminal', 's1'), input('s1'), 10)
+      requests.claimNext(
+        'worker:dead',
+        '2026-07-21T00:00:00.000Z',
+        '2026-07-21T00:00:01.000Z',
+      )
+      let executions = 0
+      const worker = new RequestWorker(
+        requests,
+        sessions,
+        new RequestPayloadStore(join(dir, 'artifacts')),
+        {
+          executeQueued: async () => {
+            executions++
+            throw new Error('must not replay')
+          },
+          requestCancellation: () => undefined,
+          expiredRequestRecovery: async () => 'complete',
+        },
+        { concurrency: 1, leaseMs: 1_000, pollMs: 10 },
+      )
+      await worker.recoverExpired()
+      expect(executions).toBe(0)
+      expect(requests.find('req-terminal')).toMatchObject({
+        status: 'succeeded',
+        result: { reply: 'already finished', sessionVersion: 1 },
+      })
+    } finally {
+      database.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('a later startup repairs a step left running after request recovery committed', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'request-step-orphan-'))
     const database = new AppDatabase(join(dir, 'ai.db'))
     try {
@@ -294,7 +373,7 @@ describe('durable request queue (T2.1)', () => {
         { concurrency: 1, leaseMs: 1_000, pollMs: 10 },
         steps,
       )
-      restartedWorker.recoverExpired()
+      await restartedWorker.recoverExpired()
       expect(steps.findByRequestId('req-orphan')[0]).toMatchObject({
         status: 'failed_recoverable', errorCode: 'process_interrupted',
       })
@@ -405,6 +484,110 @@ describe('durable request queue (T2.1)', () => {
       })
     } finally {
       afterRestart.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('pauses ordinary work while its dependency is unavailable but still runs cancel', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'request-worker-ready-'))
+    const database = new AppDatabase(':memory:')
+    try {
+      const requests = new ChatRequestRepository(database)
+      const sessions = new SqliteSessionPersistence(database)
+      requests.enqueue(start('req-ready', 's1'), input('s1'), 10)
+      let canClaim = false
+      let executions = 0
+      const worker = new RequestWorker(
+        requests,
+        sessions,
+        new RequestPayloadStore(join(dir, 'artifacts')),
+        {
+          requestCancellation: () => undefined,
+          executeQueued: async (chat: ChatInput): Promise<ChatResult> => {
+            executions++
+            const session = sessionFixture(chat.sessionId)
+            sessions.save(session, 0)
+            return { sessionId: chat.sessionId, reply: 'ready', session }
+          },
+        },
+        {
+          concurrency: 1,
+          leaseMs: 1_000,
+          pollMs: 5,
+          canClaim: () => canClaim || requests.hasQueuedCancel(),
+        },
+      )
+
+      worker.start()
+      await Bun.sleep(30)
+      expect(requests.find('req-ready')).toMatchObject({ status: 'queued', runAttempts: 0 })
+      expect(executions).toBe(0)
+
+      requests.enqueue(start('req-stop', 's1', 'cancel'), input('s1', 'cancel'), 10)
+      worker.notify()
+      await waitForTerminal(requests, 'req-stop')
+      expect(requests.find('req-ready')).toMatchObject({ status: 'cancelled' })
+      expect(executions).toBe(1)
+
+      requests.enqueue(start('req-resume', 's2'), input('s2'), 10)
+      await Bun.sleep(20)
+      expect(requests.find('req-resume')).toMatchObject({ status: 'queued', runAttempts: 0 })
+      canClaim = true
+      worker.notify()
+      await waitForTerminal(requests, 'req-resume')
+      worker.stopAccepting()
+      await worker.drain()
+      expect(executions).toBe(2)
+    } finally {
+      database.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('stopAccepting drains a claimed request to a persisted terminal state', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'request-worker-drain-'))
+    const database = new AppDatabase(':memory:')
+    try {
+      const requests = new ChatRequestRepository(database)
+      const sessions = new SqliteSessionPersistence(database)
+      requests.enqueue(start('req-drain', 's1'), input('s1'), 10)
+      let release: (() => void) | undefined
+      let started: (() => void) | undefined
+      const claimed = new Promise<void>(resolve => { started = resolve })
+      const worker = new RequestWorker(
+        requests,
+        sessions,
+        new RequestPayloadStore(join(dir, 'artifacts')),
+        {
+          requestCancellation: () => undefined,
+          executeQueued: async (chat: ChatInput): Promise<ChatResult> => {
+            started?.()
+            await new Promise<void>(resolve => { release = resolve })
+            const session = sessionFixture(chat.sessionId)
+            sessions.save(session, 0)
+            return { sessionId: chat.sessionId, reply: 'drained', session }
+          },
+        },
+        { concurrency: 1, leaseMs: 1_000, pollMs: 5 },
+      )
+
+      worker.start()
+      await claimed
+      worker.stopAccepting()
+      let drained = false
+      const draining = worker.drain().then(() => { drained = true })
+      await Bun.sleep(20)
+      expect(drained).toBe(false)
+      expect(requests.find('req-drain')?.status).toBe('running')
+
+      release?.()
+      await draining
+      expect(requests.find('req-drain')).toMatchObject({
+        status: 'cancelled',
+        result: { reply: 'drained', sessionVersion: 1 },
+      })
+    } finally {
+      database.close()
       rmSync(dir, { recursive: true, force: true })
     }
   })

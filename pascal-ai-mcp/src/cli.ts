@@ -9,6 +9,9 @@ import { ChatRequestRepository, SqliteSessionPersistence } from './persistence/s
 import { SqliteModelAttemptRecorder } from './telemetry/model-attempt-recorder'
 import { WorkflowStepRepository } from './persistence/workflow-step-repository'
 import { SceneBuildRepository } from './persistence/scene-build-repository'
+import { SqliteCheckpointSaver } from './persistence/sqlite-checkpoint-saver'
+import { AiAuditRepository } from './persistence/audit-repository'
+import { WORKFLOW_GRAPH_VERSION } from './workflow-identity'
 
 const config = loadConfig()
 const database = new AppDatabase(config.databaseFile)
@@ -18,10 +21,25 @@ sessions.importLegacyFile(config.sessionFile)
 const requests = new ChatRequestRepository(database)
 const workflowSteps = new WorkflowStepRepository(database)
 const sceneBuilds = new SceneBuildRepository(database)
+const audits = new AiAuditRepository(database)
+const checkpointSaver = new SqliteCheckpointSaver(database, {
+  graphVersion: WORKFLOW_GRAPH_VERSION,
+  ttlMs: config.workflowCheckpointTtlMs,
+})
 const mcp = new PascalMcpClient(config)
 await mcp.connect()
 
-const agent = new PascalAiAgent(config, mcp, modelAttempts, sessions, requests, workflowSteps, sceneBuilds)
+const agent = new PascalAiAgent(
+  config,
+  mcp,
+  modelAttempts,
+  sessions,
+  requests,
+  workflowSteps,
+  sceneBuilds,
+  checkpointSaver,
+  audits,
+)
 const sessionId = process.env.AI_MCP_CLI_SESSION || 'cli'
 const rl = createInterface({ input, output })
 
@@ -46,6 +64,7 @@ try {
   }
 } finally {
   rl.close()
+  checkpointSaver.close()
   await mcp.close()
   database.close()
 }

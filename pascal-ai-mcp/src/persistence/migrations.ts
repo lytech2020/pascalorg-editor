@@ -253,6 +253,140 @@ export const MIGRATIONS: readonly Migration[] = [
         WHERE scene_id IS NOT NULL;
     `,
   },
+  {
+    version: 7,
+    name: 'add_langgraph_workflow_checkpoints',
+    up: `
+      ALTER TABLE ai_requests ADD COLUMN workflow_run_id TEXT;
+      ALTER TABLE ai_requests ADD COLUMN graph_version TEXT;
+
+      CREATE INDEX ai_requests_session_workflow_idx
+        ON ai_requests(session_id, workflow_run_id, queued_at)
+        WHERE workflow_run_id IS NOT NULL;
+
+      CREATE TABLE langgraph_checkpoints (
+        thread_id TEXT NOT NULL,
+        checkpoint_ns TEXT NOT NULL,
+        checkpoint_id TEXT NOT NULL,
+        parent_checkpoint_id TEXT,
+        checkpoint_type TEXT NOT NULL,
+        checkpoint_blob BLOB NOT NULL,
+        metadata_type TEXT NOT NULL,
+        metadata_blob BLOB NOT NULL,
+        graph_version TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
+      ) STRICT;
+
+      CREATE TABLE langgraph_checkpoint_writes (
+        thread_id TEXT NOT NULL,
+        checkpoint_ns TEXT NOT NULL,
+        checkpoint_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        write_index INTEGER NOT NULL,
+        channel TEXT NOT NULL,
+        value_type TEXT NOT NULL,
+        value_blob BLOB NOT NULL,
+        PRIMARY KEY (
+          thread_id, checkpoint_ns, checkpoint_id, task_id, write_index
+        ),
+        FOREIGN KEY (thread_id, checkpoint_ns, checkpoint_id)
+          REFERENCES langgraph_checkpoints(thread_id, checkpoint_ns, checkpoint_id)
+          ON DELETE CASCADE
+      ) STRICT;
+
+      CREATE INDEX langgraph_checkpoints_expiry_idx
+        ON langgraph_checkpoints(expires_at, thread_id);
+
+      CREATE TABLE langgraph_checkpoint_health (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        checked_at TEXT NOT NULL
+      ) STRICT;
+
+      INSERT INTO langgraph_checkpoint_health(id, checked_at)
+      VALUES (1, '1970-01-01T00:00:00.000Z');
+
+      CREATE TRIGGER ai_sessions_delete_langgraph_checkpoints
+      AFTER DELETE ON ai_sessions
+      BEGIN
+        DELETE FROM langgraph_checkpoints
+        WHERE thread_id IN (
+          SELECT DISTINCT workflow_run_id
+          FROM ai_requests
+          WHERE session_id = OLD.session_id
+            AND workflow_run_id IS NOT NULL
+        );
+      END;
+    `,
+  },
+  {
+    version: 8,
+    name: 'add_tool_scene_validation_audit',
+    up: `
+      CREATE TABLE ai_tool_calls (
+        audit_id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL REFERENCES ai_requests(request_id),
+        workflow_run_id TEXT,
+        workflow_step_id TEXT REFERENCES workflow_steps(step_id),
+        session_id TEXT NOT NULL,
+        scene_id TEXT,
+        operation_key TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        mutating INTEGER NOT NULL CHECK (mutating IN (0, 1)),
+        status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'cancelled')),
+        args_summary_json TEXT NOT NULL CHECK (json_valid(args_summary_json)),
+        error_code TEXT,
+        latency_ms INTEGER CHECK (latency_ms IS NULL OR latency_ms >= 0),
+        started_at TEXT NOT NULL,
+        completed_at TEXT
+      ) STRICT;
+
+      CREATE TABLE ai_scene_changes (
+        change_id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL REFERENCES ai_requests(request_id),
+        tool_call_audit_id TEXT NOT NULL REFERENCES ai_tool_calls(audit_id),
+        workflow_run_id TEXT,
+        workflow_step_id TEXT REFERENCES workflow_steps(step_id),
+        session_id TEXT NOT NULL,
+        scene_id TEXT,
+        change_type TEXT NOT NULL,
+        before_version INTEGER,
+        after_version INTEGER,
+        node_count INTEGER NOT NULL CHECK (node_count >= 0),
+        artifact_ref TEXT,
+        summary_json TEXT NOT NULL CHECK (json_valid(summary_json)),
+        created_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE ai_validation_results (
+        validation_id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL REFERENCES ai_requests(request_id),
+        workflow_run_id TEXT,
+        workflow_step_id TEXT REFERENCES workflow_steps(step_id),
+        session_id TEXT NOT NULL,
+        scene_id TEXT,
+        validator TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('passed', 'failed', 'unavailable')),
+        validated_version INTEGER,
+        repair_round INTEGER CHECK (repair_round IS NULL OR repair_round >= 0),
+        issue_count INTEGER NOT NULL CHECK (issue_count >= 0),
+        summary_json TEXT NOT NULL CHECK (json_valid(summary_json)),
+        created_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE INDEX ai_tool_calls_request_started_idx
+        ON ai_tool_calls(request_id, started_at);
+      CREATE INDEX ai_tool_calls_scene_started_idx
+        ON ai_tool_calls(scene_id, started_at) WHERE scene_id IS NOT NULL;
+      CREATE INDEX ai_scene_changes_request_created_idx
+        ON ai_scene_changes(request_id, created_at);
+      CREATE INDEX ai_scene_changes_scene_created_idx
+        ON ai_scene_changes(scene_id, created_at) WHERE scene_id IS NOT NULL;
+      CREATE INDEX ai_validation_results_request_created_idx
+        ON ai_validation_results(request_id, created_at);
+    `,
+  },
 ]
 
 export function runMigrations(database: Database): void {

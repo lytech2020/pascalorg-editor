@@ -15,9 +15,11 @@ export type RequestWorkerOptions = {
   concurrency: number
   leaseMs: number
   pollMs: number
+  canClaim?: () => boolean
 }
 
 type ChatExecutor = Pick<PascalAiAgent, 'executeQueued' | 'requestCancellation'>
+  & Partial<Pick<PascalAiAgent, 'expiredRequestRecovery'>>
 
 const ORPHAN_STEP_SWEEP_INTERVAL_MS = 60_000
 
@@ -42,12 +44,13 @@ export class RequestWorker {
   start(): void {
     if (this.accepting) return
     this.accepting = true
-    this.recoverExpired()
-    this.notify()
+    void this.recoverExpired()
+      .catch(error => console.error(`request recovery failed: ${errorMessage(error)}`))
+      .finally(() => this.notify())
   }
 
-  recoverExpired(): void {
-    this.failExpiredRequests()
+  async recoverExpired(): Promise<void> {
+    await this.failExpiredRequests()
     this.reconcileOrphanedSteps()
     this.reconcileOrphanedSceneBuilds()
     this.nextOrphanStepSweepAt = Date.now() + ORPHAN_STEP_SWEEP_INTERVAL_MS
@@ -82,13 +85,14 @@ export class RequestWorker {
     if (!this.accepting || this.ticking) return
     this.ticking = true
     try {
-      this.failExpiredRequests()
+      await this.failExpiredRequests()
       if (Date.now() >= this.nextOrphanStepSweepAt) {
         this.reconcileOrphanedSteps()
         this.reconcileOrphanedSceneBuilds()
         this.nextOrphanStepSweepAt = Date.now() + ORPHAN_STEP_SWEEP_INTERVAL_MS
       }
       while (this.accepting && this.active.size < this.options.concurrency) {
+        if (this.options.canClaim && !this.options.canClaim()) break
         const now = new Date()
         const request = this.requests.claimNext(
           this.ownerInstanceId,
@@ -187,6 +191,8 @@ export class RequestWorker {
         requestId: request.requestId,
         traceId: request.traceId,
         ...(request.clientRequestId ? { clientRequestId: request.clientRequestId } : {}),
+        ...(request.workflowRunId ? { workflowRunId: request.workflowRunId } : {}),
+        ...(request.graphVersion ? { graphVersion: request.graphVersion } : {}),
       },
     }
   }
@@ -237,9 +243,56 @@ export class RequestWorker {
     }
   }
 
-  private failExpiredRequests(): void {
-    const expired = this.requests.failExpiredWorkerRequests(new Date().toISOString())
+  private async failExpiredRequests(): Promise<void> {
+    const now = new Date().toISOString()
+    const expired = this.requests.expiredWorkerRequests(now)
     for (const request of expired) {
+      const disposition = await this.executor.expiredRequestRecovery?.(request) ?? 'fail_recoverable'
+      if (disposition === 'complete') {
+        const stored = this.sessions.load(request.sessionId)
+        if (stored && request.ownerInstanceId) {
+          const result: QueuedChatResult = {
+            sessionId: stored.session.sessionId,
+            reply: latestAssistantReply(stored.session.messages),
+            phase: stored.session.phase,
+            sessionVersion: stored.version,
+          }
+          try {
+            this.reconcileRunningSteps(request.requestId)
+            this.requests.complete(
+              request.requestId,
+              request.ownerInstanceId,
+              request.kind !== 'cancel' && stored.session.phase === 'cancelled'
+                ? 'cancelled'
+                : 'succeeded',
+              now,
+              result,
+            )
+            try {
+              this.payloads.deleteImage(request.input?.imageArtifact)
+            } catch (error) {
+              console.error(`[req ${request.requestId}] recovered artifact cleanup failed: ${errorMessage(error)}`)
+            }
+            console.warn(`[req ${request.requestId}] recovered terminal result from durable session state`)
+          } catch (error) {
+            console.warn(`[req ${request.requestId}] terminal recovery lost request ownership: ${errorMessage(error)}`)
+          }
+          continue
+        }
+      }
+      if (disposition === 'resume') {
+        if (request.ownerInstanceId && this.requests.requeueExpiredWorkerRequest(
+          request.requestId,
+          request.ownerInstanceId,
+        )) {
+          console.warn(`[req ${request.requestId}] expired worker lease requeued from durable plan checkpoint`)
+        }
+        continue
+      }
+      if (
+        !request.ownerInstanceId
+        || !this.requests.failExpiredWorkerRequest(request.requestId, request.ownerInstanceId, now)
+      ) continue
       try {
         this.workflowSteps?.failRunningForRequest(
           request.requestId,
@@ -260,6 +313,13 @@ export class RequestWorker {
 }
 
 function classifyError(error: unknown): string {
+  if (
+    error instanceof Error
+    && error.name === 'WorkflowResumeBoundaryError'
+    && typeof (error as Error & { code?: unknown }).code === 'string'
+  ) {
+    return (error as Error & { code: string }).code
+  }
   const message = errorMessage(error)
   if (/artifact .* (?:size|hash) mismatch|ENOENT/.test(message)) return 'artifact_unavailable'
   return 'internal_error'
@@ -267,4 +327,12 @@ function classifyError(error: unknown): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function latestAssistantReply(messages: import('./types').ChatMessage[]): string {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]
+    if (message?.role === 'assistant' && typeof message.content === 'string') return message.content
+  }
+  return ''
 }

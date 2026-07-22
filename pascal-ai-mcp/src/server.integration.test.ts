@@ -75,6 +75,7 @@ async function startServer(dataDir: string, extraEnv: Record<string, string> = {
       AI_MCP_MAX_BODY_MB: '1',
       AI_MCP_SESSION_FILE: join(dataDir, 'sessions.json'),
       AI_MCP_DATABASE_FILE: join(dataDir, 'ai.db'),
+      AI_MCP_READINESS_TOKEN: 'integration-readiness-token',
       ...extraEnv,
     },
     stdout: 'pipe',
@@ -163,6 +164,21 @@ describe('server request identity (T1.3)', () => {
         expect(proc.killed).toBe(false)
         const health = await requestHttp(`${base}/health`)
         expect(health.status).toBe(200)
+        expect(JSON.parse(health.body)).toEqual({ ok: true })
+        expect((await requestHttp(`${base}/ready`)).status).toBe(401)
+        const ready = await requestHttp(`${base}/ready`, {
+          headers: { Authorization: 'Bearer integration-readiness-token' },
+        })
+        expect(ready.status).toBe(200)
+        expect(JSON.parse(ready.body)).toMatchObject({
+          ready: true,
+          checks: {
+            database: { ready: true },
+            templates: { ready: true, acceptsTraffic: true },
+            mcp: { ready: true, state: 'ready' },
+            telemetry: { ready: true },
+          },
+        })
 
         const missingCancel = await requestHttp(`${base}/chat`, {
           method: 'POST',
@@ -306,6 +322,70 @@ describe('server request identity (T1.3)', () => {
   )
 
   test(
+    'readiness drops after the MCP child exits and recovers on a fresh generation',
+    async () => {
+      const dataDir = mkdtempSync(join(tmpdir(), 'ai-mcp-reconnect-'))
+      const childScript = join(dataDir, 'fake-mcp.ts')
+      const childState = join(dataDir, 'child-starts.txt')
+      const mcpServerUrl = new URL(
+        '../node_modules/@modelcontextprotocol/sdk/dist/esm/server/mcp.js',
+        import.meta.url,
+      ).href
+      const stdioTransportUrl = new URL(
+        '../node_modules/@modelcontextprotocol/sdk/dist/esm/server/stdio.js',
+        import.meta.url,
+      ).href
+      writeFileSync(childScript, `
+        import { readFileSync, writeFileSync } from 'node:fs'
+        import { McpServer } from ${JSON.stringify(mcpServerUrl)}
+        import { StdioServerTransport } from ${JSON.stringify(stdioTransportUrl)}
+        const stateFile = process.env.TEST_MCP_STATE_FILE
+        let starts = 0
+        try { starts = Number(readFileSync(stateFile, 'utf8')) || 0 } catch {}
+        starts++
+        writeFileSync(stateFile, String(starts))
+        const server = new McpServer({ name: 'readiness-test', version: '1.0.0' })
+        await server.connect(new StdioServerTransport())
+        if (starts === 1) setTimeout(() => process.exit(0), 1_000)
+      `)
+      const { proc, port } = await startServer(dataDir, {
+        PASCAL_MCP_COMMAND: process.execPath,
+        PASCAL_MCP_ARGS: childScript,
+        PASCAL_MCP_CIRCUIT_COOLDOWN_MS: '500',
+        PASCAL_MCP_RECONNECT_BASE_DELAY_MS: '1',
+        TEST_MCP_STATE_FILE: childState,
+      })
+      try {
+        const base = `http://127.0.0.1:${port}`
+        const headers = { Authorization: 'Bearer integration-readiness-token' }
+        expect((await requestHttp(`${base}/ready`, { headers })).status).toBe(200)
+
+        await Bun.sleep(1_100)
+        const degraded = await requestHttp(`${base}/ready`, { headers })
+        expect(degraded.status).toBe(503)
+        expect(JSON.parse(degraded.body)).toMatchObject({
+          ready: false,
+          checks: { mcp: { ready: false, state: 'degraded' } },
+        })
+
+        await Bun.sleep(500)
+        const recovered = await requestHttp(`${base}/ready`, { headers })
+        expect(recovered.status).toBe(200)
+        expect(JSON.parse(recovered.body)).toMatchObject({
+          ready: true,
+          checks: { mcp: { ready: true, state: 'ready', generation: 2 } },
+        })
+        expect(readFileSync(childState, 'utf8')).toBe('2')
+      } finally {
+        proc.kill()
+        await proc.exited
+        rmSync(dataDir, { recursive: true, force: true })
+      }
+    },
+    20_000,
+  )
+
+  test(
     'production keeps liveness but rejects /chat when the configured good-template library is invalid',
     async () => {
       const dataDir = mkdtempSync(join(tmpdir(), 'ai-mcp-template-gate-'))
@@ -322,7 +402,7 @@ describe('server request identity (T1.3)', () => {
         const progressSession: WorkflowSession = {
           sessionId: 'progress-template-gate',
           inputType: 'text',
-          phase: 'generating',
+          phase: 'intake',
           availability: 'usable',
           brief: {
             existingCondition: [], designGoals: [], hardConstraints: [],
@@ -334,6 +414,21 @@ describe('server request identity (T1.3)', () => {
           updatedAt: '2026-07-21T00:00:00.000Z',
         }
         sessionPersistence.save(progressSession, 0)
+        queue.start({
+          requestId: 'progress-bootstrap-request',
+          traceId: 'progress-bootstrap-trace',
+          sessionId: 'progress-template-gate',
+          kind: 'chat',
+          startedAt: '2026-07-20T23:59:58.000Z',
+        })
+        queue.finish(
+          'progress-bootstrap-request',
+          'succeeded',
+          '2026-07-20T23:59:59.000Z',
+        )
+        const awaiting = sessionPersistence.load('progress-template-gate')!
+        awaiting.session.phase = 'awaiting_confirmation'
+        sessionPersistence.save(awaiting.session, awaiting.version)
         queue.enqueue({
           requestId: 'preexisting-progress-request',
           traceId: 'preexisting-progress-trace',
@@ -341,6 +436,10 @@ describe('server request identity (T1.3)', () => {
           kind: 'confirm',
           startedAt: '2026-07-21T00:00:00.000Z',
         }, { sessionId: 'progress-template-gate', action: 'confirm' }, 10)
+        const generating = sessionPersistence.load('progress-template-gate')!
+        generating.session.phase = 'generating'
+        sessionPersistence.save(generating.session, generating.version)
+        progressSession.phase = 'generating'
         queue.claimNext(
           'worker:still-alive',
           '2026-07-21T00:00:00.000Z',
@@ -379,9 +478,9 @@ describe('server request identity (T1.3)', () => {
           requestId: 'preexisting-queued-progress-request',
           traceId: 'preexisting-queued-progress-trace',
           sessionId: 'queued-progress-template-gate',
-          kind: 'confirm',
+          kind: 'chat',
           startedAt: new Date().toISOString(),
-        }, { sessionId: 'queued-progress-template-gate', action: 'confirm' }, 10)
+        }, { sessionId: 'queued-progress-template-gate', message: 'queued progress' }, 10)
       } finally {
         queuedDatabase.close()
       }
