@@ -1,4 +1,5 @@
 import type { PascalAiAgent } from './agent'
+import { safeErrorLogFields, stableErrorCode } from './error-policy'
 import type {
   ChatRequestRecord,
   ChatRequestRepository,
@@ -128,7 +129,10 @@ export class RequestWorker {
     const stopAfterHeartbeatFailure = (message: string): void => {
       if (heartbeatLost) return
       heartbeatLost = true
-      console.error(`[req ${request.requestId}] ${message}`)
+      console.error(JSON.stringify({
+        level: 'error', event: 'request_lease_lost', requestId: request.requestId,
+        traceId: request.traceId, message,
+      }))
       this.executor.requestCancellation(request.sessionId)
     }
     const heartbeat = setInterval(() => {
@@ -142,7 +146,8 @@ export class RequestWorker {
         )
         if (!ok) stopAfterHeartbeatFailure('request lease heartbeat lost; cancelling local execution')
       } catch (error) {
-        stopAfterHeartbeatFailure(`request lease heartbeat failed; cancelling local execution: ${errorMessage(error)}`)
+        logWorkerError(request, 'request_lease_heartbeat_failed', error)
+        stopAfterHeartbeatFailure('request lease heartbeat failed; cancelling local execution')
       }
     }, heartbeatEveryMs)
     try {
@@ -168,14 +173,14 @@ export class RequestWorker {
         queuedResult,
       )
     } catch (error) {
-      console.error(`[req ${request.requestId}] queued request failed: ${errorMessage(error)}`)
+      logWorkerError(request, 'queued_request_failed', error)
       this.finishFailed(request, classifyError(error))
     } finally {
       clearInterval(heartbeat)
       try {
-        this.payloads.deleteImage(input.imageArtifact)
+        this.payloads.deleteImage(input.imageArtifactId)
       } catch (error) {
-        console.error(`[req ${request.requestId}] artifact cleanup failed: ${errorMessage(error)}`)
+        logWorkerError(request, 'artifact_cleanup_failed', error)
       }
     }
   }
@@ -184,7 +189,7 @@ export class RequestWorker {
     return {
       sessionId: input.sessionId,
       ...(input.message ? { message: input.message } : {}),
-      ...(input.imageArtifact ? { imageDataUrl: this.payloads.loadImage(input.imageArtifact) } : {}),
+      ...(input.imageArtifactId ? { imageDataUrl: this.payloads.loadImage(input.imageArtifactId) } : {}),
       ...(input.sceneId ? { sceneId: input.sceneId } : {}),
       ...(input.action ? { action: input.action } : {}),
       context: {
@@ -209,7 +214,7 @@ export class RequestWorker {
         errorCode,
       )
     } catch (error) {
-      console.error(`[req ${request.requestId}] request failure persistence failed: ${errorMessage(error)}`)
+      logWorkerError(request, 'request_failure_persistence_failed', error)
     }
   }
 
@@ -269,13 +274,13 @@ export class RequestWorker {
               result,
             )
             try {
-              this.payloads.deleteImage(request.input?.imageArtifact)
+              this.payloads.deleteImage(request.input?.imageArtifactId)
             } catch (error) {
-              console.error(`[req ${request.requestId}] recovered artifact cleanup failed: ${errorMessage(error)}`)
+              logWorkerError(request, 'recovered_artifact_cleanup_failed', error)
             }
             console.warn(`[req ${request.requestId}] recovered terminal result from durable session state`)
           } catch (error) {
-            console.warn(`[req ${request.requestId}] terminal recovery lost request ownership: ${errorMessage(error)}`)
+            logWorkerError(request, 'terminal_recovery_lost_ownership', error)
           }
           continue
         }
@@ -300,12 +305,12 @@ export class RequestWorker {
           'process_interrupted',
         )
       } catch (error) {
-        console.error(`[req ${request.requestId}] interrupted workflow step recovery failed: ${errorMessage(error)}`)
+        logWorkerError(request, 'workflow_step_recovery_failed', error)
       }
       try {
-        this.payloads.deleteImage(request.input?.imageArtifact)
+        this.payloads.deleteImage(request.input?.imageArtifactId)
       } catch (error) {
-        console.error(`[req ${request.requestId}] expired artifact cleanup failed: ${errorMessage(error)}`)
+        logWorkerError(request, 'expired_artifact_cleanup_failed', error)
       }
       console.warn(`[req ${request.requestId}] expired worker lease marked process_interrupted`)
     }
@@ -322,11 +327,21 @@ function classifyError(error: unknown): string {
   }
   const message = errorMessage(error)
   if (/artifact .* (?:size|hash) mismatch|ENOENT/.test(message)) return 'artifact_unavailable'
-  return 'internal_error'
+  return stableErrorCode(error)
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function logWorkerError(request: ChatRequestRecord, event: string, error: unknown): void {
+  console.error(JSON.stringify({
+    level: 'error',
+    event,
+    requestId: request.requestId,
+    traceId: request.traceId,
+    ...safeErrorLogFields(error),
+  }))
 }
 
 function latestAssistantReply(messages: import('./types').ChatMessage[]): string {

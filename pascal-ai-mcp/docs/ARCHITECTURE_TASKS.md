@@ -7,8 +7,9 @@
 
 ## 全局约束
 
-- 既有约定：**不改 `packages/mcp`（MCP 服务端）**。带 ⚠️MCP 标记的任务会触及该约束，动手前需先明确解除或以"新增工具/字段、不改既有行为"的方式绕开。
-- 涉及 `packages/core` 场景 schema 的任务（⚠️SCHEMA 标记）属于 editor 仓库层面改动，需先读 `wiki/architecture/node-schemas.md` 并考虑存量场景兼容。
+- 当前实施边界（2026-07-22 起）：**只允许修改 `pascal-ai-mcp/**`**。`apps/editor/**`、`packages/**`、`pascal-reverse-proxy/**`、仓库根配置和 `.github/**` 全部冻结；即使改动看起来兼容或只是新增字段，也必须先由项目负责人明确解除对应目录约束。
+- 历史已完成任务中存在少量公共仓库、Editor 接入和家具相关改动；本约束不要求在本清单中回滚它们，但后续任务不得继续扩大这些目录的 diff。调用既有 MCP 工具不等于修改 MCP，实现可继续使用现有工具契约。
+- 带 ⚠️跨目录 标记的任务在当前边界下只能保留 ADR、接口需求或风险分析，不能进入代码实施，也不能标记完成。不得用 AI 数据库旁路或 `metadata` 临时字段冒充公共 scene schema/MCP 能力已经落地。
 - 线上 eval 消耗真实模型费用，只在任务完成标准要求时跑；日常回归用 `bun test`。
 - `requestId` 由 AI API 创建并作为业务请求主键；浏览器只能创建 `clientRequestId` / `idempotencyKey`，不得决定服务端主键。`traceId` 由可信 BFF 或 AI API 创建，不能信任浏览器自报的身份与追踪字段。
 - T2.6 采用 LangGraph 持久化方案后新增服务端 `workflowRunId`：`sessionId` 表示整段会话，`requestId` 表示一次 API/队列动作，`workflowRunId` 表示可跨 chat/confirm/modify 请求暂停与恢复的一轮工作流，`traceId` 只作链路追踪。四者不得互相冒充。
@@ -117,7 +118,10 @@
 - 顺带解决：既有备忘中的"sessions.json 单文件无清理策略会一直涨"。
 - T2.6 状态所有权（2026-07-22）：`ai_sessions`/`ai_messages` 继续是业务会话、用户可见消息与 LayoutPlan 的唯一真相源；LangGraph checkpoint 只保存执行游标、interrupt、最小节点输出引用和对应 session version，不复制完整消息、图片、Prompt、回复或整个 WorkflowSession。若未来要迁移业务状态所有权，必须另立 migration/切换任务，不能在 T2.6 中悄悄形成第二套会话状态。
 
-### [ ] T1.6 附件引用化与基本删除语义（最小版）
+### [x] T1.6 附件引用化与基本删除语义（最小版）
+- 完成于 2026-07-22。migration v9 新增 `ai_artifacts`，保存服务端 request/session 关联、私有相对 storage key、MIME、大小、SHA-256、状态、可配置过期时间和删除重试信息；请求 `input_json` 只保留 `imageArtifactId`，不再复制 MIME/大小/hash，更不保存 Base64 或公开 URL。幂等 input hash 通过 repository 查询 artifact 指纹，因此同图重复上传仍复用原 request，而 artifact id 本身不影响判等。
+- 文件 adapter 统一负责 0600 原子写、读取时 size/hash 校验、终态/取消/lease 恢复/session 删除清理。删除先把 DB 行转为不可读的 `delete_pending`，文件系统失败转 `delete_failed` 并保留固定错误码，后续维护命令可重试；文件成功删除后移除 artifact 行。进程崩在“文件落盘→登记”或“登记→request 入队”的缝隙时，维护命令分别通过旧孤儿文件和超时无 request 记录收敛；终态 request 遗留也会立即成为候选。
+- `bun run data:cleanup` 现在统一 dry-run 报告 checkpoint、过期/失败 artifact 与旧孤儿文件；`--execute` 才幂等删除，`--delete-incompatible` 仍只控制显式 graph-version 清理。`AI_MCP_ARTIFACT_TTL_HOURS` 默认 24。session 删除继续由 DB trigger 清 LangGraph thread、级联消息并 scrub request payload/result；随后按 session 清短期附件，失败不恢复内容可读性且由 cleanup 重试；request/模型/工具审计和场景历史保留。
 - 内容：只实现当前本机/内网阶段必要的数据卫生：① `ai_artifacts` 保存私有文件引用、hash、MIME、大小和可配置过期时间，不保存 Base64/永久公开 URL；②定义基础 session 删除语义（删除消息、短期附件及关联 LangGraph workflow thread/checkpoint，去标识化用量/状态可保留，场景历史不被聊天删除连带破坏）；③提供幂等清理命令处理过期附件、过期 checkpoint 和失败删除。checkpoint state 必须采用最小引用模型，不得把 Base64、完整消息、Prompt/回复或场景快照作为绕过本任务的第二份内容存储。本任务不包含字段/信封加密、KMS、客服原文访问审计、备份级删除或法务留存周期，这些移到 TX.3。
 - 与 T2.6e 的边界：T1.6 负责通用 session 删除级联、TTL/prune 执行器、失败重试和数据不可再访问的产品语义；T2.6e 负责 LangGraph 特有的 graph-version mismatch 策略、把 workflow thread 接入该通用删除器以及故障注入验证。任何会写持久 checkpoint 的 T2.6b–d 代码，在最小 checkpoint 删除与 TTL 路径就绪前只能用于无真实用户数据的测试/开发环境，不得部署到保留真实用户数据的环境。
 - 涉及：`src/persistence/`、`src/server.ts` 上传入口、文件存储 adapter、删除/清理命令。
@@ -125,7 +129,9 @@
 - 依赖：T1.5；可与阶段 2 并行，不阻塞 T2.1。对外生产标准由 TX.1 + TX.3 完成。
 - 依据：`AI_USAGE_AUDIT_DESIGN.md` §5.7、§9。
 
-### [ ] T1.7 稳定错误码与日志脱敏
+### [x] T1.7 稳定错误码与日志脱敏
+- 完成于 2026-07-22。新增 `error-policy.ts` 作为唯一公开错误策略：HTTP 错误统一返回 `error/errorCode/stage/message/requestId/traceId`（保留 `error` 仅供现有编辑器兼容，`errorCode` 为权威字段），未知异常只返回固定可公开提示；请求错误日志改为结构化的 requestId/traceId + 稳定 code/stage/type，不打印原异常对象。模型 4xx/5xx、网络失败、无效 JSON/结构化输出均改抛 `SafeServiceError`，原始供应商 body/statusText/解析片段不再进入 Error、telemetry 或客户端；供应商 code 只接受有限标识符。MCP 文本错误在进入 agent 前统一限长并脱敏，worker 终态保留模型稳定错误码。普通请求日志不再记录用户可控 sessionId。
+- 验证：对抗测试覆盖 Authorization、Cookie、API key、Base64、prompt/reply/content，以及供应商 400/500 body 同时携带敏感正文；断言公开 Error、attempt telemetry、MCP 错误文本与 HTTP envelope 均不含秘密。真实 HTTP 集成测试验证 malformed JSON/413/template gate 均带稳定 errorCode、stage 和权威身份头，现有 `error` 字段仍可供旧 UI 展示。
 - 内容：建立统一错误 envelope（requestId、稳定 errorCode、stage、可公开 message），供应商错误体只转成脱敏错误码/限长摘要；本阶段默认不保存原始错误体，只有 TX.3 的短期加密 artifact 能力就绪后才允许按策略留存。结构化日志统一注入 traceId/requestId，增加对 Authorization/Cookie/Base64/Prompt/回复的 redaction 测试。
 - 涉及：`src/server.ts`、`src/openai-compatible.ts`、`src/agent.ts`、代理路由、日志工具。
 - 完成标准：模拟供应商返回带敏感内容的 4xx/5xx，客户端和普通日志都看不到原始响应体或凭据，但能凭 requestId/errorCode 定位阶段；现有错误 UI 仍能展示可操作提示。
@@ -140,7 +146,7 @@
 
 ### [x] T2.1 /chat 改为异步任务：202 + requestId
 - 完成于 2026-07-21。migration v3 把 `ai_requests` 升级为 DB 真相源的 durable queue（queued/running/succeeded/failed/cancelled、input/result、owner、lease、heartbeat、attempt）；`POST /chat` 持久入队后立即返回 202/Location，`GET /requests/:id` 查询状态和终态结果。worker 以 `BEGIN IMMEDIATE` 原子 claim，续租 heartbeat，按 session/scene 排他，cancel 优先；取消入队会在同一事务中把该 session 尚未领取的旧任务标为 `cancelled_by_user`，已领取任务走 Abort 路径，不会出现“先取消、旧生成随后又执行”。默认全局并发 1、队深 100，普通请求超限返回 429/Retry-After；取消仅在 session 或 active request 确实存在时绕过背压，无目标 cancel 返回 404，不能借最高优先级泛洪队列。queued 在重启后继续领取；过期 running 统一 `failed/process_interrupted` 且不整单重放，等 T2.2 有 workflow step 幂等语义后再扩展恢复。
-- 数据边界：请求文本只在 queued/running 期间存在 `input_json`，终态清除；图片解码为私有 0600 临时文件，DB 仅存 id/MIME/size/SHA-256 引用，worker 临时还原 data URL 后终态删除，Base64 入库有 repository 硬拒绝。结果表保存异步客户端领取所需的 reply/sessionVersion 摘要，删除 session 时 scrub input/result 但保留请求审计；完整 `ai_artifacts` 生命周期/过期清理仍归 T1.6。删除有 active queue job 的 session 返回 409，避免 worker 随后重建已删除会话。
+- 数据边界：请求文本只在 queued/running 期间存在 `input_json`，终态清除；图片解码为私有 0600 临时文件，请求 DB payload 只存 artifact id，MIME/size/SHA-256/TTL/删除状态由 `ai_artifacts` 单一持有，worker 临时还原 data URL 后终态删除，Base64 入库有 repository 硬拒绝。结果表保存异步客户端领取所需的 reply/sessionVersion 摘要，删除 session 时 scrub input/result 并清短期附件但保留去标识化请求审计。删除有 active queue job 的 session 返回 409，避免 worker 随后重建已删除会话。
 - HTTP/前端：移除 Bun 无限 request timeout 与 Next 代理全量响应缓冲 workaround；代理流式转发，编辑器以 requestId 轮询终态，原 POST 断开不影响任务。前端成功/失败/取消关联日志均保留 clientRequestId→requestId/traceId。阶段级实时进度仍归 T2.3。
 - 生命周期与已知边界：过期 lease 的启动清扫不受模板门影响；生产模板门不 ready 时仅 worker 领取被禁用，既有 queued 保持不动，expired running 仍会降级。heartbeat 为 lease/3，续租丢失或异常会主动 Abort 本地执行；配置 lease 必须高于最长预期 event-loop stall。协作退出先停止领取再 drain。当前 server 是唯一常驻 writer，CLI/eval 仍走同步 direct audit 路径；worker 排他只针对 worker-owned 任务，因此 CLI 与 server 同 session 并发只靠 CAS 响亮失败，不能避免已发生的模型花费，且崩溃的 direct 行没有 lease、会永久保持 running——有多写者需求时必须让 direct 也进入 lease 协议。当前 MCP 连接面向单一 active scene，故默认并发 1；提升并发前须先完成 scene 隔离能力。无法确认是否执行过场景写入的过期 running 不会自动重试，这是安全选择而非断点续跑。
 - 验证：覆盖队列深度/取消绕过、Base64 拒绝、cancel 优先、session/scene 排他、lease 过期、DB 重开与双连接仅认领一次、图片 artifact 还原/清理；真实 server 集成覆盖 202→轮询终态、重启隔离、production 模板门不领取预存 queued 任务。AI typecheck 干净，完整测试集全过且测试数不减少。
@@ -243,25 +249,32 @@
 
 ## 阶段 3：领域数据与模块边界（评估 §9 Phase 3）
 
-阶段目标 / 验收：删除 AI session 后场景仍能准确识别房间类型并校验；domain 单测不需要模型/MCP/DB/React。
+当前 AI-only 阶段目标 / 验收：空间分类不再只依赖 session 或可变房名；删除 AI session 后，AI 服务仍可通过自己持久化的 scene/zone 语义投影完成只依赖房间分类的判断；domain 单测不需要模型/MCP/DB/React。**直接打开场景的非 AI 消费方读取正式空间语义，仍属于公共 scene schema 能力，当前不承诺。**
 
-### [ ] T3.1 房间语义进场景 schema ⚠️SCHEMA ⚠️MCP
-- 内容：先写并评审空间语义 ADR，再改 schema。当前 `ZoneNode` 同时用于室内房间和 `Back garden` 等外部区域，不能直接把 AI 的 `RoomType` 枚举塞进 core，也不能假设所有 Zone 都是房间。ADR 至少决定：①场景领域自己的 `SpaceUsage`/分类模型（室内、室外、交通、服务等）以及 AI `RoomType → SpaceUsage` 显式映射；②未知/自定义用途的前向兼容；③来源、置信度、templateId/planRoomId/planVersion 的契约；④schema version 与旧场景迁移。方案确定后，Zone schema（或新的正式空间语义能力）和 MCP `create_room`/更新工具支持该契约，新增可选字段且不破坏既有调用；无字段的旧场景只在迁移/导入时按 room-vocab 推断并标记低置信，正常运行不反复猜。**动手前需确认解除"不改 packages/mcp"约束**，并读 `wiki/architecture/node-schemas.md`、`layers.md`、`plugin-authoring.md`。
-- 涉及：`packages/core/src/schema/nodes/zone.ts`、`packages/mcp`（create_room 工具）、迁移逻辑。
-- 完成标准：ADR 获得确认；新生成的室内空间带场景领域用途，花园等外部 Zone 不会被误标成房间；非 AI 入口（直接打开场景）能读到；旧场景仍可解析，未知新枚举不会导致整场景加载失败。
+### [ ] T3.1 AI 侧空间语义投影（当前范围内方案）
+- 内容：先在 `pascal-ai-mcp/docs/` 写并评审空间语义 ADR，再建立 AI application DB 的 `ai_scene_spaces`（名称可由 ADR 最终确定）投影。当前 `ZoneNode` 同时用于室内房间和 `Back garden` 等外部区域，不能直接把 AI `RoomType` 当成所有 Zone 的类型。ADR 至少决定：①AI 领域自己的 `SpaceUsage`/分类模型（室内、室外、交通、服务等）和 `RoomType → SpaceUsage` 显式映射；②未知/自定义用途的开放字符串兼容；③sceneId、zoneId、来源、置信度、templateId/planRoomId/planVersion/sceneVersion 的契约；④session 删除后的保留语义与旧场景一次性低置信推断策略。新生成房间在既有 `create_room` 返回 zoneId 后写入 AI DB 投影；不修改 Zone、MCP 参数或场景 metadata。旧场景只在明确的导入/inspect 路径按 room-vocab 推断一次并持久化低置信结果，正常运行不反复猜。
+- 涉及：仅 `pascal-ai-mcp/src/domain/`、`src/persistence/`、`src/scene-executor.ts`、测试与本目录文档。
+- 完成标准：ADR 获得确认；新生成的室内空间有稳定的 AI 侧用途记录，花园等外部 Zone 不会被误标成室内房间；用户重命名 Zone 后记录不漂移；删除 session 后非内容型语义投影仍可按 sceneId/zoneId 查询；未知用途不会导致读取整条记录失败。数据库与日志不得保存完整 Prompt、回复或场景快照。
 - 依据：§6.3、§8.1。
 
-### [ ] T3.2 AI 侧消费场景语义，session 降级为缓存
-- 内容：`scene-executor.executeLayoutPlan` 施工时写入 T3.1 的场景用途和 plan 来源引用；gates/metrics/modify 中依赖房间分类的逻辑优先读场景字段，`zoneRoomTypes` 与名字正则降级为旧场景迁移兜底（保留并有删除指标）。LayoutIntent/LayoutPlan 仍由 AI application DB 持有，并通过 scene 上的来源引用关联；不要误把“房间用途进 scene”理解为删除 session 后可凭 room type 恢复完整计划。
+### [ ] T3.2 AI 侧消费空间语义投影，session 降级为缓存
+- 内容：`scene-executor.executeLayoutPlan` 施工时写入 T3.1 的 AI DB 投影；gates/metrics/modify 中依赖房间分类的逻辑优先按 sceneId/zoneId 读取该投影，`zoneRoomTypes` 与名字正则降级为旧场景一次性导入兜底（保留命中指标和未来删除条件）。LayoutIntent/LayoutPlan 仍由 AI application DB 持有，并通过来源引用关联；不能把用途投影误当成完整 LayoutPlan，也不能宣称非 AI Editor 已获得该语义。
 - 涉及：`src/scene-executor.ts`、`src/agent.ts`（gateTargetsForSession、collectDiagnostics 一带）、`src/layout-metrics.ts`。
-- 完成标准：删掉 AI session 后，inspect、校验、家具清单以及 modify 中仅依赖房间分类的判断结果不变；用户重命名房间不再影响类型判定。需要完整 LayoutPlan 的重建/拓扑修改必须从 AI DB 的 scene/plan 关联读取，缺失时明确降级或拒绝，不能静默假装可恢复。
+- 完成标准：删掉 AI session 后，AI inspect、校验、家具清单以及 modify 中仅依赖房间分类的判断结果不变；用户重命名房间不再影响类型判定。需要完整 LayoutPlan 的重建/拓扑修改必须从 AI DB 的 scene/plan 关联读取，缺失时明确降级或拒绝，不能静默假装可恢复。
 - 依赖：T3.1。
 - 依据：§6.3。
+
+### [ ] T3.1-FUTURE 正式空间语义进入公共场景 ⚠️跨目录
+- 当前状态：因实施范围固定为 `pascal-ai-mcp/**`，本任务只保留需求，不实施。T3.1 的 AI DB 投影不是它的替代完成品。
+- 内容：在单独 ADR/分支中决定公共场景领域的空间语义能力，而不是直接复用 AI `RoomType`。正式方案需覆盖室内/室外/交通/服务、未知用途前向兼容、来源与置信度、schema version、旧场景迁移，以及创建/更新工具的一致契约。
+- 涉及：`packages/core/src/schema/nodes/zone.ts`（或新的正式空间能力）、`packages/mcp`、迁移逻辑和架构文档。
+- 完成标准：新场景的正式语义可被非 AI 入口读取；花园等外部 Zone 不被误标成房间；旧场景继续解析；未知新用途不会让整场景加载失败。
+- 解锁条件：项目负责人明确允许修改对应 `packages/**` 目录，并按仓库架构流程单独评审。
 
 ### [ ] T3.3 agent.ts 拆分（application/domain/ports/adapters）
 - 内容：按评估 §6.4 的目录结构分批拆：第一批 ports（model-client、scene-gateway、workflow-store、workflow-runtime/checkpointer）+ adapters 提取，具体 LangGraph StateGraph/saver 只存在于 adapter/composition root，application 只依赖可替换的 workflow runtime port；第二批 generate/modify/inspect 三条工作流拆成独立 application service；第三批房名/面积/动线等辅助算法沉入 domain。每批独立提交、测试全过再下一批，不做一次性大爆炸重构。
 - 涉及：`src/agent.ts`（行数下降作为趋势指标，不把 `<800` 当架构验收门槛）、新 `src/domain|application|ports|adapters/`。
-- 完成标准：domain 目录零依赖 HTTP/MCP/DB/LangGraph；application 只依赖 ports，不直接依赖具体 adapter；依赖边界测试进 CI；`bun test` 全过且 eval 抽查 2–3 个 case 结果不变。
+- 完成标准：domain 目录零依赖 HTTP/MCP/DB/LangGraph；application 只依赖 ports，不直接依赖具体 adapter；依赖边界测试纳入 `pascal-ai-mcp` 的常规 `bun test`（由既有 CI 自动执行，不修改 `.github/**`）；`bun test` 全过且 eval 抽查 2–3 个 case 结果不变。
 - 依赖：建议在 T2.x 落定后做（异步化会改 agent 入口，先拆会白拆一部分）。
 - 依据：§6.4。
 
@@ -273,12 +286,14 @@
 - 依据：§7.2。
 
 ### [ ] T3.5 core 纯边界决策与执行 ⚠️SCHEMA
+- 当前状态：⚠️跨目录，冻结期间不实施、不修改仓库级 ADR/CI；保留为未来独立项目。
 - 内容：先决策（评估 §7.1 方案 A：core 提纯 / 方案 B：新增纯 `@pascal-app/scene-model`），同时处理当前架构文档与代码中对 Three/R3F/NodeDefinition 所有权的矛盾，把决策和理由记录到 `wiki/architecture/`；执行前列出 `@pascal-app/*` 公共 API、registry/plugin authoring、npm 消费方和 private-editor submodule 的兼容/semver 影响。然后分阶段迁移并加 dependency boundary 检查（lint rule 或测试：core 禁 import three/R3F —— 若选 A）。这是 editor 仓库层面的大改动，单独开分支/PR，与 AI 侧任务解耦，并使用 `review-architecture` 流程审阅。
 - 涉及：`packages/core/**`、`wiki/architecture/`、`AGENTS.md`、CI。
 - 完成标准：文档与代码一致；边界检查进 CI 会拦截违规 import；公共包和插件迁移有明确兼容策略/major version 决策，不能只让仓库内构建通过。
 - 依据：§7.1、§7.4。
 
 ### [ ] T3.6 反向代理去数据库直读
+- 当前状态：⚠️跨目录，冻结期间不实施；不能从 AI 目录修改 proxy/Editor API 来绕开。
 - 内容：`/proxy/scenes` 的项目列表改为调用 Editor/Scene API 而非直接 `SELECT ... FROM scenes`；封面与展示元数据保留在 proxy.db（它是这些数据的正当主人）；`Program.cs`（825 行）拆 routes/auth/catalog/cover/db/proxy-config 模块。
 - 涉及：`pascal-reverse-proxy/Program.cs`、可能需要 Editor 暴露场景列表 API（确认 `apps/editor` 是否已有）。
 - 完成标准：SceneStore 表结构变化不再可能悄悄弄坏代理；代理进程不再打开 pascal.db。
@@ -317,6 +332,7 @@
 - 依据：§9 Phase 4、§11。
 
 ### [ ] T4.3b 生成后人工修改量闭环
+- 当前状态：⚠️跨目录。当前可在 `pascal-ai-mcp/docs/` 定义事件草案，但不能修改 Editor/BFF 采集端，也不能把仅靠 AI 请求日志的近似统计宣称为人工修改量闭环。
 - 内容：定义“AI 完成后人工结构修改”的稳定事件契约与观察窗口，记录 scene/version、AI request/template、修改类型和匿名/可信主体；不要仅用固定“5 分钟内”且不区分撤销、自动修复与用户编辑。前端事件采集必须有项目/场景授权，服务端校验关联关系。
 - 涉及：Editor 事件出口、BFF/AI telemetry、`src/persistence/`。
 - 完成标准：能比较各模板生成后的人均结构修改量、撤销率和主要修改类型；同一修改不会因重连重复计数。
@@ -324,9 +340,9 @@
 - 依据：§9 Phase 4、§11。
 
 ### [ ] T4.4 eval 分层：PR gate + nightly
-- 内容：stubbed deterministic eval（0 token）作为 PR gate 进 CI；真实供应商 eval 改 nightly/手动触发并保存基线报告（按 roomProgram/面积段/市场维度跟踪成功率与调用数）。
-- 涉及：`eval/`、workflow。
-- 完成标准：PR 不花模型钱也能拦住规划/模板回归；nightly 报告可对比历史。
+- 内容：当前范围内先完成 `eval/` 的 deterministic/真实供应商命令分层、固定报告格式和本地回归；修改 `.github/**` 接入 PR gate/nightly 属于 ⚠️跨目录，冻结期间不实施。
+- 涉及：当前仅 `pascal-ai-mcp/eval/`、`package.json` 和本目录文档；workflow 接入待解锁。
+- 完成标准：本地 deterministic 命令零 token 且能拦住规划/模板回归；真实供应商命令显式 opt-in 并输出可比较报告。PR 自动 gate 与 nightly 调度在解除 `.github/**` 约束前不计入当前完成标准。
 - 依赖：T0.1。
 - 依据：§7.4。
 
@@ -335,6 +351,8 @@
 ## 独立轨道：对外开放前置（P0，何时做取决于对外计划）
 
 当前部署是本机/内网（T0.3 收口后风险可控），以下任务在**任何形式对外暴露之前**必须完成，不阻塞阶段 1–4：
+
+当前 AI-only 边界无法完整实现认证 BFF、Editor 授权事件或正式 KMS/对象存储接入，因此 TX.1/TX.3 只能先做 `pascal-ai-mcp/**` 内的接口与数据模型设计；**在解除跨目录约束并完成这些任务前，部署姿态必须保持本机/受信内网，不能对外开放。**
 
 ### [ ] TX.1 身份与授权贯通
 - 内容：按评估 §5.1 建议 1–4：浏览器只走认证 BFF；AI 服务绑内网 + 服务间鉴权；session/request/scene 操作绑定 userId/orgId；读取删除 session 校验所有权。前置决策：反向代理走 edge-proxy 还是正式 BFF（关联 T3.6，评估 §6.7 的二选一）。
@@ -367,7 +385,7 @@ T1.5 → T2.1 → T2.2 → T2.3 → T2.5
                  └────────→ T2.6a（已决策 A）→ T2.6b → T2.6c → T2.6d → T2.6e
 ```
 
-T2.6a 只依赖 T2.2；图中 T2.3/T2.5 先完成是当前实施顺序便利，不是技术阻塞关系。T1.6、T1.7 可在 T1.5/T1.3 后并行；T1.6 的删除/TTL 实现必须覆盖 T2.6 checkpoint，且写 checkpoint 的能力不得早于最小删除/TTL 一起进入真实数据环境。T1.2 仍应尽早完成，以便后续用真实数据验证成本和模板效果。T2.7 排在 T2.6 之后做关联审计补全，不阻塞 T2.3/T2.5。T2.6 只推进 AI 进程内的安全恢复，不解除 T2.4 的 MCP 能力阻塞。阶段 3 的 T3.1（房间语义）需要先完成 ADR 并解除 packages/mcp 约束，可以提前讨论，但不要先写 schema。
+T2.6a 只依赖 T2.2；图中 T2.3/T2.5 先完成是当前实施顺序便利，不是技术阻塞关系。T1.6、T1.7 可在 T1.5/T1.3 后并行；T1.6 的删除/TTL 实现必须覆盖 T2.6 checkpoint，且写 checkpoint 的能力不得早于最小删除/TTL 一起进入真实数据环境。T2.7 排在 T2.6 之后做关联审计补全，不阻塞 T2.3/T2.5。当前下一段可执行主线是 `T1.6 → T1.7 → T3.4/T3.7 → T3.1/T3.2（AI 侧投影）→ T3.3 → T4.1 → T4.2 → T4.3a → T4.4 本地部分`。T2.4、T3.1-FUTURE、T3.5、T3.6、T4.3b、T4.4 workflow 接入及 TX 跨目录部分保持阻塞；不得为追求勾选而越过 `pascal-ai-mcp/**`。
 
 ## 变更记录
 
@@ -377,3 +395,4 @@ T2.6a 只依赖 T2.2；图中 T2.3/T2.5 先完成是当前实施顺序便利，�
 - 2026-07-22：T2.6 选择方案 A（保留 LangGraph 并接入持久化工作流），拆为状态所有权/标识、checkpointer、节点拆分、interrupt 恢复和留存五段；补充 T1.3/T1.5/T1.6、T2.1–T2.5/T2.7、T3.3/TX.3 的演进关系，并明确不修改 `packages/mcp` 时场景写入不可自动重放。
 - 2026-07-22：依据交叉审核收口 T2.6a：T1.6 拥有通用删除/TTL、T2.6e 拥有 graph 接线/version mismatch/故障验证；明确 checkpoint 写入与删除能力的部署时序、session→workflowRunId 从权威 phase + `ai_requests` 派生，以及 interrupt 无 lease 停泊的 stale/TTL 语义。
 - 2026-07-22：完成 T2.6b–e：精简持久 graph state、route/plan/construct 节点、跨重启 interrupt/resume、仅安全 plan 边界自动 requeue、终态补齐、checkpoint 删除/TTL/version mismatch 运维与故障注入；外部场景写入继续 fail-recoverable，`packages/mcp` 保持零改动。
+- 2026-07-22：后续实施范围收紧为 `pascal-ai-mcp/**`。T3.1/T3.2 改为诚实的 AI DB 空间语义投影；正式公共 scene schema/MCP 能力保留为 T3.1-FUTURE 并阻塞。同步标记 core、proxy、Editor 事件、GitHub workflow 和对外 BFF/KMS 等跨目录任务，禁止用旁路实现冒充完成。

@@ -387,6 +387,35 @@ export const MIGRATIONS: readonly Migration[] = [
         ON ai_validation_results(request_id, created_at);
     `,
   },
+  {
+    version: 9,
+    name: 'add_private_request_artifacts',
+    up: `
+      CREATE TABLE ai_artifacts (
+        artifact_id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        session_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind = 'request_image'),
+        storage_key TEXT NOT NULL UNIQUE,
+        mime_type TEXT NOT NULL CHECK (mime_type IN ('image/png', 'image/jpeg')),
+        size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+        sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+        status TEXT NOT NULL CHECK (status IN (
+          'active', 'delete_pending', 'delete_failed'
+        )),
+        expires_at TEXT NOT NULL,
+        delete_attempts INTEGER NOT NULL DEFAULT 0 CHECK (delete_attempts >= 0),
+        last_error_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE INDEX ai_artifacts_session_created_idx
+        ON ai_artifacts(session_id, created_at);
+      CREATE INDEX ai_artifacts_cleanup_idx
+        ON ai_artifacts(status, expires_at, created_at);
+    `,
+  },
 ]
 
 export function runMigrations(database: Database): void {

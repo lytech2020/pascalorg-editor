@@ -3,6 +3,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import type { AppConfig } from './config'
+import { redactSensitiveText } from './error-policy'
 import type { OpenAiTool } from './types'
 
 export type McpConnectionState = 'disconnected' | 'connecting' | 'ready' | 'degraded' | 'closed'
@@ -276,7 +277,7 @@ export function mcpErrorMessage(result: unknown): string {
     const text = (item as { text?: unknown }).text
     return typeof text === 'string' && text.trim() ? [text.trim()] : []
   })
-  return messages.join('; ') || 'unknown error'
+  return messages.length > 0 ? redactSensitiveText(messages.join('; '), 300) : 'unknown error'
 }
 
 function connectionErrorCode(error: unknown): string {

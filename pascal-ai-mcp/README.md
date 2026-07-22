@@ -92,9 +92,9 @@ The service has **no authentication** and is intended for local/private-network 
 
 `POST /chat` is backed by the SQLite `ai_requests` queue. The worker defaults to one concurrent job (`AI_MCP_WORKER_CONCURRENCY=1`) because the current MCP connection targets one active scene; `AI_MCP_MAX_QUEUE_DEPTH` defaults to 100. A full queue returns `429` with `Retry-After`. Cancel bypasses that limit only when its session or an active target actually exists; an unknown target returns `404`. Each claimed job has a renewable lease. Losing the lease cancels local execution. After a hard process interruption, queued jobs are claimed after restart. An expired running job resumes only from a verified durable plan boundary with no scene-write evidence; if the durable session had already reached a terminal phase, the request is finalized without replay. All ambiguous or scene-writing cases become `failed/process_interrupted`, and running workflow steps become `failed_recoverable`. Unsafe scene writes are never replayed automatically.
 
-Queued text is stored only while the job is active and cleared at completion. Uploaded images are decoded to private mode-0600 files under `AI_MCP_REQUEST_ARTIFACTS_DIR` (default `.data/request-artifacts`); SQLite stores only a hash/MIME/size reference and the file is deleted at the terminal state. The full expiry/cleanup command remains T1.6.
+Queued text is stored only while the job is active and cleared at completion. Uploaded images are decoded to private mode-0600 files under `AI_MCP_REQUEST_ARTIFACTS_DIR` (default `.data/request-artifacts`). Request payloads store only an artifact ID; MIME, size, SHA-256, private storage key, deletion state and expiry live in `ai_artifacts`, never Base64 or a public URL. Files and rows are removed at the request terminal state. `AI_MCP_ARTIFACT_TTL_HOURS` defaults to 24 and bounds crash leftovers that miss normal cleanup.
 
-LangGraph checkpoint tables live in the same `AI_MCP_DATABASE_FILE` and use `AI_MCP_CHECKPOINT_TTL_DAYS` (default 30). The production graph checkpoints only workflow/session/request identifiers, session version, phase and the next safe node; complete messages, prompts, replies, image data, `WorkflowSession` objects and scene snapshots remain in their existing repositories and are never copied into checkpoints. Clarification and confirmation use durable interrupts under the same server-generated `workflowRunId`. Run `bun run data:cleanup` for a dry-run checkpoint maintenance report, `bun run data:cleanup --execute` to prune expired threads, and add `--delete-incompatible` only for an explicit graph-version cleanup. TTL marks rows eligible for deletion but does not run a background timer, so long-running deployments should schedule the execute command periodically.
+LangGraph checkpoint tables live in the same `AI_MCP_DATABASE_FILE` and use `AI_MCP_CHECKPOINT_TTL_DAYS` (default 30). The production graph checkpoints only workflow/session/request identifiers, session version, phase and the next safe node; complete messages, prompts, replies, image data, `WorkflowSession` objects and scene snapshots remain in their existing repositories and are never copied into checkpoints. Clarification and confirmation use durable interrupts under the same server-generated `workflowRunId`. Run `bun run data:cleanup` for a dry-run report covering expired checkpoints, expired/failed artifacts and unregistered old files; run `bun run data:cleanup --execute` for idempotent pruning, and add `--delete-incompatible` only for an explicit graph-version cleanup. TTL marks rows eligible for deletion but does not run a background timer, so long-running deployments should schedule the execute command periodically.
 
 On SIGTERM/SIGINT the server stops accepting HTTP requests and claiming queue jobs, waits up to `AI_MCP_DRAIN_TIMEOUT_MS` (default 5000) for handlers and claimed jobs to drain, then closes the checkpoint saver, MCP and the database. A drain timeout exits non-zero.
 
@@ -129,6 +129,23 @@ If an MCP transport closes or a request fails at the transport layer, the AI-sid
   "requestId": "server-generated-uuid",
   "traceId": "trace-id",
   "statusUrl": "/requests/server-generated-uuid"
+}
+```
+
+Errors use a stable, attributable envelope. `errorCode` is the machine contract;
+`stage` is a low-cardinality processing stage, and `message` is safe to show to
+users. The legacy `error` field mirrors `errorCode` for the current editor client.
+Raw provider bodies, credentials, prompts, replies and image Base64 are never
+included.
+
+```json
+{
+  "error": "mcp_unavailable",
+  "errorCode": "mcp_unavailable",
+  "stage": "readiness",
+  "message": "The scene service is temporarily unavailable. Please retry.",
+  "requestId": "server-generated-uuid",
+  "traceId": "trace-id"
 }
 ```
 

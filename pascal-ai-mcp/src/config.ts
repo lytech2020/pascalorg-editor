@@ -36,6 +36,7 @@ export type AppConfig = {
   databaseFile: string
   workflowCheckpointTtlMs: number
   requestArtifactsDir: string
+  requestArtifactTtlMs: number
   templatesDir: string
   requestWorkerConcurrency: number
   requestQueueDepth: number
@@ -139,6 +140,10 @@ export function loadConfig(): AppConfig {
       30,
     ) * 24 * 60 * 60 * 1000,
     requestArtifactsDir,
+    requestArtifactTtlMs: parseIntWithDefault(
+      process.env.AI_MCP_ARTIFACT_TTL_HOURS,
+      24,
+    ) * 60 * 60 * 1000,
     templatesDir,
     requestWorkerConcurrency: parseIntWithDefault(process.env.AI_MCP_WORKER_CONCURRENCY, 1),
     requestQueueDepth: parseIntWithDefault(process.env.AI_MCP_MAX_QUEUE_DEPTH, 100),

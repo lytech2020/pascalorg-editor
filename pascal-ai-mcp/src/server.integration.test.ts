@@ -257,10 +257,17 @@ describe('server request identity (T1.3)', () => {
         const invalid = await requestHttp(`${base}/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: '{broken',
+          body: '{broken-private-prompt-and-cookie',
         })
         expect(invalid.status).toBe(400)
         expect(responseHeader(invalid, 'x-request-id')).toMatch(/^[0-9a-f-]{36}$/)
+        expect(JSON.parse(invalid.body)).toMatchObject({
+          error: 'invalid_json',
+          errorCode: 'invalid_json',
+          stage: 'transport',
+          message: 'The request body is not valid JSON.',
+        })
+        expect(invalid.body).not.toContain('private-prompt')
 
         // The application limit is 1 MiB while Bun's transport hard cap is
         // 2 MiB. A normal Content-Length violation therefore reaches the
@@ -277,6 +284,9 @@ describe('server request identity (T1.3)', () => {
         }
         expect(oversized.status).toBe(413)
         expect(oversizedPayload.error).toBe('payload_too_large')
+        expect(oversizedPayload).toMatchObject({
+          errorCode: 'payload_too_large', stage: 'transport',
+        })
         expect(oversizedPayload.requestId).toMatch(/^[0-9a-f-]{36}$/)
         expect(responseHeader(oversized, 'x-request-id')).toBe(oversizedPayload.requestId ?? '')
         expect(responseHeader(oversized, 'x-trace-id')).toBe(oversizedPayload.traceId ?? '')
@@ -499,6 +509,9 @@ describe('server request identity (T1.3)', () => {
         const payload = JSON.parse(response.body) as { error?: string; requestId?: string }
         expect(response.status).toBe(503)
         expect(payload.error).toBe('template_library_unavailable')
+        expect(payload).toMatchObject({
+          errorCode: 'template_library_unavailable', stage: 'readiness',
+        })
         expect(payload.requestId).toMatch(/^[0-9a-f-]{36}$/)
         expect(responseHeader(response, 'x-request-id')).toBe(payload.requestId ?? '')
         const progress = await requestHttp(`${base}/requests/preexisting-progress-request`)

@@ -166,4 +166,18 @@ describe('MCP errors', () => {
   test('falls back when a server omits error details', () => {
     expect(mcpErrorMessage({ isError: true })).toBe('unknown error')
   })
+
+  test('redacts secrets from textual tool failures before they reach callers', () => {
+    const output = mcpErrorMessage({
+      isError: true,
+      content: [{
+        type: 'text',
+        text: 'save_failed Authorization:Bearer-secret Cookie=session-secret data:image/png;base64,cHJpdmF0ZQ==',
+      }],
+    })
+    expect(output).toContain('save_failed')
+    expect(output).not.toContain('Bearer-secret')
+    expect(output).not.toContain('session-secret')
+    expect(output).not.toContain('cHJpdmF0ZQ==')
+  })
 })

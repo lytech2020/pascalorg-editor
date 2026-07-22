@@ -284,12 +284,7 @@ export type ChatRequestStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 
 export type QueuedChatInput = {
   sessionId: string
   message?: string
-  imageArtifact?: {
-    id: string
-    mimeType: 'image/png' | 'image/jpeg'
-    sizeBytes: number
-    sha256: string
-  }
+  imageArtifactId?: string
   sceneId?: string
   action?: 'confirm' | 'cancel'
 }
@@ -405,6 +400,7 @@ export class ChatRequestRepository implements ChatRequestWriter {
   private readonly queuedCancelStatement
   private readonly sessionPhaseStatement
   private readonly latestWorkflowRunStatement
+  private readonly artifactFingerprintStatement
 
   constructor(private readonly database: AppDatabase) {
     this.startStatement = database.connection.prepare(`
@@ -571,6 +567,11 @@ export class ChatRequestRepository implements ChatRequestWriter {
       ORDER BY queued_at DESC, request_id DESC
       LIMIT 1
     `)
+    this.artifactFingerprintStatement = database.connection.prepare(`
+      SELECT mime_type, size_bytes, sha256
+      FROM ai_artifacts
+      WHERE artifact_id = ? AND status = 'active' AND expires_at > ?
+    `)
   }
 
   start(record: ChatRequestStart): string {
@@ -606,7 +607,16 @@ export class ChatRequestRepository implements ChatRequestWriter {
   enqueue(record: ChatRequestStart, input: QueuedChatInput, maxActive: number): EnqueueResult {
     assertQueuedInputSafe(input)
     const inputJson = JSON.stringify(input)
-    const inputHash = queuedInputHash(input)
+    const imageFingerprint = input.imageArtifactId
+      ? this.artifactFingerprintStatement.get(
+          input.imageArtifactId,
+          record.startedAt,
+        ) as ArtifactFingerprintRow | undefined
+      : undefined
+    if (input.imageArtifactId && !imageFingerprint) {
+      throw new SessionPersistenceDataError(`artifact ${input.imageArtifactId} is unavailable`)
+    }
+    const inputHash = queuedInputHash(input, imageFingerprint)
     const idempotencySubject = record.idempotencySubject ?? 'local'
     if (!/^[A-Za-z0-9._:-]{1,128}$/.test(idempotencySubject)) {
       throw new Error('invalid trusted idempotency subject')
@@ -802,6 +812,12 @@ type RequestRow = {
   idempotency_subject: string
 }
 
+type ArtifactFingerprintRow = {
+  mime_type: 'image/png' | 'image/jpeg'
+  size_bytes: number
+  sha256: string
+}
+
 function requestRecordFromRow(row: RequestRow): ChatRequestRecord {
   return {
     requestId: row.request_id,
@@ -833,18 +849,24 @@ function assertQueuedInputSafe(input: QueuedChatInput): void {
   if (/data:image\/[a-z0-9.+-]+;base64,/i.test(json)) {
     throw new SessionPersistenceDataError('queued request contains inline image data')
   }
+  if (input.imageArtifactId && !/^[0-9a-f-]{36}$/i.test(input.imageArtifactId)) {
+    throw new SessionPersistenceDataError('queued request contains an invalid artifact id')
+  }
 }
 
-function queuedInputHash(input: QueuedChatInput): string {
+function queuedInputHash(
+  input: QueuedChatInput,
+  imageFingerprint: ArtifactFingerprintRow | undefined,
+): string {
   const hashable = {
     sessionId: input.sessionId,
     message: input.message ?? null,
     sceneId: input.sceneId ?? null,
     action: input.action ?? null,
-    image: input.imageArtifact ? {
-      mimeType: input.imageArtifact.mimeType,
-      sizeBytes: input.imageArtifact.sizeBytes,
-      sha256: input.imageArtifact.sha256,
+    image: imageFingerprint ? {
+      mimeType: imageFingerprint.mime_type,
+      sizeBytes: imageFingerprint.size_bytes,
+      sha256: imageFingerprint.sha256,
     } : null,
   }
   return createHash('sha256').update(JSON.stringify(hashable)).digest('hex')

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
+import { SafeServiceError } from './error-policy'
 import { OpenAiCompatibleClient } from './openai-compatible'
 
 const originalFetch = globalThis.fetch
@@ -171,7 +172,7 @@ describe('attempt telemetry (T1.1)', () => {
       makeClient().complete([{ role: 'user', content: 'hi' }], 's1', {
         onAttemptFinished: attempt => attempts.push(attempt),
       }),
-    ).rejects.toThrow('failed after 5 attempt')
+    ).rejects.toThrow('temporarily unavailable')
     expect(attempts).toHaveLength(5)
     expect(attempts.every(a => a.status === 'network_error')).toBe(true)
     expect(attempts.map(a => a.attemptNo)).toEqual([1, 2, 3, 4, 5])
@@ -350,5 +351,42 @@ describe('attempt telemetry (T1.1)', () => {
       },
     })
     expect(result.output).toBe('ok')
+  })
+
+  test('provider 4xx and 5xx bodies never escape through errors or telemetry', async () => {
+    const secret = 'private prompt Authorization=Bearer-secret Cookie=session-secret'
+    for (const status of [400, 500]) {
+      globalThis.fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        new Response(JSON.stringify({
+          error: { code: status === 400 ? 'invalid_request' : 'upstream_failure', message: secret },
+        }), { status, statusText: secret })) as typeof fetch
+      const attempts: import('./openai-compatible').ModelAttemptResult[] = []
+      let thrown: unknown
+      try {
+        await makeClient().complete([{ role: 'user', content: secret }], 's1', {
+          onAttemptFinished: attempt => attempts.push(attempt),
+        })
+      } catch (error) {
+        thrown = error
+      }
+      expect(thrown).toBeInstanceOf(SafeServiceError)
+      expect(String(thrown)).not.toContain(secret)
+      expect(JSON.stringify(attempts)).not.toContain(secret)
+      expect(attempts.every(attempt => attempt.errorSummary?.includes(String(status)))).toBe(true)
+    }
+  })
+
+  test('invalid structured model output does not leak the returned content', async () => {
+    const secret = 'private model reply and api-key-value'
+    globalThis.fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      Response.json({ choices: [{ message: { role: 'assistant', content: `{${secret}` } }] })) as typeof fetch
+    let thrown: unknown
+    try {
+      await makeClient().json([{ role: 'user', content: 'hi' }], 's1')
+    } catch (error) {
+      thrown = error
+    }
+    expect(thrown).toBeInstanceOf(SafeServiceError)
+    expect(String(thrown)).not.toContain(secret)
   })
 })

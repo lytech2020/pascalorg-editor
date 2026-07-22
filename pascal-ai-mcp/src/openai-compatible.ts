@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { SafeServiceError, safeErrorLogFields } from './error-policy'
 import type { ChatCompletionResponse, ChatMessage, OpenAiTool } from './types'
 
 // Normalized token usage. Absent fields mean the provider did not report the
@@ -148,7 +149,15 @@ export class OpenAiCompatibleClient {
     }, hooks)
     const raw = completion.choices[0]?.message.content ?? ''
     const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '')
-    return callResult(completion, JSON.parse(cleaned) as T)
+    try {
+      return callResult(completion, JSON.parse(cleaned) as T)
+    } catch {
+      throw new SafeServiceError(
+        'model_invalid_response',
+        'model',
+        'The AI provider returned an invalid response. Please retry.',
+      )
+    }
   }
 
   private async request(
@@ -205,7 +214,7 @@ export class OpenAiCompatibleClient {
         } catch (error) {
           // Telemetry must never change the business outcome of a call that
           // already happened — the budget gate lives in onAttemptStarted.
-          console.error('onAttemptFinished hook failed:', errorMessage(error))
+          console.error('onAttemptFinished hook failed:', safeErrorLogFields(error, 'telemetry_sink_failed'))
         }
       }
       // Combine the per-attempt timeout with the caller's cancel signal (if
@@ -223,22 +232,26 @@ export class OpenAiCompatibleClient {
         } catch (error) {
           if (hooks.signal?.aborted) {
             finished({ status: 'cancelled', httpStatus, errorSummary: 'cancelled during body read' })
-            throw new Error('Model API request cancelled')
+            throw modelCancelledError()
           }
           if (attemptSignal.aborted) {
             finished({
               status: 'network_error',
               httpStatus,
-              errorSummary: truncate(`timed out during body read: ${errorMessage(error)}`),
+              errorSummary: 'request_timeout',
             })
-            throw error
+            throw modelUnavailableError()
           }
           finished({
             status: 'invalid_response',
             httpStatus,
             errorSummary: `unreadable response body (${errorKind(error)})`,
           })
-          throw error
+          throw new SafeServiceError(
+            'model_invalid_response',
+            'model',
+            'The AI provider returned an invalid response. Please retry.',
+          )
         }
       }
       let response: Response
@@ -254,16 +267,14 @@ export class OpenAiCompatibleClient {
         // surface it immediately so the caller can unwind.
         if (hooks.signal?.aborted) {
           finished({ status: 'cancelled', errorSummary: 'cancelled by caller' })
-          throw new Error('Model API request cancelled')
+          throw modelCancelledError()
         }
         // Network-level failures (DNS, connection reset, timeout) never hit
         // the response.ok branch below, so without this catch they were not
         // retried at all — only HTTP-level 429/5xx were.
-        finished({ status: 'network_error', errorSummary: truncate(errorMessage(error)) })
+        finished({ status: 'network_error', errorSummary: networkErrorCode(error) })
         if (attempt === 4) {
-          throw new Error(
-            `Model API request failed after ${attempt + 1} attempt(s): ${errorMessage(error)}`,
-          )
+          throw modelUnavailableError()
         }
         await delay(retryDelayMs(undefined, attempt, this.options.retryBaseDelayMs), hooks.signal)
         continue
@@ -287,21 +298,20 @@ export class OpenAiCompatibleClient {
       }
 
       const responseBody = await readBody(() => response.text(), response.status)
+      const errorCode = providerErrorCode(responseBody)
       finished({
         status: 'http_error',
         httpStatus: response.status,
-        errorSummary: truncate(`${response.status} ${response.statusText}`),
-        ...(providerErrorCode(responseBody) ? { providerErrorCode: providerErrorCode(responseBody) } : {}),
+        errorSummary: `${response.status} ${httpErrorCategory(response.status)}`,
+        ...(errorCode ? { providerErrorCode: errorCode } : {}),
       })
       const retryable = response.status === 429 || response.status >= 500
       if (!retryable || attempt === 4) {
-        throw new Error(
-          `Model API failed after ${attempt + 1} attempt(s): ${response.status} ${response.statusText} ${responseBody}`,
-        )
+        throw modelHttpError(response.status)
       }
       await delay(retryDelayMs(response.headers, attempt, this.options.retryBaseDelayMs), hooks.signal)
     }
-    throw new Error('Model API request exhausted retries')
+    throw modelUnavailableError()
   }
 
   // For Azure the deployment name is what we actually request; `model` is
@@ -368,7 +378,7 @@ function retryDelayMs(headers: Headers | undefined, attempt: number, baseMs = 20
 function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
-      reject(new Error('Model API request cancelled'))
+      reject(modelCancelledError())
       return
     }
     const timer = setTimeout(() => {
@@ -377,14 +387,10 @@ function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
     }, milliseconds)
     function onAbort() {
       clearTimeout(timer)
-      reject(new Error('Model API request cancelled'))
+      reject(modelCancelledError())
     }
     signal?.addEventListener('abort', onAbort, { once: true })
   })
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
 }
 
 function errorKind(error: unknown): string {
@@ -428,10 +434,61 @@ function providerErrorCode(responseBody: string): string | undefined {
   try {
     const parsed = JSON.parse(responseBody) as { error?: { code?: unknown; type?: unknown } }
     const code = parsed.error?.code ?? parsed.error?.type
-    return typeof code === 'string' && code ? truncate(code, 80) : undefined
+    return typeof code === 'string' && /^[A-Za-z0-9._:-]{1,80}$/.test(code) ? code : undefined
   } catch {
     return undefined
   }
+}
+
+function modelCancelledError(): SafeServiceError {
+  return new SafeServiceError('model_cancelled', 'model', 'The AI model request was cancelled.')
+}
+
+function modelUnavailableError(): SafeServiceError {
+  return new SafeServiceError(
+    'model_unavailable',
+    'model',
+    'The AI provider is temporarily unavailable. Please retry.',
+  )
+}
+
+function modelHttpError(status: number): SafeServiceError {
+  if (status === 429) {
+    return new SafeServiceError(
+      'model_rate_limited',
+      'model',
+      'The AI provider is busy. Please retry shortly.',
+    )
+  }
+  if (status === 401 || status === 403) {
+    return new SafeServiceError(
+      'model_authentication_failed',
+      'model',
+      'The AI provider is not configured correctly. Contact support with the request ID.',
+    )
+  }
+  if (status >= 500) return modelUnavailableError()
+  return new SafeServiceError(
+    'model_request_rejected',
+    'model',
+    'The AI provider rejected the request. Review the input or contact support with the request ID.',
+  )
+}
+
+function httpErrorCategory(status: number): string {
+  if (status === 429) return 'rate_limited'
+  if (status === 401 || status === 403) return 'authentication_failed'
+  if (status >= 500) return 'provider_unavailable'
+  return 'request_rejected'
+}
+
+function networkErrorCode(error: unknown): string {
+  const text = error instanceof Error ? `${error.name} ${error.message}` : String(error)
+  if (/abort/i.test(text)) return 'aborted'
+  if (/timed?\s*out|timeout/i.test(text)) return 'request_timeout'
+  if (/ECONNREFUSED|connection refused/i.test(text)) return 'connection_refused'
+  if (/EPIPE|broken pipe/i.test(text)) return 'broken_pipe'
+  return 'network_error'
 }
 
 // Maps the raw usage block to normalized fields; absent numbers stay absent

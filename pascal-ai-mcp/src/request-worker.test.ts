@@ -3,6 +3,7 @@ import { mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AppDatabase } from './persistence/database'
+import { ArtifactRepository } from './persistence/artifact-repository'
 import {
   ChatRequestRepository,
   RequestCancellationTargetNotFoundError,
@@ -30,6 +31,10 @@ function start(requestId: string, sessionId: string, kind: 'chat' | 'confirm' | 
 
 function input(sessionId: string, action?: 'confirm' | 'cancel'): QueuedChatInput {
   return { sessionId, ...(action ? { action } : { message: `message-${sessionId}` }) }
+}
+
+function payloadStore(database: AppDatabase, directory: string): RequestPayloadStore {
+  return new RequestPayloadStore(directory, new ArtifactRepository(database), 24 * 60 * 60 * 1000)
 }
 
 function sessionFixture(sessionId: string): WorkflowSession {
@@ -252,7 +257,7 @@ describe('durable request queue (T2.1)', () => {
       const worker = new RequestWorker(
         requests,
         sessions,
-        new RequestPayloadStore(join(dir, 'artifacts')),
+        payloadStore(database, join(dir, 'artifacts')),
         { executeQueued: async () => { throw new Error('not called') }, requestCancellation: () => undefined },
         { concurrency: 1, leaseMs: 1_000, pollMs: 10 },
         steps,
@@ -285,7 +290,7 @@ describe('durable request queue (T2.1)', () => {
       const worker = new RequestWorker(
         requests,
         sessions,
-        new RequestPayloadStore(join(dir, 'artifacts')),
+        payloadStore(database, join(dir, 'artifacts')),
         {
           executeQueued: async () => { throw new Error('not called') },
           requestCancellation: () => undefined,
@@ -325,7 +330,7 @@ describe('durable request queue (T2.1)', () => {
       const worker = new RequestWorker(
         requests,
         sessions,
-        new RequestPayloadStore(join(dir, 'artifacts')),
+        payloadStore(database, join(dir, 'artifacts')),
         {
           executeQueued: async () => {
             executions++
@@ -368,7 +373,7 @@ describe('durable request queue (T2.1)', () => {
       const restartedWorker = new RequestWorker(
         requests,
         sessions,
-        new RequestPayloadStore(join(dir, 'artifacts')),
+        payloadStore(database, join(dir, 'artifacts')),
         { executeQueued: async () => { throw new Error('not called') }, requestCancellation: () => undefined },
         { concurrency: 1, leaseMs: 1_000, pollMs: 10 },
         steps,
@@ -399,7 +404,7 @@ describe('durable request queue (T2.1)', () => {
       const worker = new RequestWorker(
         requests,
         sessions,
-        new RequestPayloadStore(join(dir, 'artifacts')),
+        payloadStore(database, join(dir, 'artifacts')),
         { executeQueued: async () => { throw new Error('not called') }, requestCancellation: () => undefined },
         { concurrency: 1, leaseMs: 1_000, pollMs: 5 },
         steps,
@@ -465,7 +470,7 @@ describe('durable request queue (T2.1)', () => {
     try {
       const requests = new ChatRequestRepository(afterRestart)
       const sessions = new SqliteSessionPersistence(afterRestart)
-      const payloads = new RequestPayloadStore(join(dir, 'artifacts'))
+      const payloads = payloadStore(afterRestart, join(dir, 'artifacts'))
       const worker = new RequestWorker(requests, sessions, payloads, {
         requestCancellation: () => undefined,
         executeQueued: async (chat: ChatInput): Promise<ChatResult> => {
@@ -500,7 +505,7 @@ describe('durable request queue (T2.1)', () => {
       const worker = new RequestWorker(
         requests,
         sessions,
-        new RequestPayloadStore(join(dir, 'artifacts')),
+        payloadStore(database, join(dir, 'artifacts')),
         {
           requestCancellation: () => undefined,
           executeQueued: async (chat: ChatInput): Promise<ChatResult> => {
@@ -557,7 +562,7 @@ describe('durable request queue (T2.1)', () => {
       const worker = new RequestWorker(
         requests,
         sessions,
-        new RequestPayloadStore(join(dir, 'artifacts')),
+        payloadStore(database, join(dir, 'artifacts')),
         {
           requestCancellation: () => undefined,
           executeQueued: async (chat: ChatInput): Promise<ChatResult> => {
@@ -598,9 +603,12 @@ describe('durable request queue (T2.1)', () => {
     try {
       const requests = new ChatRequestRepository(database)
       const sessions = new SqliteSessionPersistence(database)
-      const payloads = new RequestPayloadStore(join(dir, 'artifacts'))
-      const artifact = payloads.persistImage('data:image/png;base64,iVBORw0KGgo=')
-      requests.enqueue(start('req-1', 's1'), { sessionId: 's1', imageArtifact: artifact }, 10)
+      const payloads = payloadStore(database, join(dir, 'artifacts'))
+      const artifactId = payloads.persistImage('data:image/png;base64,iVBORw0KGgo=', {
+        requestId: 'req-1',
+        sessionId: 's1',
+      })
+      requests.enqueue(start('req-1', 's1'), { sessionId: 's1', imageArtifactId: artifactId }, 10)
       const executor = {
         requestCancellation: () => undefined,
         executeQueued: async (chat: ChatInput): Promise<ChatResult> => {
@@ -635,7 +643,7 @@ describe('durable request queue (T2.1)', () => {
     try {
       const requests = new ChatRequestRepository(database)
       const sessions = new SqliteSessionPersistence(database)
-      const payloads = new RequestPayloadStore(dir)
+      const payloads = payloadStore(database, dir)
       requests.enqueue(start('req-heartbeat', 's1'), input('s1'), 10)
       requests.heartbeat = () => false
       let resolveExecution: (() => void) | undefined

@@ -1,5 +1,14 @@
 import { PascalAiAgent } from './agent'
 import { loadConfig } from './config'
+import {
+  publicErrorEnvelope,
+  publicErrorMessage,
+  safeErrorLogFields,
+  stableErrorCode,
+  stableErrorStage,
+  type ErrorIdentity,
+  type ErrorStage,
+} from './error-policy'
 import { isValidImageDataUrl, readJsonBody } from './http-guards'
 import { PascalMcpClient } from './mcp'
 import { AppDatabase } from './persistence/database'
@@ -21,6 +30,7 @@ import { WorkflowStepRepository } from './persistence/workflow-step-repository'
 import { SceneBuildRepository } from './persistence/scene-build-repository'
 import { SqliteCheckpointSaver } from './persistence/sqlite-checkpoint-saver'
 import { AiAuditRepository } from './persistence/audit-repository'
+import { ArtifactRepository } from './persistence/artifact-repository'
 import { WORKFLOW_GRAPH_VERSION } from './workflow-identity'
 
 const config = loadConfig()
@@ -43,6 +53,7 @@ const requests = new ChatRequestRepository(database)
 const workflowSteps = new WorkflowStepRepository(database)
 const sceneBuilds = new SceneBuildRepository(database)
 const audits = new AiAuditRepository(database)
+const artifacts = new ArtifactRepository(database)
 const templateLibrary = loadTemplateLibrary(config.templatesDir)
 const templatesAcceptTraffic = templateLibraryAllowsTraffic(templateLibrary.health)
 const templateHealthSummary = {
@@ -76,7 +87,11 @@ const agent = new PascalAiAgent(
   checkpointSaver,
   audits,
 )
-const requestPayloads = new RequestPayloadStore(config.requestArtifactsDir)
+const requestPayloads = new RequestPayloadStore(
+  config.requestArtifactsDir,
+  artifacts,
+  config.requestArtifactTtlMs,
+)
 const worker = new RequestWorker(requests, sessions, requestPayloads, agent, {
   concurrency: config.requestWorkerConcurrency,
   leaseMs: config.requestLeaseMs,
@@ -105,8 +120,18 @@ const server = Bun.serve({
       // call) falls through to Bun's default error response, which has no
       // CORS headers — the browser reports a opaque "network error" instead
       // of the real failure, which is very hard to debug from the client.
-      console.error('Unhandled error in pascal-ai-mcp request:', error)
-      return json({ error: 'internal_error', message: errorMessage(error) }, 500)
+      const context = createRequestContext(request.headers)
+      logRequestError(context, 'http_request_failed', error)
+      return json(
+        publicErrorEnvelope(
+          context,
+          stableErrorCode(error),
+          stableErrorStage(error),
+          publicErrorMessage(error),
+        ),
+        500,
+        { 'x-request-id': context.requestId, 'x-trace-id': context.traceId },
+      )
     }
   },
 })
@@ -130,7 +155,15 @@ async function handle(request: Request): Promise<Response> {
   }
 
   if (request.method === 'GET' && url.pathname === '/ready') {
-    if (!readinessAuthorized(request)) return json({ error: 'unauthorized' }, 401)
+    if (!readinessAuthorized(request)) {
+      return genericErrorResponse(
+        request,
+        'unauthorized',
+        'validation',
+        'A valid readiness token is required.',
+        401,
+      )
+    }
     const mcpReady = await mcp.checkReady()
     if (mcpReady) worker.notify()
     const databaseReady = database.isWritable()
@@ -170,13 +203,26 @@ async function handle(request: Request): Promise<Response> {
       traceId: context.traceId,
       ...(context.clientRequestId ? { clientRequestId: context.clientRequestId } : {}),
     })
+    const fail = (
+      errorCode: string,
+      stage: ErrorStage,
+      message: string,
+      status: number,
+      headers: Record<string, string> = identityHeaders,
+      extra: Record<string, unknown> = {},
+    ) => json(publicErrorEnvelope(identity(), errorCode, stage, message, extra), status, headers)
 
     const read = await readJsonBody(request, config.maxRequestBodyBytes)
     if (!read.ok) {
-      return json(
-        { error: read.error, maxBytes: config.maxRequestBodyBytes, ...identity() },
+      return fail(
+        read.error,
+        'transport',
+        read.error === 'payload_too_large'
+          ? 'The request body is too large.'
+          : 'The request body is not valid JSON.',
         read.status,
         identityHeaders,
+        { maxBytes: config.maxRequestBodyBytes },
       )
     }
     const clientRequestId = clientRequestIdFrom(read.body as Record<string, unknown>)
@@ -191,49 +237,64 @@ async function handle(request: Request): Promise<Response> {
     }
 
     if (body.action !== undefined && body.action !== 'confirm' && body.action !== 'cancel') {
-      return json({ error: 'invalid_action', ...identity() }, 400, identityHeaders)
+      return fail('invalid_action', 'validation', 'The requested action is not supported.', 400)
     }
 
     if (body.idempotencyKey !== undefined && !isValidIdempotencyKey(body.idempotencyKey)) {
-      return json({ error: 'invalid_idempotency_key', ...identity() }, 400, identityHeaders)
+      return fail(
+        'invalid_idempotency_key',
+        'validation',
+        'The idempotency key format is invalid.',
+        400,
+      )
     }
 
     if (!body.sessionId || (!body.message && !body.imageDataUrl && !body.action)) {
-      return json(
-        { error: 'sessionId and message, imageDataUrl, or action are required', ...identity() },
+      return fail(
+        'invalid_request',
+        'validation',
+        'A session ID and a message, image, or action are required.',
         400,
-        identityHeaders,
       )
     }
 
     if (body.imageDataUrl && !isValidImageDataUrl(body.imageDataUrl)) {
-      return json(
-        { error: 'invalid_image', message: 'imageDataUrl must be a base64 data URL of type image/png or image/jpeg', ...identity() },
+      return fail(
+        'invalid_image',
+        'validation',
+        'The image must be a PNG or JPEG data URL.',
         400,
-        identityHeaders,
       )
     }
 
     if (!templatesAcceptTraffic) {
-      return json(
-        { error: 'template_library_unavailable', message: 'Template library is not ready', ...identity() },
+      return fail(
+        'template_library_unavailable',
+        'readiness',
+        'The template library is not ready. Please retry later.',
         503,
-        identityHeaders,
       )
     }
 
 
     if (body.action !== 'cancel' && !(await mcp.checkReady())) {
-      return json(
-        { error: 'mcp_unavailable', message: 'Pascal MCP is not ready', ...identity() },
+      return fail(
+        'mcp_unavailable',
+        'readiness',
+        'The scene service is temporarily unavailable. Please retry.',
         503,
         { ...identityHeaders, 'Retry-After': '2' },
       )
     }
 
-    let imageArtifact: ReturnType<RequestPayloadStore['persistImage']> | undefined
+    let imageArtifactId: string | undefined
     try {
-      if (body.imageDataUrl) imageArtifact = requestPayloads.persistImage(body.imageDataUrl)
+      if (body.imageDataUrl) {
+        imageArtifactId = requestPayloads.persistImage(body.imageDataUrl, {
+          requestId: context.requestId,
+          sessionId: body.sessionId,
+        })
+      }
       const queuedAt = new Date().toISOString()
       const enqueued = requests.enqueue({
         requestId: context.requestId,
@@ -247,14 +308,20 @@ async function handle(request: Request): Promise<Response> {
       }, {
         sessionId: body.sessionId,
         ...(body.message ? { message: body.message } : {}),
-        ...(imageArtifact ? { imageArtifact } : {}),
+        ...(imageArtifactId ? { imageArtifactId } : {}),
         ...(body.sceneId ? { sceneId: body.sceneId } : {}),
         ...(body.action ? { action: body.action } : {}),
       }, config.requestQueueDepth)
-      if (!enqueued.created) requestPayloads.deleteImage(imageArtifact)
+      if (!enqueued.created) {
+        try {
+          requestPayloads.deleteImage(imageArtifactId)
+        } catch (error) {
+          console.error(`[req ${context.requestId}] reused artifact cleanup deferred: ${errorMessage(error)}`)
+        }
+      }
       for (const cancelled of enqueued.cancelled) {
         try {
-          requestPayloads.deleteImage(cancelled.input?.imageArtifact)
+          requestPayloads.deleteImage(cancelled.input?.imageArtifactId)
         } catch (error) {
           console.error(`[req ${cancelled.requestId}] cancelled artifact cleanup failed: ${errorMessage(error)}`)
         }
@@ -267,7 +334,7 @@ async function handle(request: Request): Promise<Response> {
         )
       }
       console.log(
-        `[req ${enqueued.request.requestId}] [trace ${enqueued.request.traceId}] chat ${enqueued.created ? 'queued' : 'reused'} session=${body.sessionId}${body.action ? ` action=${body.action}` : ''}`,
+        `[req ${enqueued.request.requestId}] [trace ${enqueued.request.traceId}] chat ${enqueued.created ? 'queued' : 'reused'} kind=${enqueued.request.kind}`,
       )
       return json(
         {
@@ -287,40 +354,54 @@ async function handle(request: Request): Promise<Response> {
         },
       )
     } catch (error) {
-      requestPayloads.deleteImage(imageArtifact)
+      try {
+        requestPayloads.deleteImage(imageArtifactId)
+      } catch (cleanupError) {
+        console.error(`[req ${context.requestId}] enqueue artifact cleanup deferred: ${errorMessage(cleanupError)}`)
+      }
       if (error instanceof RequestQueueFullError) {
-        return json(
-          { error: 'queue_full', message: error.message, ...identity() },
+        return fail(
+          'queue_full',
+          'queue',
+          'The request queue is full. Please retry shortly.',
           429,
           { ...identityHeaders, 'Retry-After': '2' },
         )
       }
       if (error instanceof RequestCancellationTargetNotFoundError) {
-        return json(
-          { error: 'session_not_found', message: error.message, ...identity() },
+        return fail(
+          'session_not_found',
+          'queue',
+          'No active request was found for this session.',
           404,
-          identityHeaders,
         )
       }
       if (error instanceof RequestIdempotencyConflictError) {
-        return json(
-          { error: 'idempotency_conflict', message: error.message, existingRequestId: error.requestId, ...identity() },
+        return fail(
+          'idempotency_conflict',
+          'queue',
+          'This idempotency key was already used for different input.',
           409,
           identityHeaders,
+          { existingRequestId: error.requestId },
         )
       }
       if (error instanceof WorkflowRunResolutionError) {
-        return json(
-          { error: 'workflow_not_resumable', reason: error.reason, message: error.message, ...identity() },
+        return fail(
+          'workflow_not_resumable',
+          'workflow',
+          'The saved workflow cannot be resumed safely. Start a new request.',
           409,
           identityHeaders,
+          { reason: error.reason },
         )
       }
-      console.error(`[req ${context.requestId}] [trace ${context.traceId}] enqueue failed: ${errorMessage(error)}`)
-      return json(
-        { error: 'internal_error', message: errorMessage(error), ...identity() },
+      logRequestError(context, 'request_enqueue_failed', error)
+      return fail(
+        stableErrorCode(error),
+        stableErrorStage(error),
+        publicErrorMessage(error),
         500,
-        identityHeaders,
       )
     }
   }
@@ -329,7 +410,15 @@ async function handle(request: Request): Promise<Response> {
   if (requestMatch && request.method === 'GET') {
     const requestId = decodeURIComponent(requestMatch[1] ?? '')
     const record = requests.find(requestId)
-    if (!record) return json({ error: 'request_not_found' }, 404)
+    if (!record) {
+      return genericErrorResponse(
+        request,
+        'request_not_found',
+        'validation',
+        'The requested operation was not found.',
+        404,
+      )
+    }
     const session = sessions.load(record.sessionId)?.session
     const steps = workflowSteps.findByRequestId(requestId)
     const sceneBuild = sceneBuilds.findByRequestId(requestId)
@@ -373,13 +462,27 @@ async function handle(request: Request): Promise<Response> {
   if (sessionMatch && request.method === 'DELETE') {
     const sessionId = decodeURIComponent(sessionMatch[1] ?? '')
     if (requests.hasActiveRequest(sessionId)) {
-      return json({ deleted: false, error: 'session_busy' }, 409)
+      return genericErrorResponse(
+        request,
+        'session_busy',
+        'workflow',
+        'The session has an active request and cannot be deleted yet.',
+        409,
+        { deleted: false },
+      )
     }
+    const existed = sessions.load(sessionId) !== undefined
     const deleted = agent.deleteSession(sessionId)
+    if (deleted || !existed) {
+      const artifactCleanup = requestPayloads.deleteSessionImages(sessionId)
+      if (artifactCleanup.failed > 0) {
+        console.error(`session ${sessionId} artifact cleanup pending=${artifactCleanup.failed}`)
+      }
+    }
     return json({ deleted })
   }
 
-  return json({ error: 'not_found' }, 404)
+  return genericErrorResponse(request, 'not_found', 'validation', 'The endpoint was not found.', 404)
 }
 
 console.log(`pascal-ai-mcp listening on http://${server.hostname}:${server.port}`)
@@ -474,6 +577,36 @@ function corsHeaders(): Record<string, string> {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function logRequestError(
+  identity: ErrorIdentity,
+  event: string,
+  error: unknown,
+): void {
+  console.error(JSON.stringify({
+    level: 'error',
+    event,
+    requestId: identity.requestId,
+    traceId: identity.traceId,
+    ...safeErrorLogFields(error),
+  }))
+}
+
+function genericErrorResponse(
+  request: Request,
+  errorCode: string,
+  stage: ErrorStage,
+  message: string,
+  status: number,
+  extra: Record<string, unknown> = {},
+): Response {
+  const context = createRequestContext(request.headers)
+  return json(
+    publicErrorEnvelope(context, errorCode, stage, message, extra),
+    status,
+    { 'x-request-id': context.requestId, 'x-trace-id': context.traceId },
+  )
 }
 
 function isValidIdempotencyKey(value: unknown): value is string {
