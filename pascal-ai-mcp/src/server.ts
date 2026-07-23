@@ -31,7 +31,10 @@ import { SceneBuildRepository } from './persistence/scene-build-repository'
 import { SqliteCheckpointSaver } from './persistence/sqlite-checkpoint-saver'
 import { AiAuditRepository } from './persistence/audit-repository'
 import { ArtifactRepository } from './persistence/artifact-repository'
+import { SceneSpaceRepository } from './persistence/scene-space-repository'
 import { WORKFLOW_GRAPH_VERSION } from './workflow-identity'
+import { createLangGraphWorkflowRuntimeFactory } from './adapters/workflow/langgraph-workflow-runtime'
+import { createOpenAiModelClients } from './adapters/model/openai-model-clients'
 
 const config = loadConfig()
 const database = new AppDatabase(config.databaseFile)
@@ -54,6 +57,7 @@ const workflowSteps = new WorkflowStepRepository(database)
 const sceneBuilds = new SceneBuildRepository(database)
 const audits = new AiAuditRepository(database)
 const artifacts = new ArtifactRepository(database)
+const sceneSpaces = new SceneSpaceRepository(database)
 const templateLibrary = loadTemplateLibrary(config.templatesDir)
 const templatesAcceptTraffic = templateLibraryAllowsTraffic(templateLibrary.health)
 const templateHealthSummary = {
@@ -86,6 +90,9 @@ const agent = new PascalAiAgent(
   sceneBuilds,
   checkpointSaver,
   audits,
+  sceneSpaces,
+  createLangGraphWorkflowRuntimeFactory(checkpointSaver),
+  createOpenAiModelClients(config),
 )
 const requestPayloads = new RequestPayloadStore(
   config.requestArtifactsDir,

@@ -290,6 +290,11 @@ export async function executeLayoutPlan(options: {
   // Injected from the agent: the collinear-overlap wall dedupe that must run
   // between room creation and opening placement.
   dedupeSharedWalls: () => Promise<void>
+  onRoomCreated?: (room: {
+    planRoom: LayoutPlanRoom
+    zoneId: string
+    sceneVersion?: number
+  }) => Promise<void> | void
   // Cancellation check, run before every MCP attempt; whatever it throws
   // propagates out of executeLayoutPlan unswallowed.
   beforeCall?: () => void
@@ -307,7 +312,20 @@ export async function executeLayoutPlan(options: {
   for (const room of plan.rooms) {
     const payload = await call('create_room', { levelId, name: room.name, polygon: room.polygon }, `创建房间「${room.name}」`)
     const zoneId = typeof payload?.zoneId === 'string' ? payload.zoneId : null
-    if (zoneId) zoneIdByRoom.set(room.id, zoneId)
+    if (zoneId) {
+      zoneIdByRoom.set(room.id, zoneId)
+      try {
+        await options.onRoomCreated?.({
+          planRoom: room,
+          zoneId,
+          ...(typeof payload?.version === 'number' && Number.isInteger(payload.version)
+            ? { sceneVersion: payload.version }
+            : {}),
+        })
+      } catch {
+        issues.push(`房间「${room.name}」已建成，但空间用途投影写入失败`)
+      }
+    }
     rooms.push({
       planRoomId: room.id,
       name: room.name,

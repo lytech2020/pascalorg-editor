@@ -48,14 +48,15 @@ describe('private request artifacts (T1.6)', () => {
     try {
       const artifacts = new ArtifactRepository(database)
       const payloads = new RequestPayloadStore(join(dir, 'files'), artifacts, DAY_MS)
+      const now = new Date()
       const artifactId = payloads.persistImage(IMAGE, {
-        requestId: 'req-1', sessionId: 's1', now: new Date('2026-07-22T00:00:00.000Z'),
+        requestId: 'req-1', sessionId: 's1', now,
       })
       const record = artifacts.find(artifactId)!
       expect(record).toMatchObject({
         requestId: 'req-1', sessionId: 's1', mimeType: 'image/png',
         sizeBytes: 8, status: 'active', deleteAttempts: 0,
-        expiresAt: '2026-07-23T00:00:00.000Z',
+        expiresAt: new Date(now.getTime() + DAY_MS).toISOString(),
       })
       expect(record.sha256).toMatch(/^[0-9a-f]{64}$/)
       expect(payloads.loadImage(artifactId)).toBe(IMAGE)

@@ -15,9 +15,8 @@ import {
   CIRCULATION_RATIO_HARD,
   CIRCULATION_RATIO_SOFT,
   polygonAspectRatio,
-  type RoomKind,
 } from './layout-metrics'
-import { isDiningKitchenName } from './lang/room-vocab'
+import { areaBoundFor, TYPE_TO_KIND } from './domain/policy/room-policy'
 import { DEFAULT_NORM_PROFILE, type NormProfile } from './norms/profile'
 import {
   kitchenIsCirculation,
@@ -61,48 +60,7 @@ const TOTAL_AREA_TOLERANCE = 0.1
 const OVERLAP_AREA_TOLERANCE_SQM = 0.02
 const EDGE_EPSILON = 0.02
 
-// Maps LayoutPlan room types onto layout-metrics band kinds. `dining` maps
-// to `other` (no band) on purpose: an 8㎡ dining room is normal but sits
-// below the `living` band's minimum, and dual-counting it as a living room
-// would spam warnings. Exported for modify-ops' resize clamping — the same
-// bands must judge a resize request and the resulting plan.
-export const TYPE_TO_KIND: Record<RoomType, RoomKind> = {
-  bedroom: 'bedroom',
-  bathroom: 'bathroom',
-  kitchen: 'kitchen',
-  living: 'living',
-  living_kitchen: 'living',
-  dining: 'other',
-  hallway: 'circulation',
-  entry: 'circulation',
-  study: 'other',
-  storage: 'other',
-  balcony: 'other',
-  other: 'other',
-}
-
-// 按房型+名称选择面积档位（TEMPLATES.md #5）：DK 名的 living_kitchen 走
-// profile 的 DK 档，其余按 TYPE_TO_KIND 查常规档位表。validator #7、
-// modify-ops 的 add/resize 判定、strategy 的 fatal 界夹取三处共用——同一个
-// 房间必须在三处得到同一个档位，否则 validator 放行的 DK 会被 modify 拒绝
-// 或被 strategy 夹到 LDK 下限。
-export function areaBoundFor(
-  profile: NormProfile,
-  context: Parameters<NormProfile['roomAreaBounds']>[0],
-  type: RoomType,
-  name: string,
-  // Plan/intent carries a standalone kitchen — a bare `living` room is then
-  // an LD (客餐分离) and takes the LD tier instead of the LDK ladder.
-  hasStandaloneKitchen = false,
-): ReturnType<NormProfile['roomAreaBounds']>[RoomKind] {
-  if (type === 'living_kitchen' && profile.dkAreaBounds && isDiningKitchenName(name)) {
-    return profile.dkAreaBounds(context)
-  }
-  if (type === 'living' && hasStandaloneKitchen && profile.ldAreaBounds) {
-    return profile.ldAreaBounds(context)
-  }
-  return profile.roomAreaBounds(context)[TYPE_TO_KIND[type]]
-}
+export { areaBoundFor, TYPE_TO_KIND } from './domain/policy/room-policy'
 
 const PUBLIC_TYPES: ReadonlySet<RoomType> = new Set([
   'living', 'living_kitchen', 'dining', 'hallway', 'entry',

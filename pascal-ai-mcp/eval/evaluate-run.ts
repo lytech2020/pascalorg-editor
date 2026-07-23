@@ -61,6 +61,20 @@ export function zoneNameMatchesType(type: string, zoneName: string): boolean {
 export function countZonesOfType(type: string, zoneNames: string[]): number {
   const target = TYPE_KEY_TO_ROOM_TYPE[type]
   if (!target) return 0
+  if (target === 'bathroom') {
+    let generic = 0
+    const components = { toilet: 0, bath: 0, wash: 0 }
+    for (const name of zoneNames) {
+      if (classifyRoomTypeByName(name) !== 'bathroom') continue
+      const hits = new Set<keyof typeof components>()
+      if (/トイレ|便所|厕所|廁所|\b(?:toilet|wc)\b/i.test(name)) hits.add('toilet')
+      if (/風呂|浴室|浴槽|バスルーム|\bbath\b/i.test(name)) hits.add('bath')
+      if (/洗面|脱衣|\b(?:washroom|powder(?: room)?)\b/i.test(name)) hits.add('wash')
+      if (hits.size === 0) generic++
+      else for (const component of hits) components[component]++
+    }
+    return generic + Math.max(components.toilet, components.bath, components.wash)
+  }
   const direct = zoneNames.filter(name => classifyRoomTypeByName(name) === target).length
   if (direct > 0) return direct
   return zoneNames.filter(name => zoneNameMatchesType(type, name)).length

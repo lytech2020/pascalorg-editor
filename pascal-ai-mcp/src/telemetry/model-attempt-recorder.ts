@@ -1,4 +1,4 @@
-import type { ModelAttemptResult } from '../openai-compatible'
+import type { ModelAttemptResult } from '../ports/model-client'
 import type { ModelCallRecord, ModelCallWriter } from '../persistence/model-call-repository'
 import type { RequestContext } from '../request-context'
 

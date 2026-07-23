@@ -98,7 +98,7 @@ describe('attempt telemetry (T1.1)', () => {
         },
       })) as typeof fetch
 
-    const attempts: import('./openai-compatible').ModelAttemptResult[] = []
+    const attempts: import('./ports/model-client').ModelAttemptResult[] = []
     const result = await makeClient().complete([{ role: 'user', content: 'hi' }], 's1', {
       onAttemptFinished: attempt => attempts.push(attempt),
     })
@@ -129,7 +129,7 @@ describe('attempt telemetry (T1.1)', () => {
     globalThis.fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) =>
       Response.json({ choices: [{ message: { role: 'assistant', content: 'ok' } }] })) as typeof fetch
 
-    const attempts: import('./openai-compatible').ModelAttemptResult[] = []
+    const attempts: import('./ports/model-client').ModelAttemptResult[] = []
     const result = await makeClient().complete([{ role: 'user', content: 'hi' }], 's1', {
       onAttemptFinished: attempt => attempts.push(attempt),
     })
@@ -151,7 +151,7 @@ describe('attempt telemetry (T1.1)', () => {
       return Response.json({ choices: [{ message: { role: 'assistant', content: 'ok' } }] })
     }) as typeof fetch
 
-    const attempts: import('./openai-compatible').ModelAttemptResult[] = []
+    const attempts: import('./ports/model-client').ModelAttemptResult[] = []
     await makeClient().complete([{ role: 'user', content: 'hi' }], 's1', {
       onAttemptFinished: attempt => attempts.push(attempt),
     })
@@ -167,7 +167,7 @@ describe('attempt telemetry (T1.1)', () => {
       throw new Error('connect ECONNREFUSED')
     }) as unknown as typeof fetch
 
-    const attempts: import('./openai-compatible').ModelAttemptResult[] = []
+    const attempts: import('./ports/model-client').ModelAttemptResult[] = []
     await expect(
       makeClient().complete([{ role: 'user', content: 'hi' }], 's1', {
         onAttemptFinished: attempt => attempts.push(attempt),
@@ -193,7 +193,7 @@ describe('attempt telemetry (T1.1)', () => {
       })
     }) as unknown as typeof fetch
 
-    const attempts: import('./openai-compatible').ModelAttemptResult[] = []
+    const attempts: import('./ports/model-client').ModelAttemptResult[] = []
     const pending = makeClient().complete([{ role: 'user', content: 'hi' }], 's1', {
       signal: controller.signal,
       onAttemptFinished: attempt => attempts.push(attempt),
@@ -214,7 +214,7 @@ describe('attempt telemetry (T1.1)', () => {
       return Response.json({ choices: [{ message: { role: 'assistant', content: 'ok' } }] })
     }) as typeof fetch
 
-    const attempts: import('./openai-compatible').ModelAttemptResult[] = []
+    const attempts: import('./ports/model-client').ModelAttemptResult[] = []
     await expect(
       makeClient().complete([{ role: 'user', content: 'hi' }], 's1', {
         onAttemptStarted: () => {
@@ -233,7 +233,7 @@ describe('attempt telemetry (T1.1)', () => {
     globalThis.fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) =>
       new Response('<html>gateway soup</html>', { status: 200 })) as typeof fetch
 
-    const attempts: import('./openai-compatible').ModelAttemptResult[] = []
+    const attempts: import('./ports/model-client').ModelAttemptResult[] = []
     await expect(
       makeClient().complete([{ role: 'user', content: 'hi' }], 's1', {
         onAttemptFinished: attempt => attempts.push(attempt),
@@ -271,11 +271,11 @@ describe('attempt telemetry (T1.1)', () => {
     globalThis.fetch = (async (_input: RequestInfo | URL, _init?: RequestInit) =>
       Response.json({ choices: [{ message: { role: 'assistant', content: 'ok' } }] })) as typeof fetch
 
-    const attempts: import('./openai-compatible').ModelAttemptResult[] = []
+    const attempts: import('./ports/model-client').ModelAttemptResult[] = []
     const client = makeClient()
     const hooks = {
       operation: 'extract',
-      onAttemptFinished: (a: import('./openai-compatible').ModelAttemptResult) => attempts.push(a),
+      onAttemptFinished: (a: import('./ports/model-client').ModelAttemptResult) => attempts.push(a),
     }
     await client.complete([{ role: 'user', content: 'hi' }], 'sess-1:extract:0', hooks)
     await client.complete([{ role: 'user', content: 'hi' }], 'sess-1:extract:1', hooks)
@@ -311,7 +311,7 @@ describe('attempt telemetry (T1.1)', () => {
   test('cancel during a 2xx body read records one cancelled attempt', async () => {
     const controller = new AbortController()
     globalThis.fetch = hangingBodyFetch(200)
-    const attempts: import('./openai-compatible').ModelAttemptResult[] = []
+    const attempts: import('./ports/model-client').ModelAttemptResult[] = []
     const pending = makeClient().complete([{ role: 'user', content: 'hi' }], 's1', {
       signal: controller.signal,
       onAttemptFinished: attempt => attempts.push(attempt),
@@ -328,7 +328,7 @@ describe('attempt telemetry (T1.1)', () => {
   test('cancel during an error-body read records one cancelled attempt', async () => {
     const controller = new AbortController()
     globalThis.fetch = hangingBodyFetch(500)
-    const attempts: import('./openai-compatible').ModelAttemptResult[] = []
+    const attempts: import('./ports/model-client').ModelAttemptResult[] = []
     const pending = makeClient().complete([{ role: 'user', content: 'hi' }], 's1', {
       signal: controller.signal,
       onAttemptFinished: attempt => attempts.push(attempt),
@@ -360,7 +360,7 @@ describe('attempt telemetry (T1.1)', () => {
         new Response(JSON.stringify({
           error: { code: status === 400 ? 'invalid_request' : 'upstream_failure', message: secret },
         }), { status, statusText: secret })) as typeof fetch
-      const attempts: import('./openai-compatible').ModelAttemptResult[] = []
+      const attempts: import('./ports/model-client').ModelAttemptResult[] = []
       let thrown: unknown
       try {
         await makeClient().complete([{ role: 'user', content: secret }], 's1', {

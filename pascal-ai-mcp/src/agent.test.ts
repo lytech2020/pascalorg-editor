@@ -3,10 +3,8 @@ import {
   bedroomCountFromBriefText,
   clearLevelChildren,
   briefFactsFor,
-  effectiveGateFailures,
   ensureSiteDimensionFact,
   buildOpeningRepairData,
-  describeRemainingIssues,
   sceneDriftedFromPlan,
   formatUserFacingSummary,
   buildPlanTargets,
@@ -21,11 +19,8 @@ import {
   requestsStructurePreservation,
   formatSummary,
   mergeBrief,
-  modifyFailureRecovery,
-  planIngestAction,
   publicEditorUrl,
   shouldModifyExistingScene,
-  shouldRouteAsExistingSceneRequest,
   staleSessionRecovery,
   structuralDrift,
   windowRoomTypesFromBrief,
@@ -35,6 +30,9 @@ import {
   type WallWithOpenings,
   type ZoneSummary,
 } from './agent'
+import { planIngestAction, shouldRouteAsExistingSceneRequest } from './application/ingest-service'
+import { effectiveGateFailures, modifyFailureRecovery } from './application/modify-service'
+import { describeRemainingIssues } from './application/generate-service'
 import { requirementLabelsSatisfiedBy } from './furniture-checklist'
 import type { ChatInput, DesignBrief, RequirementFact, WorkflowSession } from './types'
 
@@ -1070,6 +1068,12 @@ describe('bedroomCountFromBriefText（case-04：无数字 bedroom_count 时的�
   test('buildPlanTargets 在缺数字事实时用兜底解析出卧室要求', () => {
     const targets = buildPlanTargets(goal('房间构成', '三室两厅两卫') as never)
     expect(targets.requiredRooms).toContainEqual({ type: 'bedroom', count: 3 })
+  })
+
+  test('buildPlanTargets 读取 extraction prompt 约定的 total_area 稳定键', () => {
+    const input = goal('房间构成', '2LDK') as DesignBrief
+    input.designGoals.push(fact('total_area', '总面积', 55))
+    expect(buildPlanTargets(input).totalAreaSqm).toBe(55)
   })
 })
 

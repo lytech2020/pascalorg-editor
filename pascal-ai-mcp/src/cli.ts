@@ -11,7 +11,10 @@ import { WorkflowStepRepository } from './persistence/workflow-step-repository'
 import { SceneBuildRepository } from './persistence/scene-build-repository'
 import { SqliteCheckpointSaver } from './persistence/sqlite-checkpoint-saver'
 import { AiAuditRepository } from './persistence/audit-repository'
+import { SceneSpaceRepository } from './persistence/scene-space-repository'
 import { WORKFLOW_GRAPH_VERSION } from './workflow-identity'
+import { createLangGraphWorkflowRuntimeFactory } from './adapters/workflow/langgraph-workflow-runtime'
+import { createOpenAiModelClients } from './adapters/model/openai-model-clients'
 
 const config = loadConfig()
 const database = new AppDatabase(config.databaseFile)
@@ -22,6 +25,7 @@ const requests = new ChatRequestRepository(database)
 const workflowSteps = new WorkflowStepRepository(database)
 const sceneBuilds = new SceneBuildRepository(database)
 const audits = new AiAuditRepository(database)
+const sceneSpaces = new SceneSpaceRepository(database)
 const checkpointSaver = new SqliteCheckpointSaver(database, {
   graphVersion: WORKFLOW_GRAPH_VERSION,
   ttlMs: config.workflowCheckpointTtlMs,
@@ -39,6 +43,9 @@ const agent = new PascalAiAgent(
   sceneBuilds,
   checkpointSaver,
   audits,
+  sceneSpaces,
+  createLangGraphWorkflowRuntimeFactory(checkpointSaver),
+  createOpenAiModelClients(config),
 )
 const sessionId = process.env.AI_MCP_CLI_SESSION || 'cli'
 const rl = createInterface({ input, output })

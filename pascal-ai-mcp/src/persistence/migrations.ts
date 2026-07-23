@@ -416,6 +416,109 @@ export const MIGRATIONS: readonly Migration[] = [
         ON ai_artifacts(status, expires_at, created_at);
     `,
   },
+  {
+    version: 10,
+    name: 'add_scope_guardrail_audit',
+    up: `
+      CREATE TABLE ai_guardrail_events (
+        event_id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL REFERENCES ai_requests(request_id),
+        workflow_run_id TEXT,
+        session_id TEXT NOT NULL,
+        policy_version TEXT NOT NULL,
+        decision TEXT NOT NULL CHECK (decision IN ('allow', 'block', 'defer')),
+        reason_code TEXT NOT NULL CHECK (reason_code IN (
+          'image_context', 'architecture_context', 'explicit_weather', 'uncertain'
+        )),
+        input_kind TEXT NOT NULL CHECK (input_kind IN ('text', 'image')),
+        latency_ms INTEGER NOT NULL CHECK (latency_ms >= 0),
+        created_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE INDEX ai_guardrail_events_request_created_idx
+        ON ai_guardrail_events(request_id, created_at);
+      CREATE INDEX ai_guardrail_events_policy_decision_idx
+        ON ai_guardrail_events(policy_version, decision, reason_code, created_at);
+    `,
+  },
+  {
+    version: 11,
+    name: 'add_ai_scene_space_semantics',
+    up: `
+      CREATE TABLE ai_scene_spaces (
+        scene_id TEXT NOT NULL,
+        zone_id TEXT NOT NULL,
+        usage TEXT NOT NULL CHECK (length(usage) BETWEEN 1 AND 64),
+        category TEXT NOT NULL CHECK (category IN (
+          'indoor_room', 'service', 'circulation', 'outdoor', 'unknown'
+        )),
+        source TEXT NOT NULL CHECK (source IN (
+          'layout_plan', 'template', 'legacy_session_cache',
+          'legacy_name_inference', 'manual'
+        )),
+        confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+        template_id TEXT,
+        plan_room_id TEXT,
+        plan_version TEXT,
+        scene_version INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (scene_id, zone_id)
+      ) STRICT;
+
+      CREATE INDEX ai_scene_spaces_scene_usage_idx
+        ON ai_scene_spaces(scene_id, usage);
+      CREATE INDEX ai_scene_spaces_plan_room_idx
+        ON ai_scene_spaces(scene_id, plan_room_id)
+        WHERE plan_room_id IS NOT NULL;
+    `,
+  },
+  {
+    version: 12,
+    name: 'add_template_match_audit',
+    up: `
+      CREATE TABLE ai_template_decisions (
+        decision_id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL REFERENCES ai_requests(request_id),
+        workflow_run_id TEXT,
+        session_id TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK (mode IN ('direct', 'after_enrichment', 'fallback')),
+        market TEXT NOT NULL,
+        room_program TEXT,
+        target_area_sqm REAL,
+        area_band TEXT NOT NULL CHECK (area_band IN ('unknown', 'under_30', '30_49', '50_69', '70_plus')),
+        selected_template_id TEXT,
+        created_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE ai_template_candidates (
+        decision_id TEXT NOT NULL REFERENCES ai_template_decisions(decision_id),
+        template_id TEXT NOT NULL,
+        candidate_rank INTEGER NOT NULL CHECK (candidate_rank >= 0),
+        area_ratio REAL NOT NULL CHECK (area_ratio > 0),
+        relaxed_typology INTEGER NOT NULL CHECK (relaxed_typology IN (0, 1)),
+        selected INTEGER NOT NULL CHECK (selected IN (0, 1)),
+        PRIMARY KEY (decision_id, template_id)
+      ) STRICT;
+
+      CREATE TABLE ai_template_rejections (
+        decision_id TEXT NOT NULL REFERENCES ai_template_decisions(decision_id),
+        template_id TEXT NOT NULL,
+        reason_code TEXT NOT NULL,
+        PRIMARY KEY (decision_id, template_id, reason_code)
+      ) STRICT;
+
+      CREATE INDEX ai_template_decisions_request_created_idx
+        ON ai_template_decisions(request_id, created_at);
+      CREATE INDEX ai_template_decisions_grouping_idx
+        ON ai_template_decisions(market, room_program, area_band, mode);
+      CREATE INDEX ai_template_decisions_selected_idx
+        ON ai_template_decisions(selected_template_id, mode)
+        WHERE selected_template_id IS NOT NULL;
+      CREATE INDEX ai_template_rejections_reason_idx
+        ON ai_template_rejections(reason_code, template_id);
+    `,
+  },
 ]
 
 export function runMigrations(database: Database): void {

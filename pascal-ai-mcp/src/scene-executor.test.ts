@@ -71,7 +71,7 @@ function makeMockMcp(options: {
         counter++
         const zoneId = `zone-${counter}`
         zonePolygons.set(zoneId, args.polygon as Array<[number, number]>)
-        return wrap({ zoneId, slabId: `slab-${counter}`, ceilingId: `ceil-${counter}`, wallIds: [], areaSqMeters: 0 })
+        return wrap({ zoneId, version: counter, slabId: `slab-${counter}`, ceilingId: `ceil-${counter}`, wallIds: [], areaSqMeters: 0 })
       }
       case 'get_walls':
         return wrap({ walls: options.walls ?? twoRoomWalls })
@@ -113,6 +113,7 @@ describe('executeLayoutPlan', () => {
   test('builds rooms, dedupes, then places connection door / entry door / windows with zero issues', async () => {
     const { callMcp, calls } = makeMockMcp()
     let dedupeCalls = 0
+    const projected: Array<{ planRoomId: string; zoneId: string; sceneVersion?: number }> = []
     const report = await executeLayoutPlan({
       plan: twoRoomPlan,
       levelId: 'level-1',
@@ -123,11 +124,22 @@ describe('executeLayoutPlan', () => {
         expect(callsNamed(calls, 'create_room')).toHaveLength(2)
         expect(callsNamed(calls, 'get_walls')).toHaveLength(0)
       },
+      onRoomCreated: room => {
+        projected.push({
+          planRoomId: room.planRoom.id,
+          zoneId: room.zoneId,
+          ...(room.sceneVersion !== undefined ? { sceneVersion: room.sceneVersion } : {}),
+        })
+      },
     })
 
     expect(report.executionIssues).toEqual([])
     expect(dedupeCalls).toBe(1)
     expect(report.rooms.map(r => r.zoneId)).toEqual(['zone-1', 'zone-2'])
+    expect(projected).toEqual([
+      { planRoomId: 'living-1', zoneId: 'zone-1', sceneVersion: 1 },
+      { planRoomId: 'bedroom-1', zoneId: 'zone-2', sceneVersion: 2 },
+    ])
 
     const doors = callsNamed(calls, 'add_door')
     expect(doors).toHaveLength(2)

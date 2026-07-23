@@ -40,6 +40,41 @@ export type ValidationAudit = AuditIdentity & {
   createdAt: string
 }
 
+export type GuardrailAudit = {
+  eventId: string
+  requestId: string
+  workflowRunId?: string
+  sessionId: string
+  policyVersion: string
+  decision: 'allow' | 'block' | 'defer'
+  reasonCode: 'image_context' | 'architecture_context' | 'explicit_weather' | 'uncertain'
+  inputKind: 'text' | 'image'
+  latencyMs: number
+  createdAt: string
+}
+
+export type TemplateMatchAudit = {
+  decisionId: string
+  requestId: string
+  workflowRunId?: string
+  sessionId: string
+  mode: 'direct' | 'after_enrichment' | 'fallback'
+  market: string
+  roomProgram?: string
+  targetAreaSqm?: number
+  selectedTemplateId?: string
+  candidates: Array<{
+    templateId: string
+    areaRatio: number
+    relaxedTypology: boolean
+  }>
+  rejections: Array<{
+    templateId: string
+    reasonCodes: string[]
+  }>
+  createdAt: string
+}
+
 export interface AiAuditWriter {
   startToolCall(record: ToolCallAuditStart): void
   finishToolCall(
@@ -52,6 +87,8 @@ export interface AiAuditWriter {
   ): boolean
   recordSceneChange(record: SceneChangeAudit): void
   recordValidation(record: ValidationAudit): void
+  recordGuardrail(record: GuardrailAudit): void
+  recordTemplateMatch(record: TemplateMatchAudit): void
 }
 
 export class AiAuditRepository implements AiAuditWriter {
@@ -62,6 +99,12 @@ export class AiAuditRepository implements AiAuditWriter {
   private readonly toolsByRequestStatement
   private readonly changesByRequestStatement
   private readonly validationsByRequestStatement
+  private readonly insertGuardrailStatement
+  private readonly guardrailsByRequestStatement
+  private readonly insertTemplateDecisionStatement
+  private readonly insertTemplateCandidateStatement
+  private readonly insertTemplateRejectionStatement
+  private readonly templateDecisionsByRequestStatement
 
   constructor(private readonly database: AppDatabase) {
     this.startToolStatement = database.connection.prepare(`
@@ -99,6 +142,34 @@ export class AiAuditRepository implements AiAuditWriter {
     `)
     this.validationsByRequestStatement = database.connection.prepare(`
       SELECT * FROM ai_validation_results WHERE request_id = ? ORDER BY rowid
+    `)
+    this.insertGuardrailStatement = database.connection.prepare(`
+      INSERT INTO ai_guardrail_events (
+        event_id, request_id, workflow_run_id, session_id, policy_version,
+        decision, reason_code, input_kind, latency_ms, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    this.guardrailsByRequestStatement = database.connection.prepare(`
+      SELECT * FROM ai_guardrail_events WHERE request_id = ? ORDER BY rowid
+    `)
+    this.insertTemplateDecisionStatement = database.connection.prepare(`
+      INSERT INTO ai_template_decisions (
+        decision_id, request_id, workflow_run_id, session_id, mode, market,
+        room_program, target_area_sqm, area_band, selected_template_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    this.insertTemplateCandidateStatement = database.connection.prepare(`
+      INSERT INTO ai_template_candidates (
+        decision_id, template_id, candidate_rank, area_ratio,
+        relaxed_typology, selected
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `)
+    this.insertTemplateRejectionStatement = database.connection.prepare(`
+      INSERT INTO ai_template_rejections (decision_id, template_id, reason_code)
+      VALUES (?, ?, ?)
+    `)
+    this.templateDecisionsByRequestStatement = database.connection.prepare(`
+      SELECT * FROM ai_template_decisions WHERE request_id = ? ORDER BY rowid
     `)
   }
 
@@ -173,6 +244,59 @@ export class AiAuditRepository implements AiAuditWriter {
     )
   }
 
+  recordGuardrail(record: GuardrailAudit): void {
+    this.insertGuardrailStatement.run(
+      record.eventId,
+      record.requestId,
+      record.workflowRunId ?? null,
+      record.sessionId,
+      record.policyVersion,
+      record.decision,
+      record.reasonCode,
+      record.inputKind,
+      Math.max(0, Math.round(record.latencyMs)),
+      record.createdAt,
+    )
+  }
+
+  recordTemplateMatch(record: TemplateMatchAudit): void {
+    this.database.transaction(() => {
+      this.insertTemplateDecisionStatement.run(
+        record.decisionId,
+        record.requestId,
+        record.workflowRunId ?? null,
+        record.sessionId,
+        record.mode,
+        record.market,
+        record.roomProgram ?? null,
+        record.targetAreaSqm ?? null,
+        templateAreaBand(record.targetAreaSqm),
+        record.selectedTemplateId ?? null,
+        record.createdAt,
+      )
+      for (let index = 0; index < record.candidates.length; index++) {
+        const candidate = record.candidates[index]!
+        this.insertTemplateCandidateStatement.run(
+          record.decisionId,
+          candidate.templateId,
+          index,
+          candidate.areaRatio,
+          candidate.relaxedTypology ? 1 : 0,
+          candidate.templateId === record.selectedTemplateId ? 1 : 0,
+        )
+      }
+      for (const rejection of record.rejections) {
+        for (const reasonCode of rejection.reasonCodes) {
+          this.insertTemplateRejectionStatement.run(
+            record.decisionId,
+            rejection.templateId,
+            reasonCode,
+          )
+        }
+      }
+    })
+  }
+
   findToolCallsByRequest(requestId: string): Array<Record<string, unknown>> {
     return this.toolsByRequestStatement.all(requestId) as Array<Record<string, unknown>>
   }
@@ -184,4 +308,20 @@ export class AiAuditRepository implements AiAuditWriter {
   findValidationsByRequest(requestId: string): Array<Record<string, unknown>> {
     return this.validationsByRequestStatement.all(requestId) as Array<Record<string, unknown>>
   }
+
+  findGuardrailsByRequest(requestId: string): Array<Record<string, unknown>> {
+    return this.guardrailsByRequestStatement.all(requestId) as Array<Record<string, unknown>>
+  }
+
+  findTemplateDecisionsByRequest(requestId: string): Array<Record<string, unknown>> {
+    return this.templateDecisionsByRequestStatement.all(requestId) as Array<Record<string, unknown>>
+  }
+}
+
+function templateAreaBand(area: number | undefined): string {
+  if (area === undefined) return 'unknown'
+  if (area < 30) return 'under_30'
+  if (area < 50) return '30_49'
+  if (area < 70) return '50_69'
+  return '70_plus'
 }

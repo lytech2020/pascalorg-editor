@@ -11,7 +11,6 @@ import {
   roomNamePattern,
   WINDOW_PATTERN,
 } from './lang/room-vocab'
-import { requirementLabelsSatisfiedBy } from './furniture-checklist'
 import { executeFurniturePlan, type FurnitureRoom } from './furniture-executor'
 import {
   executeFurnitureModifyOps,
@@ -25,14 +24,61 @@ import { applyModifyOps, parseModifyOps, resolveRoomRef, type FurnitureModifyOp 
 import { computeLayoutQuality } from './layout-metrics'
 import { kitchenIsCirculation } from './layout-plan'
 import type { IssueL10n, LayoutIntent, LayoutPlan, RoomType } from './layout-plan'
-import { PascalMcpClient } from './mcp'
-import { OpenAiCompatibleClient, type RequestHooks } from './openai-compatible'
 import { buildLayoutPlan, type PlanBuildResult } from './plan-builder'
 import { validateLayoutPlan, type PlanTargets } from './plan-validator'
 import { executeLayoutPlan, toolPayload, type McpCaller, type SceneExecutionReport } from './scene-executor'
+import { classifyScopeRequest, SCOPE_POLICY_VERSION } from './domain/guardrail/scope-policy'
+import { directTemplateEligibility } from './domain/policy/direct-template-policy'
+import {
+  findDoorlessRooms,
+  findIsolatedBedrooms,
+  findStrayWindows,
+  type WallWithOpenings,
+  type ZoneSummary,
+} from './domain/circulation'
+import {
+  checkAreaRequirements,
+  computeZoneAreaStats,
+  FLOOR_AREA_FACT_KEYS,
+  pointInPolygon,
+  polygonArea,
+  round1,
+  type MismatchFinding,
+} from './domain/area-validation'
+import {
+  collinearOverlap,
+  MIN_MEANINGFUL_OVERLAP_M,
+  orientationToSegment,
+  segmentOrientation,
+} from './domain/geometry/wall-segments'
+import type { SceneSpaceStore } from './ports/scene-space-store'
+import type { SceneGateway } from './ports/scene-gateway'
+import type { ModelClient, ModelClients, RequestHooks } from './ports/model-client'
+import { planIngestAction } from './application/ingest-service'
+import { SceneSpaceService } from './application/scene-space-service'
+import { inspectExistingScene, planExistingSceneRequest } from './application/existing-scene-service'
+import {
+  effectiveGateFailures,
+  modifyFailureRecovery,
+  runModifyWorkflow,
+  type IntentRemoval,
+} from './application/modify-service'
+import {
+  buildCompletionReply,
+  countAllIssues,
+  countDiagnosticIssues,
+  describeRemainingIssues,
+  finishSceneWorkflow,
+  publicEditorUrl,
+  runGenerateWorkflow,
+} from './application/generate-service'
 
 // Re-exported for eval/run-eval.ts, which historically imported it from here.
 export { toolPayload }
+export { publicEditorUrl }
+export { findIsolatedBedrooms }
+export { checkAreaRequirements, computeZoneAreaStats }
+export type { WallWithOpenings, ZoneSummary }
 import { createRequestContext, type RequestContext } from './request-context'
 import type {
   ChatRequestWriter,
@@ -44,10 +90,7 @@ import type { WorkflowStepWriter } from './persistence/workflow-step-repository'
 import type { WorkflowStepRecord } from './persistence/workflow-step-repository'
 import type { SceneBoundary, SceneBuildWriter } from './persistence/scene-build-repository'
 import type { AiAuditWriter, AuditIdentity } from './persistence/audit-repository'
-import {
-  CheckpointGraphVersionMismatchError,
-  type SqliteCheckpointSaver,
-} from './persistence/sqlite-checkpoint-saver'
+import { CheckpointGraphVersionMismatchError } from './persistence/sqlite-checkpoint-saver'
 import type { ModelAttemptSink } from './telemetry/model-attempt-recorder'
 import { AiOperationAuditor } from './telemetry/ai-operation-audit'
 import type {
@@ -61,7 +104,6 @@ import type {
   InformationSource,
   PhaseToolTrace,
   RequirementFact,
-  SceneResult,
   ToolCall,
   WorkflowSession,
 } from './types'
@@ -70,7 +112,11 @@ import {
   type WorkflowGraphState,
 } from './workflow-state'
 import { WORKFLOW_GRAPH_VERSION } from './workflow-identity'
-import { DurableWorkflowRuntime } from './durable-workflow'
+import type {
+  WorkflowCheckpointStore,
+  WorkflowRuntime,
+  WorkflowRuntimeFactory,
+} from './ports/workflow-runtime'
 
 const EMPTY_BRIEF: DesignBrief = {
   existingCondition: [],
@@ -100,17 +146,6 @@ const CONFIRMATION_VALUES = new Set<ConfirmationStatus>([
 // "user content" when deciding whether a scene is safe to rebuild from
 // scratch (see `countActiveContentNodes` / `shouldModifyExistingScene`).
 const SCAFFOLDING_NODE_TYPES = new Set(['project', 'site', 'building', 'level', 'story', 'storey'])
-
-// Appended to every non-delete modification request. The deterministic
-// counterpart (checkModificationProtection) verifies the strict parts after
-// the fact when the request asked for preservation; this prompt aims the
-// model at the compliant construction pattern up front so the acceptance
-// loop rarely has anything to catch.
-const MODIFICATION_GUARD_PROMPT =
-  '结构保护要求：这是对已有场景的增量修改，只做实现本次请求所必需的改动。'
-  + '新增房间时优先让新隔墙与既有墙体拼接围合，不要移动、裁剪或删除既有墙体；'
-  + '新开的门优先安排在新隔墙上；不要改动与本次请求无关的门窗和家具。'
-  + '如果请求给出了新增房间的面积或数值范围，创建后必须用 get_zones 实测确认落在范围内再结束。'
 
 // M1/M2 (docs/MODIFY_REDESIGN.md §3): translates a modify request into
 // ModifyOps — the model's ONLY job on the plan-first modify path; every op
@@ -238,11 +273,12 @@ export async function clearLevelChildren(
 }
 
 export class PascalAiAgent {
-  private readonly model?: OpenAiCompatibleClient
-  private readonly fallbackModel?: OpenAiCompatibleClient
-  private readonly fastModel?: OpenAiCompatibleClient
-  private readonly workflow: DurableWorkflowRuntime
+  private readonly model?: ModelClient
+  private readonly fallbackModel?: ModelClient
+  private readonly fastModel?: ModelClient
+  private readonly workflow: WorkflowRuntime
   private readonly toolAuditor: AiOperationAuditor
+  private readonly spaceService: SceneSpaceService
   private readonly sessionLocks = new Map<string, Promise<ChatResult>>()
   private readonly sessionVersions = new Map<string, number>()
   // Sessions with a cancel requested while a run is in flight. The running
@@ -273,61 +309,23 @@ export class PascalAiAgent {
 
   constructor(
     private readonly config: AppConfig,
-    private readonly mcp: PascalMcpClient,
+    private readonly mcp: SceneGateway,
     private readonly modelAttempts: ModelAttemptSink,
     private readonly sessions: SessionPersistence,
     private readonly requests: ChatRequestWriter,
     private readonly workflowSteps: WorkflowStepWriter | undefined,
     private readonly sceneBuilds: SceneBuildWriter,
-    private readonly checkpointSaver: SqliteCheckpointSaver,
-    audits: AiAuditWriter,
+    private readonly checkpointSaver: WorkflowCheckpointStore,
+    private readonly audits: AiAuditWriter,
+    sceneSpaces: SceneSpaceStore,
+    workflowRuntimeFactory: WorkflowRuntimeFactory,
+    modelClients: ModelClients,
   ) {
     this.toolAuditor = new AiOperationAuditor(audits)
-    if (config.aiApiKey) {
-      this.model = new OpenAiCompatibleClient({
-        provider: config.aiProvider,
-        apiKey: config.aiApiKey,
-        baseUrl: config.aiBaseUrl,
-        model: config.aiModel,
-        referer: config.aiReferer,
-        title: config.aiTitle,
-        temperature: config.aiTemperature,
-        azureDeployment: config.azureDeployment,
-        azureApiVersion: config.azureApiVersion,
-        requestTimeoutMs: config.aiRequestTimeoutMs,
-      })
-    }
-    if (config.aiFallbackModel && (config.aiFallbackApiKey || config.aiApiKey)) {
-      this.fallbackModel = new OpenAiCompatibleClient({
-        provider: config.aiProvider,
-        apiKey: config.aiFallbackApiKey ?? config.aiApiKey!,
-        baseUrl: config.aiBaseUrl,
-        model: config.aiFallbackModel,
-        referer: config.aiReferer,
-        title: `${config.aiTitle} fallback`,
-        temperature: config.aiTemperature,
-        azureDeployment: config.azureDeployment,
-        azureApiVersion: config.azureApiVersion,
-        requestTimeoutMs: config.aiRequestTimeoutMs,
-      })
-    }
-    // Cheap/fast model for low-stakes classification (scene intent routing).
-    // When AI_FAST_MODEL / OPENROUTER_FAST_MODEL is unset this equals the main
-    // model, so tiering is opt-in and never regresses existing setups.
-    if (config.aiApiKey && config.aiFastModel !== config.aiModel) {
-      this.fastModel = new OpenAiCompatibleClient({
-        provider: config.aiProvider,
-        apiKey: config.aiApiKey,
-        baseUrl: config.aiBaseUrl,
-        model: config.aiFastModel,
-        referer: config.aiReferer,
-        title: `${config.aiTitle} fast`,
-        temperature: config.aiTemperature,
-        azureDeployment: config.aiProvider === 'azure-openai' ? config.aiFastModel : config.azureDeployment,
-        azureApiVersion: config.azureApiVersion,
-        requestTimeoutMs: config.aiRequestTimeoutMs,
-      })
-    }
+    this.spaceService = new SceneSpaceService(sceneSpaces)
+    this.model = modelClients.main
+    this.fallbackModel = modelClients.fallback
+    this.fastModel = modelClients.fast
     // A live worker lease proves another process still owns an in-flight
     // session. Only unleased state is stale enough to recover; CAS remains the
     // final guard if two processes race after a lease expires.
@@ -343,12 +341,12 @@ export class PascalAiAgent {
         this.sessionVersions.delete(stored.session.sessionId)
       }
     }
-    this.workflow = new DurableWorkflowRuntime({
+    this.workflow = workflowRuntimeFactory({
       route: state => this.routeDurableWorkflow(state),
       legacy: state => this.runLegacyWorkflowNode(state),
       plan: state => this.runPlanWorkflowNode(state),
       construct: state => this.runConstructWorkflowNode(state),
-    }, checkpointSaver)
+    })
   }
 
   async chat(input: ChatInput): Promise<ChatResult> {
@@ -958,6 +956,33 @@ export class PascalAiAgent {
     if (plan.kind === 'route-existing') return this.routeExistingSceneRequest(session, plan.message)
     const message = plan.message
 
+    const guardrailStarted = performance.now()
+    const scope = classifyScopeRequest({
+      message,
+      hasImage: Boolean(input.imageDataUrl),
+    })
+    const context = this.activeRequestContexts.get(session.sessionId)
+    if (context) {
+      this.audits.recordGuardrail({
+        eventId: crypto.randomUUID(),
+        requestId: context.requestId,
+        ...(context.workflowRunId ? { workflowRunId: context.workflowRunId } : {}),
+        sessionId: session.sessionId,
+        policyVersion: SCOPE_POLICY_VERSION,
+        decision: scope.decision,
+        reasonCode: scope.reasonCode,
+        inputKind: input.imageDataUrl ? 'image' : 'text',
+        latencyMs: performance.now() - guardrailStarted,
+        createdAt: new Date().toISOString(),
+      })
+    }
+    if (scope.decision === 'block') {
+      session.messages.push({ role: 'user', content: message })
+      const reply = t(session.language, 'offTopic', {})
+      session.messages.push({ role: 'assistant', content: reply })
+      return { session, reply, next: 'finish' }
+    }
+
     if (session.phase === 'intake' && session.sceneId && message) {
       try {
         await this.callMcp(session.sessionId, 'load_scene', { id: session.sceneId })
@@ -1002,26 +1027,13 @@ export class PascalAiAgent {
 
   private async inspect(state: WorkflowGraphState): Promise<Partial<WorkflowGraphState>> {
     const session = structuredClone(state.session)
-    const question = state.input.message?.trim() ?? ''
-    const sceneId = session.sceneResult?.sceneId ?? session.sceneId
-    if (!sceneId) {
-      session.phase = 'failed'
-      return { session, reply: t(session.language, 'inspectNoScene', {}), next: 'finish' }
-    }
-    try {
-      await this.callMcp(session.sessionId, 'load_scene', { id: sceneId })
-      const reply = await this.answerSceneQuestion(session, question)
-      session.phase = session.sceneResult?.remainingIssueCount
-        ? 'completed_with_issues'
-        : 'completed'
-      session.messages.push({ role: 'assistant', content: reply })
-      return { session, reply, next: 'finish' }
-    } catch (error) {
-      session.phase = 'completed_with_issues'
-      const reply = t(session.language, 'inspectFailed', { error: errorMessage(error) })
-      session.messages.push({ role: 'assistant', content: reply })
-      return { session, reply, next: 'finish' }
-    }
+    return inspectExistingScene({
+      session,
+      question: state.input.message?.trim() ?? '',
+      loadScene: async sceneId => { await this.callMcp(session.sessionId, 'load_scene', { id: sceneId }) },
+      answerQuestion: (current, question) => this.answerSceneQuestion(current, question),
+      errorMessage,
+    })
   }
 
   private async routeExistingSceneRequest(
@@ -1030,46 +1042,7 @@ export class PascalAiAgent {
   ): Promise<Partial<WorkflowGraphState>> {
     session.messages.push({ role: 'user', content: message })
     const intent = await this.classifySceneIntent(session, message)
-    if (intent === 'off_topic') {
-      session.phase = session.sceneResult?.remainingIssueCount
-        ? 'completed_with_issues'
-        : 'completed'
-      const reply = t(session.language, 'offTopic', {})
-      session.messages.push({ role: 'assistant', content: reply })
-      return { session, reply, next: 'finish' }
-    }
-    if (intent === 'query') {
-      session.phase = 'inspecting'
-      return { session, reply: t(session.language, 'inspectStarting', {}), next: 'inspect' }
-    }
-    if (intent === 'ambiguous') {
-      session.phase = session.sceneResult?.remainingIssueCount
-        ? 'completed_with_issues'
-        : 'completed'
-      const reply = t(session.language, 'sceneIntentAmbiguous', {})
-      session.messages.push({ role: 'assistant', content: reply })
-      return { session, reply, next: 'finish' }
-    }
-
-    session.pendingModification = message
-    session.pendingOperation = intent
-    // A new request invalidates a drift acknowledgement issued for the
-    // previous one (MODIFY_REDESIGN.md §6).
-    delete session.modifyDriftConfirmed
-    // 删除是破坏性的，可能级联移除关联节点，保留二次确认；新增/修改都通过
-    // apply_patch 完成、可撤销，直接执行以免每次微调都要多一次确认往返。
-    if (intent === 'delete') {
-      session.phase = 'awaiting_modification_confirmation'
-      const reply = t(session.language, 'deleteConfirm', { message })
-      session.messages.push({ role: 'assistant', content: reply })
-      return { session, reply, next: 'finish' }
-    }
-    session.phase = 'modifying'
-    const reply = intent === 'create'
-      ? t(session.language, 'sceneCreateStarting', { message })
-      : t(session.language, 'sceneUpdateStarting', { message })
-    session.messages.push({ role: 'assistant', content: reply })
-    return { session, reply, next: 'modify' }
+    return planExistingSceneRequest(session, message, intent)
   }
 
   private async classifySceneIntent(session: WorkflowSession, message: string): Promise<SceneIntent> {
@@ -1149,241 +1122,73 @@ export class PascalAiAgent {
     state: WorkflowGraphState,
     preparedPlan = false,
   ): Promise<Partial<WorkflowGraphState>> {
-    const session = structuredClone(state.session)
-    // If this attempt goes down the fresh-build branch (no existing scene,
-    // or `session.sceneId` gets overwritten by a newly created project
-    // below) and then fails partway through construction, `session.sceneId`
-    // would otherwise be left pointing at that broken half-built scene. A
-    // retry would then see a real scene with plenty of nodes in it and
-    // mistake it for a legitimate existing project — routing into
-    // `applyConfirmedBriefToExistingScene` (incremental patch) instead of a
-    // clean rebuild. Remember what it was before this attempt so the catch
-    // block can roll it back.
-    const priorSceneId = session.sceneId
-    let freshBuildId: string | undefined
-    try {
-      if (!preparedPlan) {
-        session.executionSteps = []
-        session.toolTrace = []
-      }
-      // Persist the `generating` phase up front. Session state is otherwise
-      // only written at the very end of the turn, so a crash mid-generation
-      // would leave the stored phase stuck at `awaiting_confirmation` with no
-      // trace that a build was underway. This snapshot makes the in-progress
-      // (and any later abandoned scene) state diagnosable after a restart.
-      if (!preparedPlan) this.persistSession(session)
-      const generationArgs = buildGenerationArgs(session)
-      if (session.sceneId) {
-        const loaded = toolPayload(await this.callMcp(session.sessionId, 'load_scene', { id: session.sceneId }))
-        // Decide by real content nodes, not raw nodeCount: a scene that only
-        // holds structural scaffolding (project/site/building/level) is
-        // genuinely empty and safe to build fresh, but a scene with even one
-        // user-drawn wall must be modified incrementally — never cleared and
-        // rebuilt, which would silently destroy the user's existing work.
-        const contentNodes = await this.countActiveContentNodes(session.sessionId)
-        if (shouldModifyExistingScene(contentNodes)) {
-          return await this.runWorkflowStep(
-            session,
-            'modify',
-            () => this.applyConfirmedBriefToExistingScene(session, loaded),
-          )
-        }
-        const expectedVersion = nullableNumber(loaded.version)
-        if (expectedVersion !== null) generationArgs.expectedVersion = expectedVersion
-      }
-      // Steps ①–③ (GENERATION_REDESIGN.md §1): intent → deterministic
-      // partition → validation, all before any Pascal scene exists. A brief
-      // that can't produce a valid plan fails right here — zero abandoned
-      // scenes, and the confirmed requirements survive for a retry.
-      let activePlan = preparedPlan ? session.layoutPlan : undefined
-      if (!activePlan) {
-        const planned = await this.runWorkflowStep(
-          session,
-          'plan',
-          () => this.buildPlanForSession(session),
-          result => result.ok,
-          'plan_rejected',
-        )
-        if (!planned.ok) {
-          session.phase = 'failed'
-          const { failures, failuresL10n } = planned
-          const reply = t(session.language, 'planRejected', {
-            rounds: planned.modelCalls,
-            list: failures
-              .map((failure, index) =>
-                `- ${renderPlanFailure(failure, failuresL10n[index] ?? null, session.language ?? 'en')}`)
-              .join('\n'),
-          })
-          session.messages.push({ role: 'assistant', content: reply })
-          return { session, reply, next: 'finish' }
-        }
-        if (planned.intent) session.layoutIntent = planned.intent
-        activePlan = planned.plan
-        session.layoutPlan = activePlan
-        this.persistSession(session)
-      }
-
-      if (!priorSceneId && this.sceneBuilds) {
+    return runGenerateWorkflow(state, preparedPlan, {
+      persistSession: session => this.persistSession(session),
+      runStep: (session, operationKey, work, accepts, rejectedErrorCode) =>
+        this.runWorkflowStep(session, operationKey, work, accepts, rejectedErrorCode),
+      buildGenerationArgs,
+      loadScene: async (session, sceneId) =>
+        toolPayload(await this.callMcp(session.sessionId, 'load_scene', { id: sceneId })),
+      countActiveContentNodes: sessionId => this.countActiveContentNodes(sessionId),
+      shouldModifyExistingScene,
+      applyToExistingScene: (session, loaded) =>
+        this.applyConfirmedBriefToExistingScene(session, loaded),
+      buildPlan: (session, failures) => this.buildPlanForSession(session, failures),
+      renderPlanFailure: (message, index, plan) => renderPlanFailure(
+        message,
+        plan.ok ? null : plan.failuresL10n[index] ?? null,
+        state.session.language ?? 'en',
+      ),
+      startFreshBuild: session => {
         const context = this.activeRequestContexts.get(session.sessionId)
         if (!context) throw new Error('Missing request context for fresh scene build')
-        freshBuildId = crypto.randomUUID()
-        const startedAt = new Date().toISOString()
+        const buildId = crypto.randomUUID()
         this.sceneBuilds.start({
-          buildId: freshBuildId,
+          buildId,
           requestId: context.requestId,
           traceId: context.traceId,
           sessionId: session.sessionId,
-          startedAt,
+          startedAt: new Date().toISOString(),
         })
-      }
-
-      // ④ scaffolding only (project/site/building/level) — the template rooms
-      // it drops in are cleared and the plan's rooms are built by the
-      // deterministic executor instead.
-      const created = await this.runWorkflowStep(session, 'scaffold', async () => toolPayload(
-        await this.callMcp(session.sessionId, 'create_house_from_brief', generationArgs),
-      ))
-      session.sceneId = nullableString(created.projectId ?? created.sceneId ?? created.id) ?? undefined
-      if (freshBuildId && session.sceneId) {
-        this.sceneBuilds.identifyScene(freshBuildId, session.sceneId, new Date().toISOString())
-        const boundary = await this.sceneBoundary(session.sessionId, session.sceneId)
-        this.sceneBuilds.updateBoundary(freshBuildId, boundary, new Date().toISOString())
-      }
-      const levelId = nullableString(created.defaultLevelId)
-      const persistAfterRound = async (valid: boolean) => {
-        await this.persistScene(session.sessionId, session.sceneId, valid, nullableNumber(created.version))
-        if (freshBuildId && session.sceneId) {
-          const boundary = await this.sceneBoundary(session.sessionId, session.sceneId)
-          this.sceneBuilds.updateBoundary(freshBuildId, boundary, new Date().toISOString())
-        }
-      }
-      await this.clearLevelForRebuild(session, levelId)
-      let construction = await this.constructScenePlanFirst(session, levelId, activePlan, { persistAfterRound })
-
-      // §5 失败分流：structural gate failures go back to the plan layer once.
-      // The acceptance facts are quoted into a fresh intent prompt; if the
-      // replan passes validation the level is cleared and rebuilt. A failed
-      // replan keeps the first build (reported honestly below) rather than
-      // trading a flawed scene for no scene.
-      if (construction.structuralFailures.length > 0) {
-        const replanned = await this.runWorkflowStep(
-          session,
-          'plan',
-          () => this.buildPlanForSession(session, construction.structuralFailures),
-          result => result.ok,
-          'plan_rejected',
+        return buildId
+      },
+      createScaffold: async (session, args) => {
+        const created = toolPayload(
+          await this.callMcp(session.sessionId, 'create_house_from_brief', args),
         )
-        if (replanned.ok) {
-          if (replanned.intent) session.layoutIntent = replanned.intent
-          activePlan = replanned.plan
-          session.layoutPlan = activePlan
-          this.persistSession(session)
-          await this.clearLevelForRebuild(session, levelId)
-          construction = await this.constructScenePlanFirst(session, levelId, activePlan, { persistAfterRound })
+        return {
+          sceneId: nullableString(created.projectId ?? created.sceneId ?? created.id),
+          levelId: nullableString(created.defaultLevelId),
+          version: nullableNumber(created.version),
         }
-      }
-
-      const { diagnostics, repairRounds, toolNamesUsed, furnitureIssues, executionIssues } = construction
-      const sceneVersion = await this.persistScene(
-        session.sessionId,
-        session.sceneId,
-        diagnostics.validation.valid,
-        nullableNumber(created.version),
-      )
-      if (freshBuildId && session.sceneId) {
-        const boundary = await this.sceneBoundary(session.sessionId, session.sceneId)
-        this.sceneBuilds.succeed(freshBuildId, boundary, new Date().toISOString())
-      }
-
-      const sceneResult: SceneResult = {
-        sceneId: nullableString(created.projectId ?? created.sceneId ?? created.id),
-        editorUrl: publicEditorUrl(nullableString(created.projectId ?? created.sceneId ?? created.id)),
-        version: sceneVersion,
-        validation: diagnostics.validation,
-        verificationIssues: diagnostics.verificationIssues,
-        collisions: diagnostics.collisions,
-        doorlessRooms: diagnostics.doorlessRooms,
-        strayWindows: diagnostics.strayWindows,
-        requirementMismatches: diagnostics.requirementMismatches,
-        isolatedBedrooms: diagnostics.isolatedBedrooms,
-        furnitureIssues,
-        furniturePlacement: diagnostics.furniturePlacementIssues,
-        repairRounds,
-        remainingIssueCount: countAllIssues(diagnostics, furnitureIssues),
-        executionIssues: [...executionIssues, ...construction.structureViolations],
-        modelCallsUsed: (session.toolTrace ?? []).reduce((sum, trace) => sum + trace.modelCalls, 0),
-        gateFailures: construction.gates.failures.map(failure => failure.message),
-        layoutQuality: construction.layoutQuality,
-        furniture: construction.furnitureCounts,
-      }
-      session.sceneResult = sceneResult
-      // §5 hard gates: `completed` requires zero remaining issues AND every
-      // gate passing — a scene missing a required room can no longer be
-      // labeled done just because the repair loop ran out of findings.
-      const remaining = sceneResult.remainingIssueCount
-      session.phase = remaining === 0 && construction.gates.passed
-        ? 'completed'
-        : 'completed_with_issues'
-      const reply = buildCompletionReply({
-        lang: session.language ?? 'en',
-        successText: t(session.language, 'generateSuccess', { url: sceneResult.editorUrl }),
-        repairRounds,
-        diagnostics,
-        toolNamesUsed,
-        furnitureIssues,
-        gateFailures: construction.gates.failures,
-      })
-      session.messages.push({ role: 'assistant', content: reply })
-      return { session, reply, next: 'finish' }
-    } catch (error) {
-      // Only roll back when this attempt actually reassigned sceneId (the
-      // fresh-build branch). A failure while modifying a genuinely
-      // pre-existing scene never touches session.sceneId, so priorSceneId
-      // still matches and this is a no-op — the real project reference is
-      // never disturbed.
-      const abandonedSceneId = session.sceneId !== priorSceneId ? session.sceneId : undefined
-      if (session.sceneId !== priorSceneId) {
-        // The half-built scene is abandoned, not deleted — record it so
-        // it's not just silently orphaned in storage with no trace.
-        if (session.sceneId) {
-          console.warn(`[pascal-ai-mcp] abandoned half-built scene ${session.sceneId} after generate() failure:`, error)
-        }
-        session.sceneId = priorSceneId
-      }
-      if (freshBuildId) {
+      },
+      identifyFreshBuild: async (buildId, sceneId) => {
+        this.sceneBuilds.identifyScene(buildId, sceneId, new Date().toISOString())
+      },
+      updateFreshBuildBoundary: async (buildId, sessionId, sceneId) => {
+        const boundary = await this.sceneBoundary(sessionId, sceneId)
+        this.sceneBuilds.updateBoundary(buildId, boundary, new Date().toISOString())
+      },
+      clearLevel: (session, levelId) => this.clearLevelForRebuild(session, levelId),
+      construct: (session, levelId, plan, persistAfterRound) =>
+        this.constructScenePlanFirst(session, levelId, plan, { persistAfterRound }),
+      persistScene: (sessionId, sceneId, valid, expectedVersion) =>
+        this.persistScene(sessionId, sceneId, valid, expectedVersion),
+      succeedFreshBuild: async (buildId, sessionId, sceneId) => {
+        const boundary = await this.sceneBoundary(sessionId, sceneId)
+        this.sceneBuilds.succeed(buildId, boundary, new Date().toISOString())
+      },
+      abandonFreshBuild: (buildId, errorCode) => {
         try {
-          this.sceneBuilds.abandon(
-            freshBuildId,
-            error instanceof GenerationCancelledError ? 'cancelled_by_user' : 'scene_build_failed',
-            new Date().toISOString(),
-          )
-        } catch (persistenceError) {
-          console.error(`[scene-build ${freshBuildId}] failed to persist abandonment: ${errorMessage(persistenceError)}`)
+          this.sceneBuilds.abandon(buildId, errorCode, new Date().toISOString())
+        } catch (error) {
+          console.error(`[scene-build ${buildId}] failed to persist abandonment: ${errorMessage(error)}`)
         }
-      }
-      if (error instanceof GenerationCancelledError) {
-        session.phase = 'cancelled'
-        const reply = [
-          t(session.language, 'generateCancelled', {}),
-          ...(abandonedSceneId
-            ? [t(session.language, 'generateAbandonedScene', { sceneId: abandonedSceneId })]
-            : []),
-        ].join('\n')
-        session.messages.push({ role: 'assistant', content: reply })
-        return { session, reply, next: 'finish' }
-      }
-      session.phase = 'failed'
-      const reply = [
-        t(session.language, 'generateFailed', { error: errorMessage(error) }),
-        ...(abandonedSceneId
-          ? [t(session.language, 'generateAbandonedScene', { sceneId: abandonedSceneId })]
-          : []),
-      ].join('\n')
-      session.messages.push({ role: 'assistant', content: reply })
-      return { session, reply, next: 'finish' }
-    }
+      },
+      isCancellationError: error => error instanceof GenerationCancelledError,
+      errorMessage,
+    })
   }
-
   private async applyConfirmedBriefToExistingScene(
     session: WorkflowSession,
     loaded: Record<string, unknown>,
@@ -1400,133 +1205,54 @@ export class PascalAiAgent {
       diagnostics.validation.valid,
       nullableNumber(loaded.version),
     )
-    const remainingIssueCount = countAllIssues(diagnostics, furnitureIssues)
-    // §6 接线 2：门槛是场景性质，与怎么建出来无关 — the incremental path is
-    // judged by the same hard gates as a fresh build.
     const gates = await this.evaluateGates(session)
-    session.sceneResult = {
+    const { reply } = finishSceneWorkflow({
+      session,
       sceneId,
       editorUrl: publicEditorUrl(sceneId),
       version: sceneVersion,
-      validation: diagnostics.validation,
-      verificationIssues: diagnostics.verificationIssues,
-      collisions: diagnostics.collisions,
-      doorlessRooms: diagnostics.doorlessRooms,
-      strayWindows: diagnostics.strayWindows,
-      requirementMismatches: diagnostics.requirementMismatches,
-      isolatedBedrooms: diagnostics.isolatedBedrooms,
-      furnitureIssues,
-      furniturePlacement: diagnostics.furniturePlacementIssues,
-      repairRounds,
-      remainingIssueCount,
-      modelCallsUsed: (session.toolTrace ?? []).reduce((sum, trace) => sum + trace.modelCalls, 0),
-      gateFailures: gates.report.failures.map(failure => failure.message),
-      layoutQuality: gates.layoutQuality,
-    }
-    session.phase = remainingIssueCount === 0 && gates.report.passed
-      ? 'completed'
-      : 'completed_with_issues'
-    const reply = buildCompletionReply({
-      lang: session.language ?? 'en',
-      successText: t(session.language, 'applyToExistingSuccess', {}),
-      repairRounds,
       diagnostics,
+      repairRounds,
       toolNamesUsed,
       furnitureIssues,
       gateFailures: gates.report.failures,
+      gatesPassed: gates.report.passed,
+      successText: t(session.language, 'applyToExistingSuccess', {}),
+      layoutQuality: gates.layoutQuality,
     })
-    session.messages.push({ role: 'assistant', content: reply })
     return { session, reply, next: 'finish' }
   }
 
   private async modify(state: WorkflowGraphState): Promise<Partial<WorkflowGraphState>> {
-    const session = structuredClone(state.session)
-    const feedback = session.pendingModification ?? state.input.message?.trim() ?? ''
-    const operation = session.pendingOperation ?? 'update'
-    const sceneId = session.sceneResult?.sceneId ?? session.sceneId
-    if (!sceneId) {
-      session.phase = 'failed'
-      return {
-        session,
-        reply: t(session.language, 'modifyNoScene', {}),
-        next: 'finish',
-      }
-    }
-
-    try {
-      session.toolTrace = []
-      // Persist the `modifying` phase up front so a crash mid-edit is
-      // diagnosable rather than leaving the stored phase at its pre-edit value.
-      this.persistSession(session)
-      const loaded = toolPayload(await this.callMcp(session.sessionId, 'load_scene', { id: sceneId }))
-      // Plan-first modify (docs/MODIFY_REDESIGN.md §2): one model call
-      // translates the request into ModifyOps; furniture ops run the
-      // deterministic executor, structural ops edit the intent and
-      // re-partition under the stability constraint. Requests outside the op
-      // vocabulary (and legacy scenes without an intent snapshot, for
-      // structural asks) fall through to the legacy free-edit path.
-      // PASCAL_MODIFY_LEGACY=1 forces the old free-edit path (comparison
-      // experiments only — same posture as AI_PLAN_LLM_GEOMETRY, deliberately
-      // not in AppConfig). ALL intents go through the translator — a
-      // delete-classified "把次卧删掉" is a remove_room, a create-classified
-      // addition is an add_room; the double-confirm for deletes already
-      // happened before modify() runs.
-      if (process.env.PASCAL_MODIFY_LEGACY !== '1') {
-        const fastPath = await this.runWorkflowStep(
+    return runModifyWorkflow(state, {
+      persistSession: session => this.persistSession(session),
+      loadScene: async (session, sceneId) =>
+        toolPayload(await this.callMcp(session.sessionId, 'load_scene', { id: sceneId })),
+      runPlanFirst: (session, feedback, sceneId, loadedVersion) =>
+        this.runWorkflowStep(
           session,
           'modify-plan',
-          () => this.tryPlanFirstModify(session, feedback, sceneId, nullableNumber(loaded.version)),
-        )
-        if (fastPath) return fastPath
-      }
-      // Reaching legacy on a scene without plan snapshots deserves a note in
-      // the reply (§7) — structural asks on pre-plan-first scenes land here.
-      const legacyNoSnapshot = !session.layoutIntent || !session.layoutPlan
-      // Pre-edit snapshot: drives the deterministic protection acceptance
-      // below and marks every pre-existing wall read-only for the dedupe.
-      // Delete operations are exempt — removing existing structure is their
-      // entire point.
-      const isDeleteOperation = operation === 'delete'
-      const beforeNodes = isDeleteOperation
-        ? {}
-        : snapshotSceneNodes(toolPayload(await this.callMcp(session.sessionId, 'get_scene', {})))
-      const protectedWallIds = new Set(
-        Object.entries(beforeNodes).filter(([, node]) => node.type === 'wall').map(([id]) => id),
-      )
-      const levelId = Object.entries(beforeNodes).find(([, node]) => node.type === 'level')?.[0] ?? null
-      // §6 接线 1：把生成时的 layoutPlan 快照作为事实来源注入（房间清单、
-      // 面积、连通关系），替代模型自己 get_walls 摸底——增量修改破坏既有
-      // 房间连通（case-13）正是缺这份事实导致的。
-      const planSnapshot = session.layoutPlan && !isDeleteOperation
-        ? `\n${formatPlanSnapshot(session.layoutPlan)}`
-        : ''
-      const purpose = isDeleteOperation
-        ? `用户已确认对当前场景执行${operation}操作：${feedback}`
-        : `用户已确认对当前场景执行${operation}操作：${feedback}\n${MODIFICATION_GUARD_PROMPT}${planSnapshot}`
-      const phase = await this.runWorkflowStep(session, 'modify', () => this.runPhaseToConvergence(
+          () => this.tryPlanFirstModify(session, feedback, sceneId, loadedVersion),
+        ),
+      snapshotScene: async session => snapshotSceneNodes(
+        toolPayload(await this.callMcp(session.sessionId, 'get_scene', {})),
+      ),
+      runLegacyPhase: (session, purpose) => this.runWorkflowStep(
         session,
-        purpose,
-        undefined,
-        new Set<string>(),
-        [],
-        '按用户要求修改场景',
-      ))
-      // create_room on an existing scene leaves coincident duplicate walls
-      // along shared boundaries, exactly like fresh generation — but here the
-      // original walls are read-only: only this turn's new walls may be
-      // deleted or clipped to resolve an overlap.
-      if (!isDeleteOperation) {
-        await this.dedupeSharedWalls(session.sessionId, levelId, protectedWallIds)
-      }
-      const extraChecks = isDeleteOperation
-        ? undefined
-        : async () => {
-            const afterNodes = snapshotSceneNodes(
-              toolPayload(await this.callMcp(session.sessionId, 'get_scene', {})),
-            )
-            return checkModificationProtection(beforeNodes, afterNodes, feedback)
-          }
-      const { diagnostics, repairRounds, toolNamesUsed, furnitureIssues } = await this.refineAndDiagnose(
+        'modify',
+        () => this.runPhaseToConvergence(
+          session,
+          purpose,
+          undefined,
+          new Set<string>(),
+          [],
+          '按用户要求修改场景',
+        ),
+      ),
+      dedupeSharedWalls: (sessionId, levelId, protectedWallIds) =>
+        this.dedupeSharedWalls(sessionId, levelId, protectedWallIds),
+      checkProtection: checkModificationProtection,
+      refine: async (session, purpose, phase, extraChecks) => this.refineAndDiagnose(
         session,
         purpose,
         {
@@ -1536,102 +1262,16 @@ export class PascalAiAgent {
           furnitureIssues: phase.furnitureIssues,
           ...(extraChecks ? { extraChecks } : {}),
         },
-      )
-      const sceneVersion = await this.persistScene(
-        session.sessionId,
-        sceneId,
-        diagnostics.validation.valid,
-        nullableNumber(loaded.version),
-      )
-      const remainingIssueCount = countAllIssues(diagnostics, furnitureIssues)
-      // §6 接线 2：modify runs through the same completion gates as fresh
-      // generation — the phase is a statement about the scene, not the path.
-      const gates = await this.evaluateGates(session)
-      session.sceneResult = {
-        sceneId,
-        editorUrl: publicEditorUrl(sceneId),
-        version: sceneVersion,
-        validation: diagnostics.validation,
-        verificationIssues: diagnostics.verificationIssues,
-        collisions: diagnostics.collisions,
-        doorlessRooms: diagnostics.doorlessRooms,
-        strayWindows: diagnostics.strayWindows,
-        requirementMismatches: diagnostics.requirementMismatches,
-        isolatedBedrooms: diagnostics.isolatedBedrooms,
-        furnitureIssues,
-        furniturePlacement: diagnostics.furniturePlacementIssues,
-        repairRounds,
-        remainingIssueCount,
-        modelCallsUsed: (session.toolTrace ?? []).reduce((sum, trace) => sum + trace.modelCalls, 0),
-        gateFailures: gates.report.failures.map(failure => failure.message),
-        layoutQuality: gates.layoutQuality,
-      }
-      session.phase = remainingIssueCount === 0 && gates.report.passed
-        ? 'completed'
-        : 'completed_with_issues'
-      delete session.pendingModification
-      delete session.pendingOperation
-      const completionReply = buildCompletionReply({
-        lang: session.language ?? 'en',
-        successText: t(session.language, 'modifySuccess', {}),
-        repairRounds,
-        diagnostics,
-        toolNamesUsed,
-        furnitureIssues,
-        gateFailures: gates.report.failures,
-      })
-      const reply = legacyNoSnapshot
-        ? [completionReply, t(session.language, 'modifyLegacyNoSnapshot', {})].join('\n')
-        : completionReply
-      session.messages.push({ role: 'assistant', content: reply })
-      return { session, reply, next: 'finish' }
-    } catch (error) {
-      const destructiveWriteFailed = session.destructiveSceneWriteStarted === true
-        || this.destructiveWrites.delete(session.sessionId)
-      if (destructiveWriteFailed) {
-        this.destructiveWrites.delete(session.sessionId)
-        delete session.destructiveSceneWriteStarted
-        delete session.pendingModification
-        delete session.pendingOperation
-        session.phase = session.sceneResult ? 'completed_with_issues' : 'failed'
-        const reply = t(session.language, 'modifyDestructiveFailed', {
-          sceneId,
-          error: errorMessage(error),
-        })
-        session.messages.push({ role: 'assistant', content: reply })
-        return { session, reply, next: 'finish' }
-      }
-      if (error instanceof GenerationCancelledError) {
-        // Leave pendingModification/pendingOperation and phase intact so the
-        // user can re-confirm the same change later; the scene was not saved.
-        session.phase = 'awaiting_modification_confirmation'
-        const reply = t(session.language, 'modifyCancelled', {})
-        session.messages.push({ role: 'assistant', content: reply })
-        return { session, reply, next: 'finish' }
-      }
-      // `pendingModification`/`pendingOperation` are never cleared on this
-      // path, but that alone doesn't make them resumable: `ingest()` only
-      // re-triggers `modify` from an explicit `{action:'confirm'}` while
-      // `phase === 'awaiting_modification_confirmation'`. Route back to that
-      // phase here so a plain confirm actually retries the *same* pending
-      // request instead of the reply's "保留，可以稍后重试" being an empty
-      // promise the user can only fulfill by redescribing the change from
-      // scratch.
-      const recovery = modifyFailureRecovery(Boolean(session.pendingModification), Boolean(session.sceneResult))
-      session.phase = recovery.phase
-      const reply = recovery.canRetry
-        ? t(session.language, 'modifyFailedRetry', { error: errorMessage(error) })
-        : t(session.language, 'modifyFailedNoRetry', { error: errorMessage(error) })
-      session.messages.push({ role: 'assistant', content: reply })
-      return { session, reply, next: 'finish' }
-    }
+      ),
+      persistScene: (sessionId, sceneId, valid, expectedVersion) =>
+        this.persistScene(sessionId, sceneId, valid, expectedVersion),
+      evaluateGates: session => this.evaluateGates(session),
+      clearDestructiveWrite: sessionId => this.destructiveWrites.delete(sessionId),
+      isCancellationError: error => error instanceof GenerationCancelledError,
+      errorMessage,
+      planSnapshot: formatPlanSnapshot,
+    })
   }
-
-  // Plan-first modify (docs/MODIFY_REDESIGN.md §2, batches M1+M2). Returns
-  // null when the request can't be expressed as ModifyOps (or a structural
-  // ask hits a legacy scene without snapshots) — the caller then continues
-  // down the legacy path. Throws (cancellation, model outage) propagate to
-  // modify()'s catch, which owns the retry phase bookkeeping.
   private async tryPlanFirstModify(
     session: WorkflowSession,
     feedback: string,
@@ -1644,10 +1284,11 @@ export class PascalAiAgent {
     const zonesPayload = toolPayload(await this.callMcp(session.sessionId, 'get_zones', {}))
     const zones = Array.isArray(zonesPayload.zones) ? zonesPayload.zones.filter(isZoneSummary) : []
     if (zones.length === 0) return null
+    const zoneTypes = this.resolveZoneTypes(session, zones)
     const rooms: FurnitureRoom[] = zones.map(zone => ({
       id: zone.id,
       name: zone.name,
-      type: session.zoneRoomTypes?.[zone.id] ?? classifyRoomTypeByName(zone.name),
+      type: zoneTypes[zone.id] ?? classifyRoomTypeByName(zone.name),
       polygon: zone.polygon,
       zoneId: zone.id,
     }))
@@ -2023,6 +1664,7 @@ export class PascalAiAgent {
       callMcp: traceMcp,
       dedupeSharedWalls: () => this.dedupeSharedWalls(session.sessionId, levelId),
       beforeCall,
+      onRoomCreated: created => this.spaceService.recordBuiltRoom(sceneId, created),
     })
     const furnitureRooms: FurnitureRoom[] = plan.rooms.map(planRoom => ({
       id: planRoom.id,
@@ -2033,6 +1675,7 @@ export class PascalAiAgent {
     }))
     const furnished = await executeFurniturePlan({
       rooms: furnitureRooms,
+      connections: plan.connections,
       levelId,
       callMcp: traceMcp,
       beforeCall,
@@ -2690,6 +2333,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     // persisted on the session so modify turns and eval reports can see what
     // was decided and why.
     const strategy = deriveStrategy(briefFactsFor(session.brief, briefSummary), targets, profile)
+    const directEligibility = directTemplateEligibility(session.brief, targets, strategy)
     session.strategy = strategy
     const result = await buildLayoutPlan(
       {
@@ -2714,12 +2358,33 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
         llmGeometry,
         profile,
         strategy,
+        directTemplateEligible: directEligibility.eligible,
         templatesDir: this.config.templatesDir,
         ...(priorFailures?.length ? { priorFailures } : {}),
       },
     )
     trace.converged = result.ok
     if (result.seedTrace?.length) trace.notes = result.seedTrace
+    const requestContext = this.activeRequestContexts.get(session.sessionId)
+    if (result.templateTrace && requestContext) {
+      try {
+        this.audits.recordTemplateMatch({
+          decisionId: crypto.randomUUID(),
+          requestId: requestContext.requestId,
+          ...(requestContext.workflowRunId
+            ? { workflowRunId: requestContext.workflowRunId }
+            : {}),
+          sessionId: session.sessionId,
+          ...result.templateTrace,
+          createdAt: new Date().toISOString(),
+        })
+      } catch (error) {
+        console.error(
+          `[template-audit] requestId=${requestContext.requestId} persistence=failed`,
+          error instanceof Error ? error.message : String(error),
+        )
+      }
+    }
     if (result.ok) {
       this.recordValidation(
         session,
@@ -2747,6 +2412,22 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
   // §5 completion hard gates + layout quality, judged on the ACTUAL scene
   // state. Used by fresh generation, the rebuild decision, and modify (§6
   // 接线 2: 门槛是场景性质，与怎么建出来无关).
+  private resolveZoneTypes(session: WorkflowSession, zones: ZoneSummary[]): Record<string, RoomType> {
+    try {
+      return this.spaceService.resolveRoomTypes(
+        session.sceneId,
+        zones.map(zone => ({ id: zone.id, name: zone.name })),
+        session.zoneRoomTypes,
+      )
+    } catch (error) {
+      console.error(`scene-space projection read failed: ${errorMessage(error)}`)
+      return {
+        ...Object.fromEntries(zones.map(zone => [zone.id, classifyRoomTypeByName(zone.name)])),
+        ...(session.zoneRoomTypes ?? {}),
+      }
+    }
+  }
+
   private async evaluateGates(session: WorkflowSession): Promise<{
     report: GateReport
     layoutQuality: number
@@ -2760,6 +2441,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     const wallsPayload = toolPayload(wallsRaw)
     const summaryPayload = toolPayload(summaryRaw)
     const zones = Array.isArray(zonesPayload.zones) ? zonesPayload.zones.filter(isZoneSummary) : []
+    const zoneTypes = this.resolveZoneTypes(session, zones)
     const walls: GateWall[] = Array.isArray(wallsPayload.walls)
       ? wallsPayload.walls.filter(isWallWithOpenings)
       : []
@@ -2774,11 +2456,12 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
       ...(planTargets.totalAreaSqm !== undefined ? { totalAreaSqm: planTargets.totalAreaSqm } : {}),
       ...(planTargets.requiredRooms ? { requiredRooms: planTargets.requiredRooms } : {}),
       ...(requiredWindowRoomTypes.length > 0 ? { requiredWindowRoomTypes } : {}),
-      ...(session.zoneRoomTypes ? { zoneTypes: session.zoneRoomTypes } : {}),
+      ...(Object.keys(zoneTypes).length > 0 ? { zoneTypes } : {}),
       market: resolveNormProfile(this.config.normProfile).id,
     })
     const layoutQuality = computeLayoutQuality(zones, walls, {
       ...(planTargets.totalAreaSqm !== undefined ? { targetTotalAreaSqm: planTargets.totalAreaSqm } : {}),
+      ...(Object.keys(zoneTypes).length > 0 ? { zoneTypes } : {}),
     }).score
     this.recordValidation(
       session,
@@ -2835,6 +2518,9 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
         },
         dedupeSharedWalls: () => this.dedupeSharedWalls(session.sessionId, levelId),
         beforeCall: () => this.throwIfCancelled(session.sessionId),
+        ...(session.sceneId
+          ? { onRoomCreated: created => this.spaceService.recordBuiltRoom(session.sceneId!, created) }
+          : {}),
       }))
       trace.converged = true
       session.executionSteps.push({ phase: 'structure', status: 'completed', label: '按计划批量建造房间结构' })
@@ -2869,6 +2555,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
         )
         const furnished = await executeFurniturePlan({
           rooms: furnitureRooms,
+          connections: plan.connections,
           levelId,
           callMcp: async (name, args) => {
             const result = await this.callMcp(session.sessionId, name, args)
@@ -3250,13 +2937,14 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
       ? collisionPayload.collisions.filter(isCollision)
       : []
     const zones = Array.isArray(zonesPayload.zones) ? zonesPayload.zones.filter(isZoneSummary) : []
+    const zoneTypes = this.resolveZoneTypes(session, zones)
     const walls = Array.isArray(wallsPayload.walls) ? wallsPayload.walls.filter(isWallWithOpenings) : []
     const levelSummaryPayload = toolPayload(levelSummaryRaw)
     const items = Array.isArray(levelSummaryPayload.items)
       ? levelSummaryPayload.items.filter(isItemSummary)
       : []
     const mismatchFindings = [
-      ...compareRoomsToRequirements(zones.map(z => z.name), session.brief),
+      ...compareRoomsToRequirements(zones, session.brief, zoneTypes),
       ...checkAreaRequirements(zones, session.brief),
     ]
     const strayWallIds = findStrayWindows(zones, walls)
@@ -3270,7 +2958,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
       doorlessRooms: findDoorlessRooms(zones, walls),
       strayWindows: strayWallIds.map(wallId => issueText('zh', 'strayWindow', { wallId })),
       requirementMismatches: mismatchFindings.map(finding => finding.message),
-      isolatedBedrooms: findIsolatedBedrooms(zones, walls),
+      isolatedBedrooms: findIsolatedBedrooms(zones, walls, zoneTypes),
       furniturePlacementIssues: checkFurniturePlacement(zones, walls, items),
       // Structured sources for reply-language re-rendering (see
       // describeRemainingIssues). Extra strings appended later by
@@ -3328,7 +3016,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
 
   private async withModelFallback<T>(
     sessionId: string,
-    operation: (model: OpenAiCompatibleClient, hooks: RequestHooks) => Promise<T>,
+    operation: (model: ModelClient, hooks: RequestHooks) => Promise<T>,
   ): Promise<T> {
     if (!this.model) {
       throw new Error('The configured AI provider API key is missing')
@@ -3355,7 +3043,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
    */
   private async withFastModel<T>(
     sessionId: string,
-    operation: (model: OpenAiCompatibleClient, hooks: RequestHooks) => Promise<T>,
+    operation: (model: ModelClient, hooks: RequestHooks) => Promise<T>,
   ): Promise<T> {
     if (!this.fastModel) return this.withModelFallback(sessionId, operation)
     try {
@@ -3368,12 +3056,9 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
   }
 }
 
-function isCompletedPhase(phase: WorkflowSession['phase']): boolean {
-  return phase === 'completed' || phase === 'completed_with_issues'
-}
-
 function isTerminalWorkflowPhase(phase: WorkflowSession['phase']): boolean {
-  return isCompletedPhase(phase) || phase === 'failed' || phase === 'cancelled'
+  return phase === 'completed' || phase === 'completed_with_issues'
+    || phase === 'failed' || phase === 'cancelled'
 }
 
 /**
@@ -3424,35 +3109,6 @@ export function gateTargetsForSession(
 //   「厨房缺少灶台」，是把执行成功误判成失败）。
 // 被滤掉的失败降级为一句不影响 phase 的中性备注。生成路径（全新建）没有
 // 基线也没有删除意图，仍然全量跑，安全网不受影响。
-export type IntentRemoval = { roomName: string; itemName: string }
-
-export function effectiveGateFailures(
-  failures: GateFailure[],
-  baseline: GateFailure[],
-  removals: IntentRemoval[],
-): { effective: GateFailure[]; waived: GateFailure[] } {
-  const baselineKeys = new Set(baseline.map(failure => failure.message))
-  const removalCovers = (failure: GateFailure): boolean => {
-    const l10n = failure.l10n
-    if (!l10n || (l10n.id !== 'gateMissingEquipment' && l10n.id !== 'gateMissingBedroomFurniture')) return false
-    const room = String(l10n.params.room ?? '')
-    const label = String(l10n.params.label ?? '')
-    // Room matching is bidirectional-substring, same posture as the eval
-    // assertions: op.room is user wording（「厨房」）, the gate's room is the
-    // zone label（「厨房」or「开放式厨房」）.
-    return removals.some(removal =>
-      room.length > 0 && removal.roomName.length > 0 &&
-      (room.includes(removal.roomName) || removal.roomName.includes(room)) &&
-      requirementLabelsSatisfiedBy(removal.itemName).includes(label))
-  }
-  const effective: GateFailure[] = []
-  const waived: GateFailure[] = []
-  for (const failure of failures) {
-    (baselineKeys.has(failure.message) || removalCovers(failure) ? waived : effective).push(failure)
-  }
-  return { effective, waived }
-}
-
 // P0（case-06 复盘二修）：抽取模型（temp=1）会偶发丢掉用户口述的地块尺寸
 // （「宽 5 米、长 18 米」→ brief 里只剩 plot_shape），prompt 补丁治标不治本。
 // ingest 后对用户原话跑确定性提取；brief 里没有任何可解析出尺寸的事实时，
@@ -3645,18 +3301,6 @@ export function staleSessionRecovery(
   }
 }
 
-export function modifyFailureRecovery(
-  hasPendingModification: boolean,
-  hasSceneResult: boolean,
-): { canRetry: boolean; phase: WorkflowSession['phase'] } {
-  return {
-    canRetry: hasPendingModification,
-    phase: hasPendingModification
-      ? 'awaiting_modification_confirmation'
-      : (hasSceneResult ? 'completed_with_issues' : 'failed'),
-  }
-}
-
 /**
  * Whether a plain (non-confirm/cancel) message arriving while `phase` is
  * `awaiting_modification_confirmation` (left there by a failed modify
@@ -3664,180 +3308,6 @@ export function modifyFailureRecovery(
  * modification instruction against the existing scene, rather than falling
  * through to generic requirement extraction.
  */
-export function shouldRouteAsExistingSceneRequest(phase: WorkflowSession['phase'], message: string): boolean {
-  return phase === 'awaiting_modification_confirmation' && message.trim().length > 0
-}
-
-/**
- * The outcome of the pure `ingest` routing step. `reply`/`route` are terminal
- * for this turn (the session has already been mutated accordingly).
- * `route-existing` and `intake` are delegation markers whose remaining work
- * needs MCP/model I/O and is carried out by the async `ingest` wrapper.
- */
-export type IngestPlan =
-  | { kind: 'reply'; reply: string }
-  | { kind: 'route'; reply: string; next: 'generate' | 'modify' }
-  | { kind: 'route-existing'; message: string }
-  | { kind: 'intake'; message: string }
-
-/**
- * Pure routing/state-machine core of `ingest`. Given the incoming input and a
- * (cloned, mutable) session, it decides the turn's outcome and applies every
- * phase/brief transition that needs no I/O — cancel, confirm (including the
- * "accept defaults from clarifying" escape hatch and modification-confirm),
- * empty input, existing-scene routing, length/format guards. I/O-bound
- * branches are returned as markers. Exported so all transitions are unit
- * testable without constructing a live agent or touching MCP/the model.
- */
-export function planIngestAction(input: ChatInput, session: WorkflowSession): IngestPlan {
-  if (input.action === 'cancel') {
-    session.phase = 'cancelled'
-    session.questions = []
-    return { kind: 'reply', reply: t(session.language, 'taskCancelled', {}) }
-  }
-
-  if (input.action === 'confirm') {
-    if (session.phase === 'awaiting_modification_confirmation' && session.pendingModification) {
-      session.phase = 'modifying'
-      return { kind: 'route', reply: t(session.language, 'modifyConfirmed', {}), next: 'modify' }
-    }
-    // `clarifying` is allowed too: the explicit "接受默认假设，直接生成" escape
-    // hatch that keeps a low-confidence brief from being trapped in the
-    // clarification loop with no way forward.
-    if (session.phase !== 'awaiting_confirmation' && session.phase !== 'clarifying') {
-      return { kind: 'reply', reply: t(session.language, 'notReadyToConfirm', {}) }
-    }
-    const acceptedDefaults = session.phase === 'clarifying'
-    session.confirmedAt = new Date().toISOString()
-    session.phase = 'generating'
-    session.brief = confirmBrief(session.brief)
-    return {
-      kind: 'route',
-      reply: acceptedDefaults
-        ? t(session.language, 'confirmedWithDefaults', {})
-        : t(session.language, 'requirementsConfirmed', {}),
-      next: 'generate',
-    }
-  }
-
-  const message = input.message?.trim() ?? ''
-  if (!message && !input.imageDataUrl) {
-    return { kind: 'reply', reply: t(session.language, 'emptyInput', {}) }
-  }
-  // A failed modification left phase here so a plain confirm can retry it; a
-  // fresh plain message instead means "new change" — clear the stale pending
-  // fields and reclassify it against the still-present scene.
-  if (shouldRouteAsExistingSceneRequest(session.phase, message)) {
-    delete session.pendingModification
-    delete session.pendingOperation
-    return { kind: 'route-existing', message }
-  }
-  if (isCompletedPhase(session.phase)) {
-    if (!message) {
-      return { kind: 'reply', reply: t(session.language, 'describeChangesInText', {}) }
-    }
-    return { kind: 'route-existing', message }
-  }
-  if (message.length > 5000) {
-    return { kind: 'reply', reply: t(session.language, 'messageTooLong', {}) }
-  }
-  if (input.imageDataUrl && !isSupportedImage(input.imageDataUrl)) {
-    session.phase = 'failed'
-    session.availability = 'unusable'
-    return { kind: 'reply', reply: t(session.language, 'unsupportedImage', {}) }
-  }
-  return { kind: 'intake', message }
-}
-
-export function countDiagnosticIssues(diagnostics: {
-  validation: { errors: string[] }
-  verificationIssues: string[]
-  collisions: unknown[]
-  doorlessRooms: string[]
-  strayWindows: string[]
-  requirementMismatches: string[]
-  isolatedBedrooms: string[]
-  furniturePlacementIssues?: unknown[]
-}): number {
-  return diagnostics.validation.errors.length +
-    diagnostics.verificationIssues.length + diagnostics.collisions.length +
-    diagnostics.doorlessRooms.length + diagnostics.strayWindows.length +
-    diagnostics.requirementMismatches.length + diagnostics.isolatedBedrooms.length +
-    (diagnostics.furniturePlacementIssues?.length ?? 0)
-}
-
-/**
- * Turn remaining diagnostics into a short, human-readable list so the reply
- * says what's actually wrong instead of just a bare count.
- */
-/**
- * Guidance appended to a "completed with remaining issues" reply so the user
- * has a concrete next step. "继续修复" is picked up by
- * `classifySceneIntentFallback` as an `update` intent, which re-enters the
- * modify path and runs another diagnose/repair pass on the same scene.
- */
-export function describeRemainingIssues(
-  diagnostics: {
-    validation: { errors: string[] }
-    verificationIssues: string[]
-    collisions: Array<{ aId: string; bId: string; kind: string }>
-    doorlessRooms: string[]
-    strayWindows: string[]
-    requirementMismatches: string[]
-    isolatedBedrooms: string[]
-    furniturePlacementIssues?: FurniturePlacementIssue[]
-    strayWallIds?: string[]
-    mismatchL10n?: Array<{ id: 'zoneOverlap' | 'totalAreaOff' | 'bedroomShortfall' | 'missingSupportSpace'; params: Record<string, string | number> }>
-  },
-  lang: Lang = 'zh',
-  limit = 5,
-): string {
-  // Structured sources render in the reply language; validation/verification
-  // strings come from MCP in English and pass through, as do extraChecks
-  // strings appended after collectDiagnostics (no l10n available).
-  const mismatchCount = diagnostics.mismatchL10n?.length ?? 0
-  const mismatches = diagnostics.mismatchL10n
-    ? [
-        ...diagnostics.mismatchL10n.map(entry => issueText(lang, entry.id, entry.params as never)),
-        ...diagnostics.requirementMismatches.slice(mismatchCount),
-      ]
-    : diagnostics.requirementMismatches
-  const strayWindows = diagnostics.strayWallIds
-    ? diagnostics.strayWallIds.map(wallId => issueText(lang, 'strayWindow', { wallId }))
-    : diagnostics.strayWindows
-  const items = [
-    ...diagnostics.validation.errors,
-    ...diagnostics.verificationIssues,
-    ...diagnostics.collisions.map(c => issueText(lang, 'collision', { a: c.aId, b: c.bId, kind: c.kind })),
-    ...diagnostics.doorlessRooms.map(room => issueText(lang, 'doorlessRoom', { room })),
-    ...strayWindows,
-    ...mismatches,
-    ...diagnostics.isolatedBedrooms.map(room => issueText(lang, 'isolatedBedroom', { room })),
-    ...(diagnostics.furniturePlacementIssues ?? []).map(issue => renderPlacementIssue(issue, lang)),
-  ]
-  if (items.length === 0) return ''
-  const shown = items.slice(0, limit).map(item => `- ${item}`).join('\n')
-  const more = items.length > limit ? t(lang, 'moreItems', { count: items.length - limit }) : ''
-  return `\n${shown}${more}`
-}
-
-// FurniturePlacementIssue carries its structure (kind + names), so the reply
-// can re-render it in any language; `message` stays the zh canonical text.
-function renderPlacementIssue(issue: FurniturePlacementIssue, lang: Lang): string {
-  if (lang === 'zh') return issue.message
-  const item = issue.itemName || issue.itemId
-  switch (issue.kind) {
-    case 'overlap':
-      return issueText(lang, 'placementOverlap', { item, other: issue.otherItemId ?? '?' })
-    case 'out_of_bounds':
-      return issueText(lang, 'placementOutOfBounds', { item, room: issue.room ?? null })
-    case 'door_clearance':
-      return issueText(lang, 'placementDoorClearance', { item })
-    default:
-      return issue.message
-  }
-}
-
 /**
  * session.messages records every turn but was previously never read back
  * into any model prompt, so cross-turn references ("that one", "same as
@@ -3885,8 +3355,6 @@ function extractMarkdownSection(markdown: string, heading: string): string | und
 // at item placement at all — so "passed automatic checks" does not cover
 // furniture placement quality. apply_patch is included because it can touch
 // an item node just as easily as any other node type.
-const FURNITURE_TOOLS = new Set(['place_item', 'furnish_room', 'apply_patch'])
-
 // Tools that write scene history — each successful call is one undo step.
 // Used by the repair-round structure lock to roll a violating round back.
 const MUTATING_TOOLS = new Set([
@@ -3898,68 +3366,6 @@ const MUTATING_TOOLS = new Set([
 // wasn't placed as intended. Furniture failures used to be invisible to
 // remainingIssueCount/phase (they only appeared in reply text), so a scene
 // with overlapping/out-of-bounds furniture was mislabeled fully `completed`.
-export function countAllIssues(
-  diagnostics: Parameters<typeof countDiagnosticIssues>[0],
-  furnitureIssues: string[],
-): number {
-  return countDiagnosticIssues(diagnostics) + furnitureIssues.length
-}
-
-function describeFurnitureIssues(furnitureIssues: string[], lang: Lang, limit = 5): string {
-  const shown = furnitureIssues.slice(0, limit).map(issue => `- ${issue}`).join('\n')
-  return t(lang, 'furnitureIssuesSummary', {
-    count: furnitureIssues.length,
-    list: shown,
-    moreCount: Math.max(0, furnitureIssues.length - limit),
-  })
-}
-
-// Builds the completion reply, counting structural diagnostics and furniture
-// failures separately so the message is accurate for furniture-only issues
-// (which the repair loop never attempts) instead of claiming a bogus repair
-// round count.
-function buildCompletionReply(args: {
-  lang: Lang
-  successText: string
-  repairRounds: number
-  diagnostics: Parameters<typeof describeRemainingIssues>[0]
-  toolNamesUsed: Set<string>
-  furnitureIssues: string[]
-  // §5 hard-gate failures. Shown even when diagnostics are clean — a scene
-  // can pass every repairable check and still fail a gate (e.g. brief 要求的
-  // 房型缺失), and the reply must say so instead of claiming success.
-  // Structured (with l10n) so the list renders in the reply language.
-  gateFailures?: GateFailure[]
-}): string {
-  const lang = args.lang
-  const structural = countDiagnosticIssues(args.diagnostics)
-  const furniture = args.furnitureIssues.length
-  const gates = args.gateFailures?.length ?? 0
-  const touchedFurniture = [...args.toolNamesUsed].some(name => FURNITURE_TOOLS.has(name))
-  const generalNote = touchedFurniture ? t(lang, 'furnitureGeneralNote', {}) : ''
-  if (structural === 0 && furniture === 0 && gates === 0) {
-    return `${args.successText}${generalNote}`
-  }
-  const parts: string[] = []
-  if (structural > 0) {
-    parts.push(t(lang, 'repairCapReached', {
-      rounds: args.repairRounds,
-      count: structural,
-      list: describeRemainingIssues(args.diagnostics, lang),
-    }))
-  }
-  if (gates > 0) {
-    const list = args.gateFailures!
-      .map(failure => `- ${renderGateFailure(failure, lang)}`)
-      .join('\n')
-    parts.push(t(lang, 'gatesNotPassed', { count: gates, list }))
-  }
-  if (furniture > 0) {
-    parts.push(describeFurnitureIssues(args.furnitureIssues, lang))
-  }
-  return `${parts.join('\n\n')}${t(lang, 'remainingIssuesHint', {})}${generalNote}`
-}
-
 // Plan-stage failures (partitioner/validator, via PlanBuildFailure) carry an
 // aligned l10n ref; re-render per language, zh/无模板 falls back to the
 // canonical zh text.
@@ -3975,18 +3381,6 @@ function renderPlanFailure(message: string, l10n: IssueL10n | null, lang: Lang):
 
 // Gate failures carry {id, params}; re-render in the reply language, falling
 // back to the canonical zh message when a failure predates the l10n field.
-function renderGateFailure(failure: GateFailure, lang: Lang): string {
-  if (lang === 'zh' || !failure.l10n) return failure.message
-  try {
-    // The l10n id/params come from completion-gates as a loosely-typed pair;
-    // issueText's overloads can't see through that, so cast at this boundary.
-    const render = issueText as (l: Lang, id: string, params: unknown) => string
-    return render(lang, failure.l10n.id, failure.l10n.params)
-  } catch {
-    return failure.message
-  }
-}
-
 /**
  * `place_item` silently swaps in a placeholder box when its `catalogItemId`
  * isn't in the catalog (status: 'catalog_unavailable'), and `furnish_room`
@@ -4114,101 +3508,6 @@ function isWallSummary(value: unknown): value is WallSummary {
     isNumberPair(value.start) && isNumberPair(value.end)
 }
 
-// Two walls built independently by separate `create_room` calls along a
-// shared boundary land on (near enough) the same line segment. 5cm covers
-// normal floating-point drift without risking merging two walls that are
-// genuinely just close together (e.g. a narrow corridor).
-const WALL_COINCIDENCE_EPSILON_M = 0.05
-
-function pointsClose(p: [number, number], q: [number, number]): boolean {
-  return Math.hypot(p[0] - q[0], p[1] - q[1]) <= WALL_COINCIDENCE_EPSILON_M
-}
-
-// Two rooms tracing a shared edge may walk it in opposite directions
-// (clockwise vs counter-clockwise polygon winding), so both same-direction
-// and reversed-direction endpoint matches count as coincident. Takes any
-// {start,end} shape so it also works for a raw zone-polygon edge, not just
-// two WallSummary objects. This only catches *exact* endpoint-pair matches —
-// see `collinearOverlap` below for the T-junction case where a long wall
-// partially overlaps one or more shorter walls without sharing endpoints.
-function wallsCoincide(
-  a: { start: [number, number]; end: [number, number] },
-  b: { start: [number, number]; end: [number, number] },
-): boolean {
-  return (pointsClose(a.start, b.start) && pointsClose(a.end, b.end)) ||
-    (pointsClose(a.start, b.end) && pointsClose(a.end, b.start))
-}
-
-// A segment's orientation as a position along a fixed axis, for rooms built
-// axis-aligned (per our own structure-phase prompt guidance). Returns null
-// for a diagonal segment — those fall back to exact endpoint matching via
-// `wallsCoincide`, since interval overlap isn't meaningful off-axis.
-type SegmentOrientation = { axis: 'x' | 'z'; constant: number; lo: number; hi: number }
-
-function segmentOrientation(seg: { start: [number, number]; end: [number, number] }): SegmentOrientation | null {
-  const [sx, sz] = seg.start
-  const [ex, ez] = seg.end
-  if (Math.abs(sx - ex) <= WALL_COINCIDENCE_EPSILON_M) {
-    // Vertical in plan (runs along z), x is constant.
-    return { axis: 'z', constant: (sx + ex) / 2, lo: Math.min(sz, ez), hi: Math.max(sz, ez) }
-  }
-  if (Math.abs(sz - ez) <= WALL_COINCIDENCE_EPSILON_M) {
-    // Horizontal in plan (runs along x), z is constant.
-    return { axis: 'x', constant: (sz + ez) / 2, lo: Math.min(sx, ex), hi: Math.max(sx, ex) }
-  }
-  return null
-}
-
-// Below this, two collinear segments are considered "touching" (e.g. at a
-// shared corner) rather than meaningfully overlapping — must stay smaller
-// than any real wall-splitting fragment we'd want to keep.
-const MIN_MEANINGFUL_OVERLAP_M = 0.03
-
-/**
- * Two axis-aligned segments overlap collinearly if they run along the same
- * axis at the same constant coordinate (within wall-coincidence tolerance)
- * and their 1D intervals along that axis overlap by more than a sliver.
- * Handles exact duplicates, one segment fully containing the other, and
- * partial (T-junction / staggered) overlap uniformly — the caller decides
- * what to do with the overlap interval.
- */
-function collinearOverlap(
-  a: { start: [number, number]; end: [number, number] },
-  b: { start: [number, number]; end: [number, number] },
-): { axis: 'x' | 'z'; constant: number; lo: number; hi: number } | null {
-  const oa = segmentOrientation(a)
-  const ob = segmentOrientation(b)
-  if (!oa || !ob) return null
-  if (oa.axis !== ob.axis) return null
-  if (Math.abs(oa.constant - ob.constant) > WALL_COINCIDENCE_EPSILON_M) return null
-  const lo = Math.max(oa.lo, ob.lo)
-  const hi = Math.min(oa.hi, ob.hi)
-  if (hi - lo <= MIN_MEANINGFUL_OVERLAP_M) return null
-  return { axis: oa.axis, constant: (oa.constant + ob.constant) / 2, lo, hi }
-}
-
-// True if `a` and `b` overlap enough (exact endpoint match OR meaningful
-// collinear interval overlap) that a door/window hosted on either one
-// should count as hosted on the other's edge too.
-function segmentsCoverSameLine(
-  a: { start: [number, number]; end: [number, number] },
-  b: { start: [number, number]; end: [number, number] },
-): boolean {
-  return wallsCoincide(a, b) || collinearOverlap(a, b) !== null
-}
-
-function orientationToSegment(o: { axis: 'x' | 'z'; constant: number; lo: number; hi: number }): {
-  start: [number, number]
-  end: [number, number]
-} {
-  return o.axis === 'x'
-    ? { start: [o.lo, o.constant], end: [o.hi, o.constant] }
-    : { start: [o.constant, o.lo], end: [o.constant, o.hi] }
-}
-
-export type WallOpening = { type: string }
-export type WallWithOpenings = WallSummary & { openings: WallOpening[] }
-
 function isWallWithOpenings(value: unknown): value is WallWithOpenings {
   if (!isWallSummary(value)) return false
   const openings = (value as { openings?: unknown }).openings
@@ -4216,8 +3515,6 @@ function isWallWithOpenings(value: unknown): value is WallWithOpenings {
     o => isRecord(o) && typeof o.type === 'string',
   )
 }
-
-export type ZoneSummary = { id: string; name: string; polygon: Array<[number, number]> }
 
 function isZoneSummary(value: unknown): value is ZoneSummary {
   return isRecord(value) && typeof value.id === 'string' &&
@@ -4505,356 +3802,6 @@ export function checkModificationProtection(
   return issues
 }
 
-// ---------------------------------------------------------------------------
-// Deterministic floor-area acceptance. The eval harness always checked total
-// area, but nothing on the generation side did — a build 50% over the brief's
-// target sailed through every repair round as "no issues" (case-03). These
-// helpers close that loop: `checkAreaRequirements` output feeds
-// `requirementMismatches`, which both triggers and steers the repair loop.
-// ---------------------------------------------------------------------------
-
-function polygonArea(polygon: Array<[number, number]>): number {
-  let sum = 0
-  for (let i = 0; i < polygon.length; i++) {
-    const [x1, z1] = polygon[i]!
-    const [x2, z2] = polygon[(i + 1) % polygon.length]!
-    sum += x1 * z2 - x2 * z1
-  }
-  return Math.abs(sum) / 2
-}
-
-function pointInPolygon(x: number, z: number, polygon: Array<[number, number]>): boolean {
-  let inside = false
-  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
-    const [xi, zi] = polygon[i]!
-    const [xj, zj] = polygon[j]!
-    if (zi > z !== zj > z && x < ((xj - xi) * (z - zi)) / (zj - zi) + xi) {
-      inside = !inside
-    }
-  }
-  return inside
-}
-
-/**
- * Per-zone areas can't simply be summed for a total-area check: if two room
- * polygons overlap (rooms built independently can intrude on each other),
- * the sum double-counts the overlap and reads high. This computes the true
- * union area — plus how much area is covered more than once, and by which
- * zone pairs — with a compressed-grid decomposition: collect every distinct
- * vertex coordinate on each axis, and classify each resulting grid cell by
- * testing its midpoint against every zone polygon. Exact for the
- * axis-aligned rectilinear rooms our structure prompt produces; a close
- * approximation for anything diagonal.
- */
-export function computeZoneAreaStats(zones: ZoneSummary[]): {
-  sumArea: number
-  unionArea: number
-  overlapArea: number
-  overlappingPairs: Array<{ aName: string; bName: string; areaSqMeters: number }>
-} {
-  const sumArea = zones.reduce((total, zone) => total + polygonArea(zone.polygon), 0)
-  const xsSet = new Set<number>()
-  const zsSet = new Set<number>()
-  for (const zone of zones) {
-    for (const [x, z] of zone.polygon) {
-      xsSet.add(x)
-      zsSet.add(z)
-    }
-  }
-  const xs = [...xsSet].sort((a, b) => a - b)
-  const zs = [...zsSet].sort((a, b) => a - b)
-  let unionArea = 0
-  let overlapArea = 0
-  const pairAreas = new Map<string, { aName: string; bName: string; areaSqMeters: number }>()
-  for (let i = 0; i < xs.length - 1; i++) {
-    const cellWidth = xs[i + 1]! - xs[i]!
-    if (cellWidth <= 0) continue
-    const cx = (xs[i]! + xs[i + 1]!) / 2
-    for (let j = 0; j < zs.length - 1; j++) {
-      const cellDepth = zs[j + 1]! - zs[j]!
-      if (cellDepth <= 0) continue
-      const cz = (zs[j]! + zs[j + 1]!) / 2
-      const covering = zones.filter(zone => pointInPolygon(cx, cz, zone.polygon))
-      if (covering.length === 0) continue
-      const cellArea = cellWidth * cellDepth
-      unionArea += cellArea
-      if (covering.length < 2) continue
-      overlapArea += cellArea
-      for (let a = 0; a < covering.length; a++) {
-        for (let b = a + 1; b < covering.length; b++) {
-          const key = [covering[a]!.id, covering[b]!.id].sort().join('|')
-          const entry = pairAreas.get(key) ?? {
-            aName: covering[a]!.name || covering[a]!.id,
-            bName: covering[b]!.name || covering[b]!.id,
-            areaSqMeters: 0,
-          }
-          entry.areaSqMeters += cellArea
-          pairAreas.set(key, entry)
-        }
-      }
-    }
-  }
-  return { sumArea, unionArea, overlapArea, overlappingPairs: [...pairAreas.values()] }
-}
-
-// Generation-side acceptance is deliberately tighter (±10%) than the eval
-// harness (±12%), so a scene that passes here also passes evaluation.
-const AREA_TOLERANCE_RATIO = 0.1
-// Ignore sliver overlaps from floating-point drift along shared boundaries.
-const MIN_MEANINGFUL_ZONE_OVERLAP_SQM = 0.05
-
-const FLOOR_AREA_FACT_KEYS = ['floor_area_sqm', 'area_sqm', 'room_area_sqm', 'area']
-
-function round1(value: number): number {
-  return Math.round(value * 10) / 10
-}
-
-/**
- * Deterministic total-area and zone-overlap acceptance against the confirmed
- * brief. Returns human-readable issue strings for `requirementMismatches`.
- * The area-mismatch message carries its own repair guidance because the
- * repair prompt forwards these strings verbatim — fixing a global area miss
- * requires re-partitioning, not nudging one room.
- */
-export type MismatchFinding = {
-  message: string
-  l10n: { id: 'zoneOverlap' | 'totalAreaOff' | 'bedroomShortfall' | 'missingSupportSpace'; params: Record<string, string | number> }
-}
-
-export function checkAreaRequirements(zones: ZoneSummary[], brief: DesignBrief): MismatchFinding[] {
-  if (zones.length === 0) return []
-  const issues: MismatchFinding[] = []
-  const stats = computeZoneAreaStats(zones)
-  for (const pair of stats.overlappingPairs) {
-    if (pair.areaSqMeters <= MIN_MEANINGFUL_ZONE_OVERLAP_SQM) continue
-    const params = { a: pair.aName, b: pair.bName, area: round1(pair.areaSqMeters) }
-    issues.push({ message: issueText('zh', 'zoneOverlap', params), l10n: { id: 'zoneOverlap', params } })
-  }
-  const target = numberFact(brief, FLOOR_AREA_FACT_KEYS)
-  if (target !== undefined && target > 0) {
-    // Union (not sum) so overlapping rooms can't inflate the reading.
-    const actual = stats.unionArea
-    if (Math.abs(actual - target) > target * AREA_TOLERANCE_RATIO) {
-      const deviation = Math.round((Math.abs(actual - target) / target) * 100)
-      const params = { target, actual: round1(actual), deviation, tolerance: Math.round(AREA_TOLERANCE_RATIO * 100) }
-      issues.push({ message: issueText('zh', 'totalAreaOff', params), l10n: { id: 'totalAreaOff', params } })
-    }
-  }
-  return issues
-}
-
-/**
- * A room with no door of its own is a sealed-off space nobody can walk
- * into. `verify_scene` only checks whether a *level* has any doors at all,
- * not whether each individual room does, so a room that got missed during
- * the openings phase (especially likely now that rooms are built and
- * connected one at a time) slips through unnoticed. We match each zone's
- * polygon edges to every wall that covers any part of that edge — a T
- * junction can leave one long zone edge represented by several shorter wall
- * segments after dedup, so this checks all overlapping walls rather than a
- * single exact match — and check whether any of them hosts a door.
- */
-function findDoorlessRooms(zones: ZoneSummary[], walls: WallWithOpenings[]): string[] {
-  const doorless: string[] = []
-  for (const zone of zones) {
-    let hasDoor = false
-    for (let i = 0; i < zone.polygon.length && !hasDoor; i++) {
-      const edgeStart = zone.polygon[i]!
-      const edgeEnd = zone.polygon[(i + 1) % zone.polygon.length]!
-      const edge = { start: edgeStart, end: edgeEnd }
-      hasDoor = walls.some(
-        w => segmentsCoverSameLine(w, edge) && w.openings.some(o => o.type === 'door'),
-      )
-    }
-    if (!hasDoor) doorless.push(zone.name || zone.id)
-  }
-  return doorless
-}
-
-// Fuzzy, name-based room classification for the circulation check below —
-// same limitation as `compareRoomsToRequirements`: `create_room` has no
-// `type` field, only a model-chosen name.
-type CirculationRoomKind = 'bedroom' | 'blocked-service' | 'passable'
-
-// Delegates to the shared trilingual vocabulary. living_kitchen resolves to
-// passable (an open kitchen merged into the living space IS the public path —
-// the case-02 lesson); pure kitchens/bathrooms block transit.
-function classifyCirculationRoomKind(name: string): CirculationRoomKind {
-  switch (classifyRoomTypeByName(name)) {
-    case 'bedroom':
-      return 'bedroom'
-    case 'kitchen':
-    case 'bathroom':
-      return 'blocked-service'
-    default:
-      return 'passable'
-  }
-}
-
-// Which zone(s) a wall's segment lies along the boundary of. A door on a
-// wall that hosts two zones' edges connects those two rooms; a door on a
-// wall that only hosts one zone's edge leads outside (or to an
-// as-yet-untracked space) and doesn't contribute an interior connection.
-function wallHostZoneIds(
-  wall: { start: [number, number]; end: [number, number] },
-  zones: ZoneSummary[],
-): string[] {
-  const hostIds: string[] = []
-  for (const zone of zones) {
-    for (let i = 0; i < zone.polygon.length; i++) {
-      const edgeStart = zone.polygon[i]!
-      const edgeEnd = zone.polygon[(i + 1) % zone.polygon.length]!
-      if (segmentsCoverSameLine(wall, { start: edgeStart, end: edgeEnd })) {
-        hostIds.push(zone.id)
-        break
-      }
-    }
-  }
-  return hostIds
-}
-
-/**
- * Deterministic check for the circulation rule the structure-phase prompt
- * asks the model to plan for ("每个卧室都必须能只经过公共动线到达，不能要求
- * 先穿过卫生间、厨房或另一个卧室才能到达") but never verifies — the model can
- * (and, per earlier observed generations, sometimes does) route a bedroom's
- * only door through another bedroom or straight into the kitchen/bathroom.
- *
- * Builds a room-adjacency graph from doors: a door on a wall connects every
- * zone whose boundary that wall's segment lies along (usually the two rooms
- * either side of an interior wall). Then, for each bedroom, does a BFS that
- * is only allowed to terminate *at* a kitchen/bathroom/other-bedroom (a dead
- * end — not a valid path onward) but never allowed to continue *through*
- * one, looking for any reachable room that isn't itself a bedroom, kitchen,
- * or bathroom. A bedroom with no such reachable room is flagged.
- *
- * Known limitation: this treats every non-bedroom/kitchen/bathroom room
- * (living room, hallway, entry, dining, study, storage, ...) as valid
- * circulation, which is a looser reading than "must be a genuine public
- * circulation hub" — deliberately so, since the prompt's actual requirement
- * is only ever framed as the negative rule above, not a positive list of
- * qualifying room types. An intentionally adjoining suite (e.g. a bedroom
- * opening only into a dressing room that opens into the hallway) would also
- * false-positive here, same class of tradeoff as `findStrayWindows`.
- */
-export function findIsolatedBedrooms(zones: ZoneSummary[], walls: WallWithOpenings[]): string[] {
-  const kindById = new Map<string, CirculationRoomKind>()
-  for (const zone of zones) kindById.set(zone.id, classifyCirculationRoomKind(zone.name || ''))
-  // 1K 豁免（kitchenIsCirculation，与 validator/gates 同判定）：唯一居室且
-  // 无走廊时，厨房按可通行处理。
-  const zoneTypesForExemption = zones.map(zone => classifyRoomTypeByName(zone.name || ''))
-  if (kitchenIsCirculation({
-    bedrooms: [...kindById.values()].filter(kind => kind === 'bedroom').length,
-    hallways: zoneTypesForExemption.filter(type => type === 'hallway').length,
-    livingLike: zoneTypesForExemption.filter(type =>
-      type === 'living' || type === 'living_kitchen' || type === 'dining').length,
-  })) {
-    for (const zone of zones) {
-      if (classifyRoomTypeByName(zone.name || '') === 'kitchen') kindById.set(zone.id, 'passable')
-    }
-  }
-
-  const bounds = overallZoneBounds(zones)
-  const adjacency = new Map<string, Set<string>>()
-  // Zones with a door in an exterior wall (a door wall hosted by exactly one
-  // zone, sitting on the building boundary): that's an entry door straight to
-  // the outside, which connects the room to the public world without any
-  // interior public room. Without this, a single-room dwelling — whose only
-  // door IS the entry door — is flagged isolated and burns repair rounds on
-  // an unfixable finding (plan-first builds hit this every time on case-01).
-  const exteriorDoorZoneIds = new Set<string>()
-  for (const zone of zones) adjacency.set(zone.id, new Set())
-  for (const wall of walls) {
-    if (!wall.openings.some(o => o.type === 'door')) continue
-    const hostIds = wallHostZoneIds(wall, zones)
-    if (hostIds.length === 1 && bounds) {
-      const midX = (wall.start[0] + wall.end[0]) / 2
-      const midZ = (wall.start[1] + wall.end[1]) / 2
-      const onBoundary =
-        Math.abs(midX - bounds.minX) <= EXTERIOR_BOUNDARY_EPSILON_M ||
-        Math.abs(midX - bounds.maxX) <= EXTERIOR_BOUNDARY_EPSILON_M ||
-        Math.abs(midZ - bounds.minZ) <= EXTERIOR_BOUNDARY_EPSILON_M ||
-        Math.abs(midZ - bounds.maxZ) <= EXTERIOR_BOUNDARY_EPSILON_M
-      if (onBoundary) exteriorDoorZoneIds.add(hostIds[0]!)
-    }
-    for (let i = 0; i < hostIds.length; i++) {
-      for (let j = i + 1; j < hostIds.length; j++) {
-        adjacency.get(hostIds[i]!)?.add(hostIds[j]!)
-        adjacency.get(hostIds[j]!)?.add(hostIds[i]!)
-      }
-    }
-  }
-
-  const isolated: string[] = []
-  for (const zone of zones) {
-    if (kindById.get(zone.id) !== 'bedroom') continue
-    if (exteriorDoorZoneIds.has(zone.id)) continue
-    const visited = new Set<string>([zone.id])
-    const queue: string[] = [zone.id]
-    let reachedPassable = false
-    while (queue.length > 0 && !reachedPassable) {
-      const current = queue.shift()!
-      for (const neighborId of adjacency.get(current) ?? []) {
-        if (visited.has(neighborId)) continue
-        visited.add(neighborId)
-        if (kindById.get(neighborId) === 'passable') {
-          reachedPassable = true
-          break
-        }
-        // A bedroom or kitchen/bathroom neighbor is a dead end for this
-        // check — reachable, but not allowed to be transited *through*, so
-        // it's marked visited (no revisiting) but never enqueued.
-      }
-    }
-    if (!reachedPassable) isolated.push(zone.name || zone.id)
-  }
-  return isolated
-}
-
-// Approximates "is this wall on the building's exterior?" by the overall
-// bounding box of every room (there's no stored footprint polygon to check
-// against once a wall isn't touching the outer edge of that box, it's
-// almost certainly an interior partition). Rectangular-ish footprints only
-// — an L-shaped building could false-positive on the notch, so this is a
-// best-effort signal fed into repair rounds, not a hard failure.
-const EXTERIOR_BOUNDARY_EPSILON_M = 0.15
-
-function overallZoneBounds(
-  zones: ZoneSummary[],
-): { minX: number; maxX: number; minZ: number; maxZ: number } | null {
-  if (zones.length === 0) return null
-  const bounds = { minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity }
-  for (const zone of zones) {
-    for (const [x, z] of zone.polygon) {
-      if (x < bounds.minX) bounds.minX = x
-      if (x > bounds.maxX) bounds.maxX = x
-      if (z < bounds.minZ) bounds.minZ = z
-      if (z > bounds.maxZ) bounds.maxZ = z
-    }
-  }
-  return bounds
-}
-
-// Returns the OFFENDING WALL IDS; callers render the message per language
-// (zh for diagnostics/prompts, the user's language for the reply summary).
-function findStrayWindows(zones: ZoneSummary[], walls: WallWithOpenings[]): string[] {
-  const bounds = overallZoneBounds(zones)
-  if (!bounds) return []
-  const wallIds: string[] = []
-  for (const wall of walls) {
-    if (!wall.openings.some(o => o.type === 'window')) continue
-    const midX = (wall.start[0] + wall.end[0]) / 2
-    const midZ = (wall.start[1] + wall.end[1]) / 2
-    const onBoundary =
-      Math.abs(midX - bounds.minX) <= EXTERIOR_BOUNDARY_EPSILON_M ||
-      Math.abs(midX - bounds.maxX) <= EXTERIOR_BOUNDARY_EPSILON_M ||
-      Math.abs(midZ - bounds.minZ) <= EXTERIOR_BOUNDARY_EPSILON_M ||
-      Math.abs(midZ - bounds.maxZ) <= EXTERIOR_BOUNDARY_EPSILON_M
-    if (!onBoundary) wallIds.push(wall.id)
-  }
-  return wallIds
-}
-
 /**
  * `create_room` has no `type` field, only a model-chosen `name`, so this is
  * necessarily a fuzzy keyword match rather than an exact comparison. Scoped
@@ -4868,25 +3815,30 @@ function findStrayWindows(zones: ZoneSummary[], walls: WallWithOpenings[]): stri
  * it mentioned a number of bedrooms. Only requestedRooms (the brief's own
  * explicit room list) drives which support spaces are checked for.
  */
-function compareRoomsToRequirements(zoneNames: string[], brief: DesignBrief): MismatchFinding[] {
+function compareRoomsToRequirements(
+  zones: ZoneSummary[],
+  brief: DesignBrief,
+  zoneTypes: Record<string, RoomType> = {},
+): MismatchFinding[] {
   const issues: MismatchFinding[] = []
+  const actualTypes = zones.map(zone => zoneTypes[zone.id] ?? classifyRoomTypeByName(zone.name))
   const bedroomCount = numberFact(brief, ['bedroom_count', 'bedrooms'])
   if (bedroomCount !== undefined && bedroomCount > 0) {
-    const actual = zoneNames.filter(name => ROOM_NAME_PATTERNS.bedroom.test(name)).length
+    const actual = actualTypes.filter(type => type === 'bedroom').length
     if (actual < bedroomCount) {
       const params = { expected: bedroomCount, actual }
       issues.push({ message: issueText('zh', 'bedroomShortfall', params), l10n: { id: 'bedroomShortfall', params } })
     }
   }
   const requestedRooms = arrayFact(brief, ['rooms', 'required_rooms', 'function_spaces'])
-  const supportSpaces: Array<[string, RegExp]> = [
-    ['厨房', ROOM_NAME_PATTERNS.kitchen],
-    ['卫生间', ROOM_NAME_PATTERNS.bathroom],
-    ['客厅', ROOM_NAME_PATTERNS.living],
+  const supportSpaces: Array<[string, RegExp, ReadonlySet<RoomType>]> = [
+    ['厨房', ROOM_NAME_PATTERNS.kitchen, new Set(['kitchen', 'living_kitchen'])],
+    ['卫生间', ROOM_NAME_PATTERNS.bathroom, new Set(['bathroom'])],
+    ['客厅', ROOM_NAME_PATTERNS.living, new Set(['living', 'living_kitchen'])],
   ]
-  for (const [label, pattern] of supportSpaces) {
+  for (const [label, pattern, acceptedTypes] of supportSpaces) {
     const wasRequested = requestedRooms.some(room => pattern.test(room))
-    if (wasRequested && !zoneNames.some(name => pattern.test(name))) {
+    if (wasRequested && !actualTypes.some(type => acceptedTypes.has(type))) {
       const params = { label }
       issues.push({ message: issueText('zh', 'missingSupportSpace', params), l10n: { id: 'missingSupportSpace', params } })
     }
@@ -5264,22 +4216,6 @@ function buildGenerationArgs(session: WorkflowSession): Record<string, unknown> 
   }
 }
 
-function confirmBrief(brief: DesignBrief): DesignBrief {
-  const confirm = (facts: RequirementFact[]) => facts.map(fact => ({
-    ...fact,
-    confirmationStatus: 'confirmed' as const,
-  }))
-  return {
-    ...brief,
-    existingCondition: confirm(brief.existingCondition),
-    designGoals: confirm(brief.designGoals),
-    hardConstraints: confirm(brief.hardConstraints),
-    assumptions: confirm(brief.assumptions),
-    uncertainties: [],
-    conflicts: [],
-  }
-}
-
 // place_item's `rotation` parameter is interpreted as radians by the scene
 // renderer (Three.js convention), but nothing in the tool's schema or
 // description tells the model that — so it reliably supplies degree-shaped
@@ -5308,12 +4244,6 @@ function parseToolArgs(raw: string): Record<string, unknown> {
   const parsed = JSON.parse(raw) as unknown
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
   return parsed as Record<string, unknown>
-}
-
-function isSupportedImage(dataUrl: string): boolean {
-  const match = dataUrl.match(/^data:image\/(png|jpe?g);base64,([a-z0-9+/=]+)$/i)
-  if (!match) return false
-  return (match[2]?.length ?? Number.POSITIVE_INFINITY) <= 28 * 1024 * 1024
 }
 
 function isFactValue(value: unknown): value is RequirementFact['value'] {
@@ -5392,10 +4322,6 @@ function nullableString(value: unknown): string | null {
 
 function nullableNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
-}
-
-export function publicEditorUrl(sceneId: string | null): string | null {
-  return sceneId ? `/scene/${encodeURIComponent(sceneId)}` : null
 }
 
 // `count` is the number of *content* nodes (scaffolding excluded, see

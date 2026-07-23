@@ -191,6 +191,24 @@ describe('each gate fails on its broken scene', () => {
     const report = evaluateCompletionGates(zones, walls, reduced, {})
     expect(report.failures.some(f => f.gate === 7 && f.message.includes('床'))).toBe(true)
   })
+
+  test('gate 7: a door-connected closet room satisfies the wardrobe requirement', () => {
+    const zones: GateZone[] = [
+      { id: 'z-bed', name: '卧室', polygon: rect(0, 0, 4, 3) },
+      { id: 'z-closet', name: 'クローゼット', polygon: rect(4, 0, 1, 3) },
+    ]
+    const walls: GateWall[] = [
+      wall('w-between', [4, 0], [4, 3], [{ type: 'door' }]),
+    ]
+    const report = evaluateCompletionGates(
+      zones,
+      walls,
+      [item('i-bed', '双人床', 2, 1.5)],
+      { zoneTypes: { 'z-bed': 'bedroom', 'z-closet': 'storage' } },
+    )
+
+    expect(report.failures.filter(failure => failure.gate === 7)).toEqual([])
+  })
 })
 
 describe('classifyZoneType', () => {

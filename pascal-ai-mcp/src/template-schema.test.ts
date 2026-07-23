@@ -39,11 +39,50 @@ describe('TemplateRecordSchema', () => {
     delete raw.schemaVersion
     expect(TemplateRecordSchema.safeParse(raw).success).toBe(false)
     expect(parseTemplateRecord(raw).schemaVersion).toBe(TEMPLATE_SCHEMA_VERSION)
+    raw.schemaVersion = 1
+    expect(parseTemplateRecord(raw).schemaVersion).toBe(TEMPLATE_SCHEMA_VERSION)
+  })
+
+  test('rejects overlapping or out-of-footprint stretch bands at exact paths', () => {
+    const raw = sample()
+    raw.adaptation = {
+      areaRatio: { min: 0.8, max: 1.2 },
+      xBands: [
+        { from: 1, to: 4, weight: 1 },
+        { from: 3, to: 8, weight: 1 },
+      ],
+    }
+    const result = TemplateRecordSchema.safeParse(raw)
+    expect(result.success).toBe(false)
+    if (!result.success) {
+      const message = formatTemplateSchemaError(result.error)
+      expect(message).toContain('adaptation.xBands[1]')
+      expect(message).toContain('adaptation.xBands[1].to')
+    }
+  })
+
+  test('rejects a stretch band that reverses the axis at the minimum ratio', () => {
+    const raw = sample()
+    raw.adaptation = {
+      areaRatio: { min: 0.1, max: 1.2 },
+      xBands: [
+        { from: 1, to: 1.1, weight: 100 },
+        { from: 2, to: 7, weight: 1 },
+      ],
+    }
+
+    const result = TemplateRecordSchema.safeParse(raw)
+    expect(result.success).toBe(false)
+    if (!result.success) {
+      const message = formatTemplateSchemaError(result.error)
+      expect(message).toContain('adaptation.xBands[0].weight')
+      expect(message).toContain('non-monotonic')
+    }
   })
 
   test('rejects unsupported future versions instead of guessing', () => {
     const raw = sample()
-    raw.schemaVersion = 2
+    raw.schemaVersion = 3
     expect(() => migrateTemplateRecord(raw)).toThrow('schemaVersion')
   })
 

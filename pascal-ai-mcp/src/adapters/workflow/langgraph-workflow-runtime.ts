@@ -1,29 +1,27 @@
 import type { RunnableConfig } from '@langchain/core/runnables'
-import { Command, END, interrupt, START, StateGraph } from '@langchain/langgraph'
-import type { SqliteCheckpointSaver } from './persistence/sqlite-checkpoint-saver'
-import {
-  DurableWorkflowState,
-  type DurableWorkflowGraphState,
-} from './workflow-state'
-import { WORKFLOW_GRAPH_VERSION } from './workflow-identity'
+import { Annotation, Command, END, interrupt, START, StateGraph } from '@langchain/langgraph'
+import type { SqliteCheckpointSaver } from '../../persistence/sqlite-checkpoint-saver'
+import type {
+  WorkflowNodes,
+  WorkflowRuntime,
+  WorkflowRuntimeFactory,
+  WorkflowSnapshot,
+} from '../../ports/workflow-runtime'
+import type { DurableWorkflowGraphState, DurableWorkflowNext } from '../../workflow-state'
+import { WORKFLOW_GRAPH_VERSION } from '../../workflow-identity'
 
-export type DurableWorkflowSnapshot = {
-  values: DurableWorkflowGraphState
-  next: string[]
-  interrupted: boolean
-}
+const DurableWorkflowState = Annotation.Root({
+  sessionId: Annotation<string>,
+  sessionVersion: Annotation<number>,
+  requestId: Annotation<string>,
+  phase: Annotation<DurableWorkflowGraphState['phase']>,
+  next: Annotation<DurableWorkflowNext>,
+})
 
-export type DurableWorkflowNodes = {
-  route: (state: DurableWorkflowGraphState) => Promise<Partial<DurableWorkflowGraphState>>
-  legacy: (state: DurableWorkflowGraphState) => Promise<Partial<DurableWorkflowGraphState>>
-  plan: (state: DurableWorkflowGraphState) => Promise<Partial<DurableWorkflowGraphState>>
-  construct: (state: DurableWorkflowGraphState) => Promise<Partial<DurableWorkflowGraphState>>
-}
-
-export class DurableWorkflowRuntime {
+export class LangGraphWorkflowRuntime implements WorkflowRuntime {
   private readonly graph
 
-  constructor(nodes: DurableWorkflowNodes, saver: SqliteCheckpointSaver) {
+  constructor(nodes: WorkflowNodes, saver: SqliteCheckpointSaver) {
     this.graph = new StateGraph(DurableWorkflowState)
       .addNode('route', nodes.route)
       .addNode('legacy', nodes.legacy)
@@ -67,17 +65,14 @@ export class DurableWorkflowRuntime {
   }
 
   async resume(workflowRunId: string, requestId: string): Promise<DurableWorkflowGraphState> {
-    return await this.graph.invoke(
-      new Command({ resume: { requestId } }),
-      workflowConfig(workflowRunId),
-    )
+    return await this.graph.invoke(new Command({ resume: { requestId } }), workflowConfig(workflowRunId))
   }
 
   async retryPending(workflowRunId: string): Promise<DurableWorkflowGraphState> {
     return await this.graph.invoke(null, workflowConfig(workflowRunId))
   }
 
-  async snapshot(workflowRunId: string): Promise<DurableWorkflowSnapshot | undefined> {
+  async snapshot(workflowRunId: string): Promise<WorkflowSnapshot | undefined> {
     const snapshot = await this.graph.getState(workflowConfig(workflowRunId))
     if (!snapshot.config?.configurable?.checkpoint_id) return undefined
     return {
@@ -86,6 +81,12 @@ export class DurableWorkflowRuntime {
       interrupted: snapshot.tasks.some(task => task.interrupts.length > 0),
     }
   }
+}
+
+export function createLangGraphWorkflowRuntimeFactory(
+  saver: SqliteCheckpointSaver,
+): WorkflowRuntimeFactory {
+  return nodes => new LangGraphWorkflowRuntime(nodes, saver)
 }
 
 function waitingOrFinished(state: DurableWorkflowGraphState): 'wait' | 'finish' {

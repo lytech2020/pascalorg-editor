@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { Database } from 'bun:sqlite'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { request as httpRequest, type IncomingHttpHeaders } from 'node:http'
+import { createServer as createNetServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AppDatabase } from './persistence/database'
@@ -66,12 +67,29 @@ async function waitForRequest(base: string, requestId: string): Promise<Record<s
   throw new Error(`request ${requestId} did not finish`)
 }
 
+function availablePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = createNetServer()
+    probe.once('error', reject)
+    probe.listen(0, '127.0.0.1', () => {
+      const address = probe.address()
+      if (!address || typeof address === 'string') {
+        probe.close()
+        reject(new Error('failed to allocate an integration-test port'))
+        return
+      }
+      probe.close(error => error ? reject(error) : resolve(address.port))
+    })
+  })
+}
+
 async function startServer(dataDir: string, extraEnv: Record<string, string> = {}) {
+  const allocatedPort = await availablePort()
   const proc = Bun.spawn(['bun', 'src/server.ts'], {
     cwd: join(import.meta.dir, '..'),
     env: {
       ...process.env,
-      AI_MCP_PORT: '0',
+      AI_MCP_PORT: String(allocatedPort),
       AI_MCP_MAX_BODY_MB: '1',
       AI_MCP_SESSION_FILE: join(dataDir, 'sessions.json'),
       AI_MCP_DATABASE_FILE: join(dataDir, 'ai.db'),
@@ -113,6 +131,10 @@ async function startServer(dataDir: string, extraEnv: Record<string, string> = {
     }
     void scan()
   })
+  if (port !== allocatedPort) {
+    proc.kill()
+    throw new Error(`server listened on ${port}, expected allocated port ${allocatedPort}`)
+  }
   return { proc, port }
 }
 
@@ -147,8 +169,10 @@ function seedSession(
 // Boots the real server (including its MCP stdio child) and verifies the
 // T1.3 request-identity contract over actual HTTP. Isolation: a temp SQLite
 // database holds all live state; AI_MCP_SESSION_FILE points at an absent
-// legacy import source. AI_MCP_PORT=0 lets the OS assign a free port, parsed
-// from the child's own startup log so we cannot talk to another server.
+// legacy import source. The parent asks the OS for an ephemeral port before
+// spawning because Bun 1.3 on macOS rejects Bun.serve({ port: 0 }); the port
+// is still parsed from the child's own startup log so we cannot talk to a
+// different server.
 // Uses the cancel action so no model call (and no API key) is involved.
 describe('server request identity (T1.3)', () => {
   test(
@@ -187,6 +211,18 @@ describe('server request identity (T1.3)', () => {
         })
         expect(missingCancel.status).toBe(404)
         expect(JSON.parse(missingCancel.body)).toMatchObject({ error: 'session_not_found' })
+
+        const weather = await requestHttp(`${base}/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId: `guardrail-${crypto.randomUUID().slice(0, 8)}`,
+            message: '今天天气怎么样？',
+          }),
+        })
+        expect(weather.status).toBe(202)
+        const weatherRequestId = (JSON.parse(weather.body) as { requestId: string }).requestId
+        expect(await waitForRequest(base, weatherRequestId)).toMatchObject({ status: 'succeeded' })
 
         const response = await requestHttp(`${base}/chat`, {
           method: 'POST',
@@ -311,9 +347,20 @@ describe('server request identity (T1.3)', () => {
             SELECT request_id, kind, status FROM ai_requests ORDER BY queued_at, request_id
           `).all() as Array<{ request_id: string; kind: string; status: string }>
           expect(requests).toEqual([
+            { request_id: weatherRequestId, kind: 'chat', status: 'succeeded' },
             { request_id: firstRequestId, kind: 'cancel', status: 'succeeded' },
             { request_id: secondRequestId, kind: 'cancel', status: 'succeeded' },
           ])
+          expect(audit.query(`
+            SELECT policy_version, decision, reason_code, input_kind
+            FROM ai_guardrail_events WHERE request_id = ?
+          `).get(weatherRequestId)).toEqual({
+            policy_version: 'scope-v1', decision: 'block',
+            reason_code: 'explicit_weather', input_kind: 'text',
+          })
+          expect(audit.query(`
+            SELECT COUNT(*) AS count FROM ai_model_calls WHERE request_id = ?
+          `).get(weatherRequestId)).toEqual({ count: 0 })
           const state = audit.query(`
             SELECT version, state_json FROM ai_sessions WHERE session_id = ?
           `).get(sessionId) as { version: number; state_json: string }

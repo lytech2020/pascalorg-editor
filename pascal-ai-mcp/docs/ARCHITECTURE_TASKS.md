@@ -251,13 +251,15 @@
 
 当前 AI-only 阶段目标 / 验收：空间分类不再只依赖 session 或可变房名；删除 AI session 后，AI 服务仍可通过自己持久化的 scene/zone 语义投影完成只依赖房间分类的判断；domain 单测不需要模型/MCP/DB/React。**直接打开场景的非 AI 消费方读取正式空间语义，仍属于公共 scene schema 能力，当前不承诺。**
 
-### [ ] T3.1 AI 侧空间语义投影（当前范围内方案）
+### [x] T3.1 AI 侧空间语义投影（当前范围内方案）
+- 完成于 2026-07-22（待提交）：新增已确认的 `SPACE_SEMANTICS_ADR.md`，明确 AI DB 投影而非公共 Zone/MCP schema；migration v11 建立 `ai_scene_spaces`，以 sceneId+zoneId 保存开放用途、室内/服务/交通/室外/未知分类、来源、置信度和 plan/scene 版本引用。`create_room` 成功后按返回 zoneId 写投影；旧场景只在显式读取路径进行一次性低置信导入，已有记录不因改名被覆盖，花园/庭院按 outdoor 保存。投影不含 Prompt、回复、几何或场景快照，删除 session 不级联删除该非内容型 scene 语义。本轮未修改 `packages/**`。
 - 内容：先在 `pascal-ai-mcp/docs/` 写并评审空间语义 ADR，再建立 AI application DB 的 `ai_scene_spaces`（名称可由 ADR 最终确定）投影。当前 `ZoneNode` 同时用于室内房间和 `Back garden` 等外部区域，不能直接把 AI `RoomType` 当成所有 Zone 的类型。ADR 至少决定：①AI 领域自己的 `SpaceUsage`/分类模型（室内、室外、交通、服务等）和 `RoomType → SpaceUsage` 显式映射；②未知/自定义用途的开放字符串兼容；③sceneId、zoneId、来源、置信度、templateId/planRoomId/planVersion/sceneVersion 的契约；④session 删除后的保留语义与旧场景一次性低置信推断策略。新生成房间在既有 `create_room` 返回 zoneId 后写入 AI DB 投影；不修改 Zone、MCP 参数或场景 metadata。旧场景只在明确的导入/inspect 路径按 room-vocab 推断一次并持久化低置信结果，正常运行不反复猜。
 - 涉及：仅 `pascal-ai-mcp/src/domain/`、`src/persistence/`、`src/scene-executor.ts`、测试与本目录文档。
 - 完成标准：ADR 获得确认；新生成的室内空间有稳定的 AI 侧用途记录，花园等外部 Zone 不会被误标成室内房间；用户重命名 Zone 后记录不漂移；删除 session 后非内容型语义投影仍可按 sceneId/zoneId 查询；未知用途不会导致读取整条记录失败。数据库与日志不得保存完整 Prompt、回复或场景快照。
 - 依据：§6.3、§8.1。
 
-### [ ] T3.2 AI 侧消费空间语义投影，session 降级为缓存
+### [x] T3.2 AI 侧消费空间语义投影，session 降级为缓存
+- 完成于 2026-07-22（待提交）：新增 `SceneSpaceStore` port 与 `SceneSpaceService`；gates、layout metrics、modify 家具清单、诊断和隔绝卧室检查统一按“持久 scene projection → session cache → 一次性名称推断”解析 zone 类型。重命名不改变已有类型；projection 读写失败有明确日志并降级，完整 LayoutPlan 缺失时既有 legacy modify 路径会在回复中明确提示，不把用途投影冒充拓扑快照。repository、application service、executor callback 和 metrics 回归覆盖投影优先、改名稳定、花园保护及 session 删除后保留。
 - 内容：`scene-executor.executeLayoutPlan` 施工时写入 T3.1 的 AI DB 投影；gates/metrics/modify 中依赖房间分类的逻辑优先按 sceneId/zoneId 读取该投影，`zoneRoomTypes` 与名字正则降级为旧场景一次性导入兜底（保留命中指标和未来删除条件）。LayoutIntent/LayoutPlan 仍由 AI application DB 持有，并通过来源引用关联；不能把用途投影误当成完整 LayoutPlan，也不能宣称非 AI Editor 已获得该语义。
 - 涉及：`src/scene-executor.ts`、`src/agent.ts`（gateTargetsForSession、collectDiagnostics 一带）、`src/layout-metrics.ts`。
 - 完成标准：删掉 AI session 后，AI inspect、校验、家具清单以及 modify 中仅依赖房间分类的判断结果不变；用户重命名房间不再影响类型判定。需要完整 LayoutPlan 的重建/拓扑修改必须从 AI DB 的 scene/plan 关联读取，缺失时明确降级或拒绝，不能静默假装可恢复。
@@ -271,14 +273,17 @@
 - 完成标准：新场景的正式语义可被非 AI 入口读取；花园等外部 Zone 不被误标成房间；旧场景继续解析；未知新用途不会让整场景加载失败。
 - 解锁条件：项目负责人明确允许修改对应 `packages/**` 目录，并按仓库架构流程单独评审。
 
-### [ ] T3.3 agent.ts 拆分（application/domain/ports/adapters）
+### [x] T3.3 agent.ts 拆分（application/domain/ports/adapters）
+- 完成于 2026-07-22（待提交）：model client、scene gateway、workflow runtime/checkpoint、scene-space store 均已抽为 ports；OpenAI client construction 与 LangGraph StateGraph/runtime 只存在于 adapters/composition root，`DurableWorkflowGraphState` 为纯对象类型。ingest、existing-scene inspect/route、generate/modify 顶层编排、completion/finalization、gate/failure policy 与 scene-space projection 已成为独立 application service；房型/面积 policy、面积验收、墙段几何、房间动线和 scope guardrail 已进入纯 domain。递归依赖边界测试会检查传递 import，domain/application/ports 不得反向依赖 persistence、MCP、OpenAI、LangGraph 或 SQLite；各纯 domain 模块有独立单测。agent 从 HEAD 的 5,430 行降至 4,331 行，只保留 session/lease 协调、场景写 fencing 和低层工具执行等必须贴近副作用边界的能力；在 T2.4 未获得 MCP 原子恢复能力前，不为追求行数把这些顺序约束伪装成可重放的纯 workflow。
+- 真实供应商抽查：case-12 scope boundary 直接通过；case-03 实际场景 gates 全过、remainingIssueCount=0，首次报告唯一失败来自评测器把日式分离卫浴的 `トイレ/浴室/洗面室` 错算为三卫，修正为按功能组计数后重判为一卫；case-02 首次发现门连独立 `クローゼット` 仍被要求在卧室重复放衣柜，统一修正 executor 与 completion gate 后付费重跑通过（phase=completed、gates=pass、quality=88、modelCalls=1）。完整测试 651 pass / 0 fail、`check-types` 干净，证明本轮分层重构未改变合法业务结果。
 - 内容：按评估 §6.4 的目录结构分批拆：第一批 ports（model-client、scene-gateway、workflow-store、workflow-runtime/checkpointer）+ adapters 提取，具体 LangGraph StateGraph/saver 只存在于 adapter/composition root，application 只依赖可替换的 workflow runtime port；第二批 generate/modify/inspect 三条工作流拆成独立 application service；第三批房名/面积/动线等辅助算法沉入 domain。每批独立提交、测试全过再下一批，不做一次性大爆炸重构。
 - 涉及：`src/agent.ts`（行数下降作为趋势指标，不把 `<800` 当架构验收门槛）、新 `src/domain|application|ports|adapters/`。
 - 完成标准：domain 目录零依赖 HTTP/MCP/DB/LangGraph；application 只依赖 ports，不直接依赖具体 adapter；依赖边界测试纳入 `pascal-ai-mcp` 的常规 `bun test`（由既有 CI 自动执行，不修改 `.github/**`）；`bun test` 全过且 eval 抽查 2–3 个 case 结果不变。
 - 依赖：建议在 T2.x 落定后做（异步化会改 agent 入口，先拆会白拆一部分）。
 - 依据：§6.4。
 
-### [ ] T3.4 面积/房型 policy 收口
+### [x] T3.4 面积/房型 policy 收口
+- 完成于 2026-07-22（待提交）：`TYPE_TO_KIND` 与 `areaBoundFor` 移入 `domain/policy/room-policy.ts`，validator 仅为旧消费方重导出；strategy、modify-ops 直接依赖 domain policy，不再反向导入 plan-validator。现有 policy/validator/strategy/modify 回归保持行为不变。
 - 内容：把 `areaBoundFor`、`TYPE_TO_KIND`、房型分类、窗/动线/最小门边、必需空间、DK/LDK 市场规则从 `plan-validator.ts` 等处抽到 `domain/policy/`（或并入 norms/），validator、strategy、modify-ops、template matcher 统一从 policy 导入，消除"策略层反向依赖校验器"。
 - 涉及：`src/plan-validator.ts`、`src/strategy.ts`、`src/modify-ops.ts`、`src/norms/`。
 - 完成标准：`grep "from './plan-validator'" src/strategy.ts src/modify-ops.ts` 为空；行为零变化（现有单测全过）。
@@ -299,7 +304,8 @@
 - 完成标准：SceneStore 表结构变化不再可能悄悄弄坏代理；代理进程不再打开 pascal.db。
 - 依据：§6.7。
 
-### [ ] T3.7 防护栏前移
+### [x] T3.7 防护栏前移
+- 完成于 2026-07-22（待提交）：新增纯 domain `scope-policy`，在 requirement extraction 前只确定性拦截中/日/英明确天气问句；建筑语料放行、带图请求默认有建筑上下文、不确定文本 fail-open。migration v10 与 audit repository 保存 request 关联、稳定 decision/reason/policy version/latency，不保存原问题；现有 extraction relevant 检查继续作为第二道。单测与真实队列链路验证被拦请求的 `ai_model_calls` 为 0。
 - 内容：在 requirement extraction 之前加低成本 scope 判定：确定性规则只拦截高置信、明确越界内容；不确定时 fail-open 到 fast model 或 extraction，避免关键词 allowlist 误伤自然语言。带户型图片/DXF 的请求默认视为有建筑上下文，除非有明确安全原因。被拦截请求写独立 `ai_guardrail_events`（reason_code、policy_version、decision、latency），并关联 ai_requests；现有 extraction 内的 `relevant:false` 保留为第二道。若 fast model 参与分类，它的调用照常进入 ai_model_calls，不能宣称模型用量为 0。
 - 涉及：`src/agent.ts`（ingest 前）、`src/lang/`。
 - 完成标准："今天天气怎么样"被确定性规则拦截且 `ai_model_calls` 里该请求零调用；中文/日文/英文正常户型语料和带图短文本的回归集无明显误拦截；所有决策有稳定 reason_code/policy_version 可统计。
@@ -310,21 +316,24 @@
 
 ## 阶段 4：真正的 template-first 与质量闭环（评估 §9 Phase 4）
 
-### [ ] T4.1 模板候选前置到模型 Intent 之前
+### [x] T4.1 模板候选前置到模型 Intent 之前
+- 完成于 2026-07-22（待提交）：`buildLayoutPlan` 在 Intent prompt 前用 roomProgram、面积、market、厨房模式、requiredRooms 与 typology 约束查询模板；高置信候选直接构造可持久化 LayoutIntent、adapt+validate 并返回 `modelCalls: 0`。直达默认关闭，只有结构化 brief 中所有有效规划事实均能被确定性查询表达时才放行；现状、未决项或未知布局约束一律回退模型 enrichment，不静默丢需求。明确 footprint、重规划及信息不足路径保留模型 enrichment；标准 `2LDK 55㎡` 回归断言模型函数不可被调用且 direct hit 成功。
 - 内容：按评估 §6.5 流程图改造 `plan-builder`：确认 brief 后先用确定性事实（roomProgram、面积、market、kitchenPreference——`briefFactsFor` 已有）构造模板查询；唯一高置信命中 → 直接 adapt+validate 零模型调用；多候选/缺字段 → 才调用模型补 Intent 再 rerank；无模板 → partitioner。现有 `findTemplateSeed` 的匹配规则可复用为查询谓词。
 - 涉及：`src/plan-builder.ts`、`src/template-seed.ts`、`src/agent.ts`（generate 入口）。
 - 完成标准：标准房型（如"2LDK 55㎡"）在模板命中时 `ai_model_calls` 为 0 次 Intent 调用；eval 全量回归通过。
 - 依赖：T1.2（用计量数据验证）；建议 T1.4 之后（schema 稳定）。
 - 依据：§6.5。
 
-### [ ] T4.2 模板可伸缩表达
+### [x] T4.2 模板可伸缩表达
+- 完成于 2026-07-22（待提交）：模板 schema 升至 v2，新增显式 `adaptation.areaRatio` 与按轴、非重叠的 stretch bands；同一全局分段线性映射同时作用于 room/footprint polygon，相同输入坐标在厘米取整后仍一致。schema 在最小面积比例处验证每个带的映射斜率严格大于 0，禁止高权重收缩造成坐标反转。无 adaptation 的模板保持整图等比缩放。`tpl-jp-2ldk-57` 固定 75㎡ fixture 将服务范围从 v1 面积上限 1.25 扩到约 1.33，fatal=0，并断言 LDK/洋室共享坐标不破坏；设计与 warning 边界见 `TEMPLATE_ADAPTATION_DESIGN.md`。人工修改量属于 T4.3b 的跨目录观测闭环，本地算法验收不伪造该指标。
 - 内容：模板从"整图等比缩放"升级为"拓扑 + 比例约束 + 可伸缩区域"，命中后由 solver 局部调整而非缩放失败即全回退。设计文档必须区分面积比例窗口与线性缩放比例（例如面积 0.8–1.25 对应边长约 0.894–1.118，不等同于面积 ±10%），并定义共享墙、门窗宿主、最小尺寸和非矩形 footprint 的约束。这是算法项，先写设计文档和固定 fixtures 再动码。
 - 涉及：`src/template-seed.ts`、`templates/` schema（schemaVersion+1）、新设计文档。
 - 完成标准：在明确的面积段 fixture 中，同一模板服务范围较基线显著扩大；fatal=0 比例、soft warning 分布、几何一致性和人工修改量均不劣于基线。不要用含义不明确的“validator 满分率”作为唯一指标。
 - 依赖：T1.4、T4.1。
 - 依据：§6.5、§14-5。
 
-### [ ] T4.3a 模板命中与拒因闭环
+### [x] T4.3a 模板命中与拒因闭环
+- 完成于 2026-07-22（待提交）：结构化 `TemplateMatchTrace` 区分 direct / after_enrichment / fallback，记录排序候选和稳定拒因码，不保存用户原文。migration v12 新增 decision/candidate/rejection 三张规范化审计表与 market/roomProgram/面积档/模板/拒因索引；写入与规划 request/workflowRun 关联，测试用 SQL 直接验证“模板命中次数”和“拒因分布”可聚合。
 - 内容：落库记录每次生成的 template direct hit / after enrichment / partitioner fallback、候选集合与模板拒绝原因（seedTrace 已有，落库即可），形成 §11 指标中不依赖前端事件的最小集。
 - 涉及：`src/persistence/`、`src/template-seed.ts` trace 接线。
 - 完成标准：能用 SQL 回答"哪个模板命中率最高、哪个最常被拒、拒因分布"，且统计可按 roomProgram/面积段/market 分组。
@@ -339,7 +348,8 @@
 - 依赖：T4.3a、TX.1（或先完成匿名但不可跨用户归因的受限版本）。
 - 依据：§9 Phase 4、§11。
 
-### [ ] T4.4 eval 分层：PR gate + nightly
+### [x] T4.4 eval 分层：PR gate + nightly
+- 当前范围完成于 2026-07-22（待提交）：`bun run eval` / `eval:deterministic` 运行零 token 的规划、模板、partitioner、validator 回归与 23 个 case 契约检查，并输出 schemaVersion 固定的 JSON/Markdown 报告；`eval:provider` 必须显式携带费用许可，直接运行 provider harness 会在加载配置、连接 MCP、调用模型前以 exit 2 拒绝。真实报告增加 mode/schemaVersion/generatedAt/caseIds/repeat 元数据，便于前后比较。`.github/**` 的 PR/nightly 调度按跨目录约束继续不实施，不影响本地完成状态。
 - 内容：当前范围内先完成 `eval/` 的 deterministic/真实供应商命令分层、固定报告格式和本地回归；修改 `.github/**` 接入 PR gate/nightly 属于 ⚠️跨目录，冻结期间不实施。
 - 涉及：当前仅 `pascal-ai-mcp/eval/`、`package.json` 和本目录文档；workflow 接入待解锁。
 - 完成标准：本地 deterministic 命令零 token 且能拦住规划/模板回归；真实供应商命令显式 opt-in 并输出可比较报告。PR 自动 gate 与 nightly 调度在解除 `.github/**` 约束前不计入当前完成标准。
@@ -396,3 +406,4 @@ T2.6a 只依赖 T2.2；图中 T2.3/T2.5 先完成是当前实施顺序便利，�
 - 2026-07-22：依据交叉审核收口 T2.6a：T1.6 拥有通用删除/TTL、T2.6e 拥有 graph 接线/version mismatch/故障验证；明确 checkpoint 写入与删除能力的部署时序、session→workflowRunId 从权威 phase + `ai_requests` 派生，以及 interrupt 无 lease 停泊的 stale/TTL 语义。
 - 2026-07-22：完成 T2.6b–e：精简持久 graph state、route/plan/construct 节点、跨重启 interrupt/resume、仅安全 plan 边界自动 requeue、终态补齐、checkpoint 删除/TTL/version mismatch 运维与故障注入；外部场景写入继续 fail-recoverable，`packages/mcp` 保持零改动。
 - 2026-07-22：后续实施范围收紧为 `pascal-ai-mcp/**`。T3.1/T3.2 改为诚实的 AI DB 空间语义投影；正式公共 scene schema/MCP 能力保留为 T3.1-FUTURE 并阻塞。同步标记 core、proxy、Editor 事件、GitHub workflow 和对外 BFF/KMS 等跨目录任务，禁止用旁路实现冒充完成。
+- 2026-07-22：完成 T3.1/T3.2 AI 侧空间语义投影、T3.3 ports/adapters/application/domain 分层、T3.4 policy 收口与 T3.7 前置防护栏；T3.3 的三例真实供应商抽查补齐，并修正日式分离卫浴计数和门连独立衣柜间的家具完成口径。全程只改 `pascal-ai-mcp/**`。

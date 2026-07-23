@@ -28,6 +28,7 @@
 // ---------------------------------------------------------------------------
 
 import { classifyRoomTypeByName } from './lang/room-vocab'
+import type { RoomType } from './layout-plan'
 
 export type MetricsZone = {
   id: string
@@ -131,7 +132,11 @@ export function bandTableForTotalArea(totalAreaSqm: number): BandTable {
 // public living/dining variant (a living_kitchen scores as living, not as a
 // kitchen — the case-02 rule).
 export function classifyRoomKind(name: string): RoomKind {
-  switch (classifyRoomTypeByName(name)) {
+  return roomKindForType(classifyRoomTypeByName(name))
+}
+
+export function roomKindForType(type: RoomType): RoomKind {
+  switch (type) {
     case 'hallway':
     case 'entry':
       return 'circulation'
@@ -285,11 +290,13 @@ function round1(value: number): number {
 export function computeLayoutQuality(
   zones: MetricsZone[],
   walls: MetricsWall[],
-  options: { targetTotalAreaSqm?: number } = {},
+  options: { targetTotalAreaSqm?: number; zoneTypes?: Record<string, RoomType> } = {},
 ): LayoutQuality {
   const areas = zones.map(zone => ({
     zone,
-    kind: classifyRoomKind(zone.name || ''),
+    kind: options.zoneTypes?.[zone.id]
+      ? roomKindForType(options.zoneTypes[zone.id]!)
+      : classifyRoomKind(zone.name || ''),
     area: polygonArea(zone.polygon),
   }))
   const totalArea = areas.reduce((sum, entry) => sum + entry.area, 0)

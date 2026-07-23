@@ -1,4 +1,3 @@
-import { Annotation } from '@langchain/langgraph'
 import type { ChatInput, WorkflowSession } from './types'
 
 export type WorkflowGraphState = {
@@ -10,12 +9,10 @@ export type WorkflowGraphState = {
 
 export type DurableWorkflowNext = 'legacy' | 'plan' | 'construct' | 'finish'
 
-export const DurableWorkflowState = Annotation.Root({
-  sessionId: Annotation<string>,
-  sessionVersion: Annotation<number>,
-  requestId: Annotation<string>,
-  phase: Annotation<WorkflowSession['phase']>,
-  next: Annotation<DurableWorkflowNext>,
-})
-
-export type DurableWorkflowGraphState = typeof DurableWorkflowState.State
+export type DurableWorkflowGraphState = {
+  sessionId: string
+  sessionVersion: number
+  requestId: string
+  phase: WorkflowSession['phase']
+  next: DurableWorkflowNext
+}

@@ -5,7 +5,8 @@ import {
   type ModelCallRecord,
   type ModelCallWriter,
 } from '../persistence/model-call-repository'
-import { OpenAiCompatibleClient, type ModelAttemptResult } from '../openai-compatible'
+import { OpenAiCompatibleClient } from '../openai-compatible'
+import type { ModelAttemptResult } from '../ports/model-client'
 import { SqliteModelAttemptRecorder } from './model-attempt-recorder'
 
 const originalFetch = globalThis.fetch

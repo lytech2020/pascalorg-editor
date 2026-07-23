@@ -2,7 +2,7 @@
 
 目录结构（2026-07-17 整理）：模板按质量分子目录——`templates/good/`（合格参照）、`templates/bad/`（反例）；预览镜像同一布局——`layout-previews/templates/good|bad/` 是参照渲染，`layout-previews/templates/ours/` 是分区器对同房型程序的对比渲染（此前 `--ours` 后缀混在平铺目录里，屡次被误认成模板本体）。加载器（`template-seed.ts templateFilePaths`）读根目录 + 一层子目录，散放在根的 JSON 仍然有效。
 
-状态：底座已落地（2026-07-14），现有 15 个参照（14 好 1 反，含 11 张真实间取り图转换）。挂起 1 张：① 真实 2DK 55.69㎡（上下两块错位的异形轮廓、中央玄関动线）待 L 形/异形 footprint 支持（GENERATION_REDESIGN §10.2）后转换——矩形化会铺进 ~12㎡ 不存在的角落并抹平其「狭长+下方居室离卫浴远」的形态要点；（3LDK 70.4㎡ 已于 2026-07-16 拍板按标注面积收录为 tpl-jp-3ldk-70，面积口径存疑记录在其 source 字段。）用途：**评测/校准资产优先，同时已接入生成种子**；安全命中时直接等比缩放参照计划，拒绝原因进入请求 trace，未命中回落分区器。
+状态：底座已落地（2026-07-14），现有 15 个参照（14 好 1 反，含 11 张真实间取り图转换）。挂起 1 张：① 真实 2DK 55.69㎡（上下两块错位的异形轮廓、中央玄関动线）待 L 形/异形 footprint 支持（GENERATION_REDESIGN §10.2）后转换——矩形化会铺进 ~12㎡ 不存在的角落并抹平其「狭长+下方居室离卫浴远」的形态要点；（3LDK 70.4㎡ 已于 2026-07-16 拍板按标注面积收录为 tpl-jp-3ldk-70，面积口径存疑记录在其 source 字段。）用途：**评测/校准资产优先，同时已接入 template-first 生成**；房型编号、面积、market、厨房模式足够明确时先于 Intent 模型直接匹配，安全命中可做到零 Intent 调用；需要补充语义时在 Intent 后二次匹配，未命中回落分区器。命中模式、候选和稳定拒因会进入审计表。
 
 ## 格式
 
@@ -10,7 +10,7 @@
 
 ```jsonc
 {
-  "schemaVersion": 1,            // 当前版本；仓库内模板必须显式填写
+  "schemaVersion": 2,            // 当前版本；仓库内模板必须显式填写
   "id": "tpl-jp-2ldk-60-tanoji",
   "meta": {
     "market": "jp",              // NormProfile id
@@ -22,11 +22,17 @@
     "roomProgram": "2ldk",       // 日本房型编号（1r/1k/Ndk/Nldk）——与请求侧确定性解析出的编号精确匹配
     "notes": "形态要点"
   },
+  "adaptation": {                // 可选；只允许模板作者声明过的局部伸缩
+    "areaRatio": { "min": 0.72, "max": 1.4 },
+    "zBands": [{ "from": 2.6, "to": 6.4, "weight": 1 }]
+  },
   "plan": { "footprint": …, "entry": …, "rooms": […], "connections": […] }
 }
 ```
 
 坐标要求：轴对齐、房间铺满 footprint（validator 覆盖率检查会抓漏）；精度到 0.1m 足够（照间取り图目测按比例量）。房型必须用系统 12 枚举；日本卫浴分离按方案 B（トイレ/洗面脱衣/浴室都是 `bathroom` 类型 + 名字区分）。
+
+schema v2 的 `adaptation` 设计、面积比例与线性比例的区别、共享墙/门窗/非矩形约束及固定 fixture 见 [TEMPLATE_ADAPTATION_DESIGN.md](./TEMPLATE_ADAPTATION_DESIGN.md)。没有该字段的模板仍按整图等比缩放，不能由运行时猜测“可伸缩房间”。
 
 `src/template-schema.ts` 是唯一结构契约：运行时加载器与 `templates:check` 共用 `TemplateRecordSchema`，错误会带精确字段路径（如 `plan.rooms[2].type`）。运行时保留显式的旧版迁移函数，但 CI 不会自动补版本：已入库 JSON 缺少 `schemaVersion` 会直接失败。服务启动时全量加载模板并输出健康摘要；开发环境警告后跳过单个坏文件，生产环境若 good/未知模板无效或无任何有效 good 模板，保持 liveness 但拒绝 `/chat`。
 

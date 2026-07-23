@@ -14,6 +14,7 @@
 // ---------------------------------------------------------------------------
 
 import type { LayoutIntent, LayoutIntentRoom } from './layout-plan'
+import { areaBoundFor } from './domain/policy/room-policy'
 import { isDiningKitchenName } from './lang/room-vocab'
 import {
   detectKitchenPreference,
@@ -26,7 +27,6 @@ import {
   type JapaneseRoomProgram,
 } from './lang/strategy-vocab'
 import type { NormProfile } from './norms/profile'
-import { areaBoundFor } from './plan-validator'
 
 export type AreaBand = 'tiny' | 'compact' | 'standard' | 'large'
 

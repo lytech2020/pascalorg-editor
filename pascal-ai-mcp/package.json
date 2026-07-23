@@ -12,7 +12,10 @@
     "templates:check": "bun scripts/check-templates.ts",
     "scenes:cleanup": "bun scripts/cleanup-abandoned-scenes.ts",
     "data:cleanup": "bun scripts/cleanup-ai-data.ts",
-    "eval": "bun run eval/run-eval.ts",
+    "eval": "bun run eval/run-deterministic.ts",
+    "eval:deterministic": "bun run eval/run-deterministic.ts",
+    "eval:provider": "bun run eval/run-eval.ts --allow-provider-cost",
+    "eval:dry-run": "bun run eval/run-eval.ts --dry-run",
     "eval:review": "bun run eval/review.ts"
   },
   "dependencies": {

@@ -1,102 +1,13 @@
 import { createHash } from 'node:crypto'
 import { SafeServiceError, safeErrorLogFields } from './error-policy'
 import type { ChatCompletionResponse, ChatMessage, OpenAiTool } from './types'
-
-// Normalized token usage. Absent fields mean the provider did not report the
-// number — callers must not read them as 0 (T1.1). Field names align with
-// AI_USAGE_AUDIT_DESIGN.md (cacheCreationTokens = explicit cache writes,
-// OpenRouter `cache_write_tokens`).
-export type ModelUsage = {
-  inputTokens?: number
-  outputTokens?: number
-  totalTokens?: number
-  reasoningTokens?: number
-  cacheReadTokens?: number
-  cacheCreationTokens?: number
-}
-
-export type ModelRequestParams = {
-  temperature: number
-  toolCount?: number
-  toolChoice?: string
-  parallelToolCalls?: boolean
-  responseFormat?: string
-}
-
-// One telemetry record per REAL HTTP attempt — success, HTTP error, network
-// failure and cancel all emit, so internal retries and fallback calls are
-// individually visible. This is the source of truth for metering
-// (ai_model_calls in T1.2); business logs and the session are not.
-export type ModelAttemptResult = {
-  provider: 'openai-compatible' | 'azure-openai'
-  // Stable low-cardinality business label ("extract", "plan:intent", …) from
-  // RequestHooks.operation — the aggregation axis for per-stage cost stats.
-  // Absent when the caller didn't classify the call.
-  operation?: string
-  // Raw per-call correlation tag (also sent to the provider as session_id).
-  // High-cardinality — carries sessionId and retry round; keep it out of
-  // aggregation keys.
-  sessionKey: string
-  // Unique id per logical model call (one request() invocation). Primary,
-  // fast and fallback calls each get their own callId, so their attemptNo
-  // sequences don't collide when persisted.
-  callId: string
-  // What we asked for vs. what the provider says actually served the call.
-  requestedModel: string
-  model?: string
-  attemptNo: number
-  // invalid_response = HTTP 2xx whose body failed to parse: the provider DID
-  // serve (and bill) the request, so it must still be recorded.
-  status: 'ok' | 'http_error' | 'network_error' | 'cancelled' | 'invalid_response'
-  httpStatus?: number
-  // Short provider error code (e.g. "context_length_exceeded"), never the
-  // raw response body.
-  providerErrorCode?: string
-  errorSummary?: string
-  providerRequestId?: string
-  finishReason?: string
-  usage?: ModelUsage
-  promptVersion?: string
-  promptHash: string
-  requestParams: ModelRequestParams
-  startedAt: string
-  latencyMs: number
-}
-
-// Optional per-call hooks: `signal` lets a caller abort an in-flight request
-// (e.g. on user cancel); `temperature` overrides the client default for this
-// one call (plan-first temperature split, 批次 D).
-//
-// Attempt lifecycle:
-// - `onAttemptStarted` runs BEFORE the HTTP request is sent. Throwing here
-//   aborts the attempt without spending provider money — this is where the
-//   model-call budget is enforced.
-// - `onAttemptFinished` fires after every real HTTP attempt (ok, HTTP error,
-//   network failure, cancel, unparseable 2xx) with the full result. It is a
-//   synchronous fire-and-forget telemetry sink: exceptions are swallowed and
-//   logged, and a persistence consumer (T1.2) must enqueue synchronously and
-//   do async work off-band — a returned Promise is ignored.
-export type RequestHooks = {
-  signal?: AbortSignal
-  onAttemptStarted?: () => void
-  onAttemptFinished?: (result: ModelAttemptResult) => void
-  temperature?: number
-  // Stable business label for this call ("extract", "modify-ops",
-  // "plan:intent", …). Keep it low-cardinality — no session ids or round
-  // numbers — so persisted attempts can be aggregated per stage.
-  operation?: string
-  promptVersion?: string
-}
-
-// Uniform return contract for text/JSON model calls: the parsed output plus
-// the response metadata callers need for tracing and cost attribution.
-export type ModelCallResult<T> = {
-  output: T
-  model?: string
-  providerRequestId?: string
-  usage?: ModelUsage
-  finishReason?: string
-}
+import type {
+  ModelAttemptResult,
+  ModelCallResult,
+  ModelRequestParams,
+  ModelUsage,
+  RequestHooks,
+} from './ports/model-client'
 
 export type ModelClientOptions = {
   provider: 'openai-compatible' | 'azure-openai'

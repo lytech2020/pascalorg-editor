@@ -2,7 +2,8 @@ import { describe, expect, test } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { DurableWorkflowRuntime, type DurableWorkflowNodes } from './durable-workflow'
+import { LangGraphWorkflowRuntime } from './adapters/workflow/langgraph-workflow-runtime'
+import type { WorkflowNodes } from './ports/workflow-runtime'
 import { AppDatabase } from './persistence/database'
 import { SqliteCheckpointSaver } from './persistence/sqlite-checkpoint-saver'
 import { WORKFLOW_GRAPH_VERSION } from './workflow-identity'
@@ -19,7 +20,7 @@ describe('DurableWorkflowRuntime (T2.6c/d)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'durable-workflow-'))
     const file = join(dir, 'ai.db')
     const workflowRunId = crypto.randomUUID()
-    const nodes: DurableWorkflowNodes = {
+    const nodes: WorkflowNodes = {
       route: async state => ({ next: 'legacy', phase: state.phase }),
       legacy: async state => state.requestId === 'request-1'
         ? { phase: 'awaiting_confirmation', sessionVersion: 2, next: 'finish' }
@@ -30,7 +31,7 @@ describe('DurableWorkflowRuntime (T2.6c/d)', () => {
     try {
       const firstDatabase = new AppDatabase(file)
       const firstSaver = saver(firstDatabase)
-      const firstRuntime = new DurableWorkflowRuntime(nodes, firstSaver)
+      const firstRuntime = new LangGraphWorkflowRuntime(nodes, firstSaver)
       await firstRuntime.start({
         sessionId: 'session-1',
         sessionVersion: 1,
@@ -48,7 +49,7 @@ describe('DurableWorkflowRuntime (T2.6c/d)', () => {
 
       const reopened = new AppDatabase(file)
       const reopenedSaver = saver(reopened)
-      const resumedRuntime = new DurableWorkflowRuntime(nodes, reopenedSaver)
+      const resumedRuntime = new LangGraphWorkflowRuntime(nodes, reopenedSaver)
       const result = await resumedRuntime.resume(workflowRunId, 'request-2')
       expect(result).toMatchObject({
         sessionId: 'session-1',
@@ -67,7 +68,7 @@ describe('DurableWorkflowRuntime (T2.6c/d)', () => {
   test('retries only the pending construct node after a persisted plan boundary', async () => {
     const database = new AppDatabase(':memory:')
     let constructAttempts = 0
-    const nodes: DurableWorkflowNodes = {
+    const nodes: WorkflowNodes = {
       route: async () => ({ next: 'plan' }),
       legacy: async () => ({ phase: 'failed', next: 'finish' }),
       plan: async () => ({ phase: 'generating', sessionVersion: 2, next: 'construct' }),
@@ -77,7 +78,7 @@ describe('DurableWorkflowRuntime (T2.6c/d)', () => {
         return { phase: 'completed', sessionVersion: 3, next: 'finish' }
       },
     }
-    const runtime = new DurableWorkflowRuntime(nodes, saver(database))
+    const runtime = new LangGraphWorkflowRuntime(nodes, saver(database))
     const workflowRunId = crypto.randomUUID()
     try {
       await expect(runtime.start({

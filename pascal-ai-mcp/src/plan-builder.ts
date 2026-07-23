@@ -24,7 +24,11 @@ import {
   type RoomType,
 } from './layout-plan'
 import { partitionLayout } from './layout-partitioner'
-import { findTemplateSeed } from './template-seed'
+import {
+  findDirectTemplateSeed,
+  findTemplateSeed,
+  type TemplateMatchTrace,
+} from './template-seed'
 import { DEFAULT_NORM_PROFILE, type NormProfile } from './norms/profile'
 import { validateLayoutPlan, type PlanTargets, type PlanValidation } from './plan-validator'
 import { applyStrategy, strategyPromptLines, type StrategyDecision } from './strategy'
@@ -49,6 +53,10 @@ export type PlanBuildOptions = {
   strategy?: StrategyDecision
   // Must be the same library startup health checks validated.
   templatesDir?: string
+  // The direct path skips Intent enrichment. Callers must prove that every
+  // active planning fact is represented by the deterministic template query;
+  // absent/false stays on the model-enrichment path.
+  directTemplateEligible?: boolean
 }
 
 export type PlanBuildSuccess = {
@@ -60,6 +68,7 @@ export type PlanBuildSuccess = {
   // Template-seed rejection reasons (docs/TEMPLATES.md) — debug data for the
   // request trace, never rendered to users.
   seedTrace?: string[]
+  templateTrace?: TemplateMatchTrace
 }
 
 export type PlanBuildFailure = {
@@ -73,6 +82,7 @@ export type PlanBuildFailure = {
   modelCalls: number
   // Template-seed rejection reasons from the last round (debug trace only).
   seedTrace?: string[]
+  templateTrace?: TemplateMatchTrace
 }
 
 export type PlanBuildResult = PlanBuildSuccess | PlanBuildFailure
@@ -218,6 +228,35 @@ export async function buildLayoutPlan(
   const maxRounds = options.maxRounds ?? DEFAULT_MAX_ROUNDS
   const llmGeometry = options.llmGeometry === true
   const profile = options.profile ?? DEFAULT_NORM_PROFILE
+  let directTemplateTrace: TemplateMatchTrace | undefined
+  if (
+    !llmGeometry
+    && !options.priorFailures?.length
+    && options.strategy
+    && options.directTemplateEligible === true
+  ) {
+    const direct = findDirectTemplateSeed(
+      inputs.targets.totalAreaSqm,
+      profile,
+      options.strategy,
+      { targets: inputs.targets, templatesDir: options.templatesDir },
+    )
+    directTemplateTrace = direct.matchTrace
+    if (direct.seed && direct.intent) {
+      const extraNotes = [...direct.seed.notes, ...options.strategy.notes]
+      return {
+        ok: true,
+        intent: direct.intent,
+        plan: {
+          ...direct.seed.plan,
+          notes: [...(direct.seed.plan.notes ?? []), ...extraNotes],
+        },
+        validation: direct.seed.validation,
+        modelCalls: 0,
+        templateTrace: direct.matchTrace,
+      }
+    }
+  }
   const messages: ChatMessage[] = [
     { role: 'system', content: llmGeometry ? PLAN_SYSTEM_PROMPT : INTENT_SYSTEM_PROMPT },
     {
@@ -242,6 +281,18 @@ export async function buildLayoutPlan(
   let lastFailures: string[] = []
   let lastFailuresL10n: Array<IssueL10n | null> = []
   let lastSeedTrace: string[] | undefined
+  let lastTemplateTrace: TemplateMatchTrace | undefined = llmGeometry
+    ? undefined
+    : directTemplateTrace ?? {
+        mode: 'fallback',
+        market: profile.id,
+        ...(options.strategy?.roomProgram ? { roomProgram: options.strategy.roomProgram } : {}),
+        ...(inputs.targets.totalAreaSqm !== undefined
+          ? { targetAreaSqm: inputs.targets.totalAreaSqm }
+          : {}),
+        candidates: [],
+        rejections: [],
+      }
   for (let round = 0; round < maxRounds; round++) {
     modelCalls++
     const reply = await complete(messages, `plan:${llmGeometry ? 'geometry' : 'intent'}:${round}`)
@@ -255,6 +306,7 @@ export async function buildLayoutPlan(
     lastFailures = attempt.failures
     lastFailuresL10n = attempt.failuresL10n
     lastSeedTrace = attempt.seedTrace
+    lastTemplateTrace = attempt.templateTrace ?? lastTemplateTrace
     messages.push({ role: 'user', content: correctionPrompt(attempt.failures) })
   }
   return {
@@ -263,12 +315,19 @@ export async function buildLayoutPlan(
     failuresL10n: lastFailuresL10n,
     modelCalls,
     ...(lastSeedTrace?.length ? { seedTrace: lastSeedTrace } : {}),
+    ...(lastTemplateTrace ? { templateTrace: lastTemplateTrace } : {}),
   }
 }
 
 type Attempt =
   | { ok: true; result: Omit<PlanBuildSuccess, 'modelCalls'> }
-  | { ok: false; failures: string[]; failuresL10n: Array<IssueL10n | null>; seedTrace?: string[] }
+  | {
+      ok: false
+      failures: string[]
+      failuresL10n: Array<IssueL10n | null>
+      seedTrace?: string[]
+      templateTrace?: TemplateMatchTrace
+    }
 
 const noL10n = (failures: string[]): Array<IssueL10n | null> => failures.map(() => null)
 
@@ -295,13 +354,37 @@ function evaluateIntentReply(
   // partitioner hasn't learned. No hit (or a post-scale fatal) falls through
   // to partitionLayout below.
   const seedTrace: string[] = []
-  const seed = findTemplateSeed(intent, profile, strategy, { targets, trace: seedTrace, templatesDir })
+  const templateTrace: TemplateMatchTrace = {
+    mode: 'after_enrichment',
+    market: profile.id,
+    ...(strategy?.roomProgram ? { roomProgram: strategy.roomProgram } : {}),
+    targetAreaSqm: intent.targetTotalAreaSqm,
+    candidates: [],
+    rejections: [],
+  }
+  const seed = findTemplateSeed(intent, profile, strategy, {
+    targets,
+    trace: seedTrace,
+    templatesDir,
+    matchTrace: templateTrace,
+  })
   const seedTraceField = seedTrace.length > 0 ? { seedTrace } : {}
   if (seed) {
     const extraNotes = [...seed.notes, ...(strategy?.notes ?? []), ...applied.notes]
     const plan = { ...seed.plan, notes: [...(seed.plan.notes ?? []), ...extraNotes] }
-    return { ok: true, result: { ok: true, intent, plan, validation: seed.validation, ...seedTraceField } }
+    return {
+      ok: true,
+      result: {
+        ok: true,
+        intent,
+        plan,
+        validation: seed.validation,
+        templateTrace,
+        ...seedTraceField,
+      },
+    }
   }
+  templateTrace.mode = 'fallback'
   // Recoverable parse defects (dropped fields, renamed ids) don't block on
   // their own — the partitioned plan is judged on its merits below.
   const partition = partitionLayout(intent, profile, strategy)
@@ -319,6 +402,7 @@ function evaluateIntentReply(
         partition.l10n ?? null,
         ...details.map(detail => detail.l10n ?? null),
       ],
+      templateTrace,
       ...seedTraceField,
     }
   }
@@ -328,6 +412,7 @@ function evaluateIntentReply(
       ok: false,
       failures: [...errors, ...validation.fatal],
       failuresL10n: [...noL10n(errors), ...validation.fatalL10n],
+      templateTrace,
       ...seedTraceField,
     }
   }
@@ -337,7 +422,10 @@ function evaluateIntentReply(
   const plan = extraNotes.length > 0
     ? { ...partition.plan, notes: [...(partition.plan.notes ?? []), ...extraNotes] }
     : partition.plan
-  return { ok: true, result: { ok: true, intent, plan, validation, ...seedTraceField } }
+  return {
+    ok: true,
+    result: { ok: true, intent, plan, validation, templateTrace, ...seedTraceField },
+  }
 }
 
 function evaluateGeometryReply(reply: string, targets: PlanTargets, profile: NormProfile): Attempt {

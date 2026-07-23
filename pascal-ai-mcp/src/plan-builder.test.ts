@@ -2,6 +2,8 @@ import { describe, expect, test } from 'bun:test'
 import { partitionLayout } from './layout-partitioner'
 import type { LayoutIntent } from './layout-plan'
 import { buildLayoutPlan, parseLayoutPlanJson } from './plan-builder'
+import { JP_NORM_PROFILE } from './norms/profile-jp'
+import { deriveStrategy } from './strategy'
 import type { ChatMessage } from './types'
 
 const oneBedroomIntent: LayoutIntent = {
@@ -28,6 +30,53 @@ function scriptedModel(replies: string[]) {
 }
 
 describe('buildLayoutPlan (intent path)', () => {
+  test('a high-confidence 2LDK template hit skips the Intent model entirely', async () => {
+    const targets = {
+      totalAreaSqm: 55,
+      requiredRooms: [{ type: 'bedroom' as const, count: 2 }],
+    }
+    const strategy = deriveStrategy({ roomProgram: '2ldk' }, targets, JP_NORM_PROFILE)
+    const result = await buildLayoutPlan(
+      { briefSummary: '2LDK 55㎡', targets },
+      async () => { throw new Error('the model must not be called') },
+      { profile: JP_NORM_PROFILE, strategy, directTemplateEligible: true },
+    )
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('unreachable')
+    expect(result.modelCalls).toBe(0)
+    expect(result.templateTrace?.mode).toBe('direct')
+    expect(result.templateTrace?.selectedTemplateId).toMatch(/^tpl-jp-2ldk/)
+  })
+
+  test('does not skip Intent enrichment unless the confirmed brief is eligible', async () => {
+    const targets = {
+      totalAreaSqm: 55,
+      requiredRooms: [{ type: 'bedroom' as const, count: 2 }],
+    }
+    const strategy = deriveStrategy({ roomProgram: '2ldk' }, targets, JP_NORM_PROFILE)
+    let modelCalls = 0
+    const result = await buildLayoutPlan(
+      { briefSummary: '2LDK 55㎡，两间卧室都必须朝南', targets },
+      async () => {
+        modelCalls++
+        return JSON.stringify({
+          targetTotalAreaSqm: 55,
+          rooms: [
+            { id: 'ldk', name: 'LDK', type: 'living_kitchen' },
+            { id: 'bedroom-1', name: '卧室1', type: 'bedroom', requiresExteriorWindow: true },
+            { id: 'bedroom-2', name: '卧室2', type: 'bedroom', requiresExteriorWindow: true },
+            { id: 'bathroom', name: '卫生间', type: 'bathroom' },
+          ],
+        })
+      },
+      { profile: JP_NORM_PROFILE, strategy, directTemplateEligible: false },
+    )
+
+    expect(result.ok).toBe(true)
+    expect(modelCalls).toBe(1)
+    expect(result.modelCalls).toBe(1)
+  })
+
   test('valid intent on the first round yields a validated plan in one model call', async () => {
     const { complete } = scriptedModel([JSON.stringify(oneBedroomIntent)])
     const result = await buildLayoutPlan(

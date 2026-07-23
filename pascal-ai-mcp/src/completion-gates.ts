@@ -15,7 +15,7 @@
 // layout-metrics.ts, so agent.ts and the eval harness can both call in.
 // ---------------------------------------------------------------------------
 
-import { findMissingFurniture } from './furniture-checklist'
+import { findMissingFurniture, isWardrobeStorageName } from './furniture-checklist'
 import { classifyRoomTypeByName } from './lang/room-vocab'
 import {
   kitchenIsCirculation,
@@ -253,7 +253,11 @@ export function evaluateCompletionGates(
       // (2026-07-14 case-11 复盘).
       const bedroomName = label(entry.zone)
       const hasDressingRoom = typed.some(other =>
-        other.type === 'storage' && bedroomName.length > 0 && (other.zone.name ?? '').includes(bedroomName))
+        other.type === 'storage' && (
+          bedroomName.length > 0 && (other.zone.name ?? '').includes(bedroomName)
+          || graph.adjacency.get(entry.zone.id)?.has(other.zone.id)
+            && isWardrobeStorageName(label(other.zone))
+        ))
       for (const missing of findMissingFurniture('bedroom', names)) {
         if (hasDressingRoom && /衣柜|wardrobe|closet|クローゼット/i.test(missing.label)) continue
         failures.push({

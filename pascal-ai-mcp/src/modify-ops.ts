@@ -13,9 +13,9 @@
 // ---------------------------------------------------------------------------
 
 import { classifyRoomTypeByName } from './lang/room-vocab'
+import { areaBoundFor } from './domain/policy/room-policy'
 import { ROOM_TYPES, type LayoutIntent, type LayoutIntentRoom, type RoomType } from './layout-plan'
 import type { NormProfile } from './norms/profile'
-import { areaBoundFor } from './plan-validator'
 
 export type StructuralModifyOp =
   | { op: 'add_room'; room: { name: string; type: RoomType; targetAreaSqm?: number }; near?: string }

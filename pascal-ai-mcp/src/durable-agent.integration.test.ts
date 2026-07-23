@@ -4,12 +4,18 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PascalAiAgent } from './agent'
 import { loadConfig } from './config'
-import { DurableWorkflowRuntime, type DurableWorkflowNodes } from './durable-workflow'
+import {
+  createLangGraphWorkflowRuntimeFactory,
+  LangGraphWorkflowRuntime,
+} from './adapters/workflow/langgraph-workflow-runtime'
+import { createOpenAiModelClients } from './adapters/model/openai-model-clients'
+import type { WorkflowNodes } from './ports/workflow-runtime'
 import type { PascalMcpClient } from './mcp'
 import { AppDatabase } from './persistence/database'
 import { ModelCallRepository } from './persistence/model-call-repository'
 import { SceneBuildRepository } from './persistence/scene-build-repository'
 import { AiAuditRepository } from './persistence/audit-repository'
+import { SceneSpaceRepository } from './persistence/scene-space-repository'
 import { ChatRequestRepository, SqliteSessionPersistence } from './persistence/session-repository'
 import { SqliteCheckpointSaver } from './persistence/sqlite-checkpoint-saver'
 import { WorkflowStepRepository } from './persistence/workflow-step-repository'
@@ -68,6 +74,9 @@ test('a clarification interrupt resumes the same compact workflow after process 
         new SceneBuildRepository(database),
         checkpointSaver,
         new AiAuditRepository(database),
+        new SceneSpaceRepository(database),
+        createLangGraphWorkflowRuntimeFactory(checkpointSaver),
+        createOpenAiModelClients(config),
       ),
       requests,
     }
@@ -152,8 +161,11 @@ test('expired recovery directly enforces the safe plan boundary', async () => {
     sceneBuilds,
     checkpointSaver,
     new AiAuditRepository(database),
+    new SceneSpaceRepository(database),
+    createLangGraphWorkflowRuntimeFactory(checkpointSaver),
+    createOpenAiModelClients(config),
   )
-  const nodes: DurableWorkflowNodes = {
+  const nodes: WorkflowNodes = {
     route: async () => ({ next: 'plan' }),
     legacy: async () => ({ phase: 'failed', next: 'finish' }),
     plan: async () => ({ phase: 'generating', sessionVersion: 1, next: 'construct' }),
@@ -167,7 +179,7 @@ test('expired recovery directly enforces the safe plan boundary', async () => {
       kind: 'chat',
       startedAt: '2026-07-22T00:00:00.000Z',
     }, { sessionId, message: 'design' }, 100).request
-    const runtime = new DurableWorkflowRuntime(nodes, checkpointSaver)
+    const runtime = new LangGraphWorkflowRuntime(nodes, checkpointSaver)
     await expect(runtime.start({
       sessionId,
       sessionVersion: 0,

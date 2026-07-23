@@ -473,3 +473,29 @@ describe('模板库逐文件容错', () => {
     expect(templateLibraryAllowsTraffic(library.health, 'production')).toBe(true)
   })
 })
+
+describe('schema v2 local stretch bands', () => {
+  test('a declared stretch band expands one template beyond the v1 area window without breaking shared coordinates', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tpl-stretch-'))
+    copyFileSync(
+      join(import.meta.dir, '..', 'templates', 'good', 'tpl-jp-2ldk-57.json'),
+      join(dir, 'tpl-jp-2ldk-57.json'),
+    )
+    const seed = findTemplateSeed({
+      targetTotalAreaSqm: 75,
+      rooms: [
+        { id: 'bedroom-1', name: '洋室1', type: 'bedroom' },
+        { id: 'bedroom-2', name: '洋室2', type: 'bedroom' },
+        { id: 'ldk-1', name: 'LDK', type: 'living_kitchen' },
+      ],
+    }, JP_NORM_PROFILE, { roomProgram: '2ldk' }, { templatesDir: dir })
+    expect(seed?.validation.fatal).toEqual([])
+    expect(seed?.notes.some(note => note.includes('可伸缩区域'))).toBe(true)
+    expect(seed!.plan.footprint.width * seed!.plan.footprint.depth).toBeCloseTo(75, 0)
+
+    const ldk = seed!.plan.rooms.find(room => room.id === 'ldk-1')!
+    const bedroom = seed!.plan.rooms.find(room => room.id === 'bedroom-2')!
+    const ldkBoundary = new Set(ldk.polygon.map(([x, z]) => `${x}:${z}`))
+    expect(bedroom.polygon.some(([x, z]) => ldkBoundary.has(`${x}:${z}`))).toBe(true)
+  })
+})

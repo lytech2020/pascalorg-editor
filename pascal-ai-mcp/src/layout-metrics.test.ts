@@ -148,6 +148,14 @@ describe('bandTableForTotalArea', () => {
 })
 
 describe('computeLayoutQuality', () => {
+  test('zone semantics override a misleading renamed room', () => {
+    const quality = computeLayoutQuality([
+      { id: 'zone-1', name: 'Bathroom after rename', polygon: [[0, 0], [8, 0], [8, 2], [0, 2]] },
+    ], [], { zoneTypes: { 'zone-1': 'hallway' } })
+    expect(quality.circulation.areaSqm).toBe(16)
+    expect(quality.roomAreaFindings).toEqual([])
+  })
+
   test('a well-formed two-bed scores high with no hard issues', () => {
     const { zones, walls } = goodTwoBed()
     const quality = computeLayoutQuality(zones, walls, { targetTotalAreaSqm: 70 })

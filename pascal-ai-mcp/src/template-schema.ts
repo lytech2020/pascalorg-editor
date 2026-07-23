@@ -2,7 +2,7 @@ import { z } from 'zod'
 import { ROOM_TYPES, type LayoutPlan } from './layout-plan'
 import type { JapaneseRoomProgram } from './lang/strategy-vocab'
 
-export const TEMPLATE_SCHEMA_VERSION = 1 as const
+export const TEMPLATE_SCHEMA_VERSION = 2 as const
 
 export const TEMPLATE_MARKETS = ['default', 'jp'] as const
 export const TEMPLATE_QUALITIES = ['good', 'bad'] as const
@@ -43,6 +43,25 @@ const identifier = z.string().min(1).refine(value => value === value.trim(), {
 const coordinate = z.number().finite()
 const point = z.tuple([coordinate, coordinate])
 const polygon = z.array(point).min(3)
+const stretchBand = z.strictObject({
+  from: z.number().finite().nonnegative(),
+  to: z.number().finite().positive(),
+  weight: z.number().finite().positive().default(1),
+}).refine(band => band.to > band.from, {
+  message: 'stretch band to must be greater than from',
+})
+const templateAdaptation = z.strictObject({
+  areaRatio: z.strictObject({
+    min: z.number().finite().positive(),
+    max: z.number().finite().positive(),
+  }).refine(range => range.min <= 1 && range.max >= 1 && range.min <= range.max, {
+    message: 'areaRatio must contain 1 and satisfy min <= max',
+  }),
+  xBands: z.array(stretchBand).min(1).optional(),
+  zBands: z.array(stretchBand).min(1).optional(),
+}).refine(value => value.xBands !== undefined || value.zBands !== undefined, {
+  message: 'at least one stretch axis is required',
+})
 
 const LayoutPlanSchema: z.ZodType<LayoutPlan> = z.strictObject({
   footprint: z.strictObject({
@@ -79,6 +98,7 @@ export const TemplateRecordSchema = z.strictObject({
     roomProgram: z.enum(TEMPLATE_ROOM_PROGRAMS).optional(),
     notes: z.string().optional(),
   }),
+  adaptation: templateAdaptation.optional(),
   plan: LayoutPlanSchema,
 }).superRefine((template, context) => {
   const roomIds = new Set<string>()
@@ -133,6 +153,53 @@ export const TemplateRecordSchema = z.strictObject({
     }
     connectionPairs.add(pair)
   }
+  for (const [axis, limit] of [
+    ['xBands', template.plan.footprint.width],
+    ['zBands', template.plan.footprint.depth],
+  ] as const) {
+    const bands = template.adaptation?.[axis]
+    if (!bands) continue
+    let previousTo = -Infinity
+    for (let index = 0; index < bands.length; index++) {
+      const band = bands[index]!
+      if (band.to > limit) {
+        context.addIssue({
+          code: 'custom',
+          path: ['adaptation', axis, index, 'to'],
+          message: `${axis} exceeds footprint limit ${limit}`,
+        })
+      }
+      if (band.from < previousTo) {
+        context.addIssue({
+          code: 'custom',
+          path: ['adaptation', axis, index],
+          message: `${axis} must be sorted and non-overlapping`,
+        })
+      }
+      previousTo = band.to
+    }
+
+    const adaptation = template.adaptation!
+    const xShare = adaptation.xBands && adaptation.zBands ? 0.5 : adaptation.xBands ? 1 : 0
+    const axisShare = axis === 'xBands' ? xShare : 1 - xShare
+    const minimumTargetLength = limit * Math.pow(adaptation.areaRatio.min, axisShare)
+    const delta = minimumTargetLength - limit
+    const capacity = bands.reduce(
+      (sum, band) => sum + (band.to - band.from) * band.weight,
+      0,
+    )
+    for (let index = 0; index < bands.length; index++) {
+      const band = bands[index]!
+      const slope = 1 + delta * band.weight / capacity
+      if (slope <= 0) {
+        context.addIssue({
+          code: 'custom',
+          path: ['adaptation', axis, index, 'weight'],
+          message: `${axis} becomes non-monotonic at minimum areaRatio ${adaptation.areaRatio.min}`,
+        })
+      }
+    }
+  }
 })
 
 export type TemplateRecord = z.infer<typeof TemplateRecordSchema>
@@ -141,7 +208,7 @@ export type TemplateQuality = TemplateRecord['meta']['quality']
 
 export function migrateTemplateRecord(raw: unknown): unknown {
   if (!isRecord(raw)) return raw
-  if (raw.schemaVersion === undefined) {
+  if (raw.schemaVersion === undefined || raw.schemaVersion === 1) {
     return { ...raw, schemaVersion: TEMPLATE_SCHEMA_VERSION }
   }
   if (raw.schemaVersion === TEMPLATE_SCHEMA_VERSION) return raw

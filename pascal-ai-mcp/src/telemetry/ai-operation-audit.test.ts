@@ -40,6 +40,49 @@ function auditFixture() {
 }
 
 describe('AI operation audit', () => {
+  test('stores normalized template decisions so hit and rejection rates are queryable with SQL', () => {
+    const fixture = auditFixture()
+    try {
+      fixture.repository.recordTemplateMatch({
+        decisionId: 'decision-1',
+        requestId: 'request-1',
+        workflowRunId: fixture.identity.workflowRunId,
+        sessionId: 'session-1',
+        mode: 'direct',
+        market: 'jp',
+        roomProgram: '2ldk',
+        targetAreaSqm: 55,
+        selectedTemplateId: 'tpl-jp-2ldk-54',
+        candidates: [
+          { templateId: 'tpl-jp-2ldk-54', areaRatio: 1.02, relaxedTypology: false },
+        ],
+        rejections: [
+          { templateId: 'tpl-jp-2ldk-58', reasonCodes: ['hub_form_mismatch'] },
+        ],
+        createdAt: '2026-07-22T00:00:01.000Z',
+      })
+      expect(fixture.repository.findTemplateDecisionsByRequest('request-1')[0]).toMatchObject({
+        mode: 'direct',
+        room_program: '2ldk',
+        area_band: '50_69',
+        selected_template_id: 'tpl-jp-2ldk-54',
+      })
+      expect(fixture.database.connection.query(`
+        SELECT selected_template_id, COUNT(*) AS hits
+        FROM ai_template_decisions
+        WHERE selected_template_id IS NOT NULL
+        GROUP BY selected_template_id
+      `).all()).toEqual([{ selected_template_id: 'tpl-jp-2ldk-54', hits: 1 }])
+      expect(fixture.database.connection.query(`
+        SELECT reason_code, COUNT(*) AS rejections
+        FROM ai_template_rejections
+        GROUP BY reason_code
+      `).all()).toEqual([{ reason_code: 'hub_form_mismatch', rejections: 1 }])
+    } finally {
+      fixture.database.close()
+    }
+  })
+
   test('reconstructs read, write, failure, cancellation, version, and validation summaries', async () => {
     const fixture = auditFixture()
     const privateValue = 'private prompt and api-key-value'
@@ -192,5 +235,7 @@ function throwingWriter(point: 'start' | 'finish'): AiAuditWriter {
     },
     recordSceneChange() {},
     recordValidation() {},
+    recordGuardrail() {},
+    recordTemplateMatch() {},
   }
 }

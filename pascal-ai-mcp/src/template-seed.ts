@@ -52,6 +52,25 @@ export type TemplateSeedResult = {
   validation: ReturnType<typeof validateLayoutPlan>
 }
 
+export type TemplateMatchMode = 'direct' | 'after_enrichment' | 'fallback'
+
+export type TemplateMatchTrace = {
+  mode: TemplateMatchMode
+  market: string
+  roomProgram?: string
+  targetAreaSqm?: number
+  selectedTemplateId?: string
+  candidates: Array<{
+    templateId: string
+    areaRatio: number
+    relaxedTypology: boolean
+  }>
+  rejections: Array<{
+    templateId: string
+    reasonCodes: string[]
+  }>
+}
+
 const DEFAULT_TEMPLATES_DIR = join(import.meta.dir, '..', 'templates')
 
 // Area ratio the uniform scaling may bridge (linear scale ≈ ±10%).
@@ -278,11 +297,51 @@ function matchTemplate(
     return { ok: false, reasons }
   }
   const ratio = intent.targetTotalAreaSqm / templateArea
-  if (ratio < MIN_AREA_RATIO || ratio > MAX_AREA_RATIO) {
-    reasons.push(`area ratio out of range: ${ratio.toFixed(2)} not in [${MIN_AREA_RATIO}, ${MAX_AREA_RATIO}]`)
+  const areaRange = template.adaptation?.areaRatio ?? {
+    min: MIN_AREA_RATIO,
+    max: MAX_AREA_RATIO,
+  }
+  if (ratio < areaRange.min || ratio > areaRange.max) {
+    reasons.push(`area ratio out of range: ${ratio.toFixed(2)} not in [${areaRange.min}, ${areaRange.max}]`)
   }
   if (reasons.length > 0) return { ok: false, reasons }
   return { ok: true, ratio, relaxedTypology }
+}
+
+function rejectionCode(reason: string): string {
+  if (reason.startsWith('roomProgram mismatch')) return 'room_program_mismatch'
+  if (reason.startsWith('typology constraint mismatch')) return 'typology_constraint_mismatch'
+  if (reason.startsWith('typology mismatch')) return 'typology_mismatch'
+  if (reason.startsWith('service room count below floor')) return 'service_room_shortage'
+  if (reason.startsWith('bedroom count mismatch')) return 'bedroom_count_mismatch'
+  if (reason.startsWith('hubForm mismatch')) return 'hub_form_mismatch'
+  if (reason.startsWith('area ratio out of range')) return 'area_ratio_out_of_range'
+  if (reason.includes('count mismatch')) return 'core_room_count_mismatch'
+  if (reason.includes('count below floor')) return 'service_room_count_shortage'
+  if (reason === 'template footprint area is not positive') return 'invalid_template_area'
+  return 'other_mismatch'
+}
+
+type StretchBand = { from: number; to: number; weight: number }
+
+function localAxisMapper(
+  length: number,
+  bands: StretchBand[] | undefined,
+  targetLength: number,
+): (value: number) => number {
+  if (!bands) {
+    const scale = targetLength / length
+    return value => roundCm(value * scale)
+  }
+  const capacity = bands.reduce((sum, band) => sum + (band.to - band.from) * band.weight, 0)
+  const delta = targetLength - length
+  return value => {
+    let weightedBefore = 0
+    for (const band of bands) {
+      weightedBefore += Math.max(0, Math.min(value, band.to) - band.from) * band.weight
+    }
+    return roundCm(value + delta * weightedBefore / capacity)
+  }
 }
 
 // Core (non-service) template rooms take the intent's ids and names so the
@@ -322,10 +381,24 @@ function adaptTemplate(
 ): Omit<TemplateSeedResult, 'validation'> | null {
   const remap = coreRoomRemap(intent, template.plan.rooms)
   if (!remap) return null
-  const s = Math.sqrt(ratio)
-  const scale = (value: number) => roundCm(value * s)
+  const adaptation = template.adaptation
+  const xShare = adaptation
+    ? adaptation.xBands && adaptation.zBands ? 0.5 : adaptation.xBands ? 1 : 0
+    : 0.5
+  const xScale = Math.pow(ratio, xShare)
+  const zScale = ratio / xScale
+  const mapX = localAxisMapper(
+    template.plan.footprint.width,
+    adaptation?.xBands,
+    template.plan.footprint.width * xScale,
+  )
+  const mapZ = localAxisMapper(
+    template.plan.footprint.depth,
+    adaptation?.zBands,
+    template.plan.footprint.depth * zScale,
+  )
   const scalePolygon = (polygon: Array<[number, number]>): Array<[number, number]> =>
-    polygon.map(([x, z]) => [scale(x), scale(z)])
+    polygon.map(([x, z]) => [mapX(x), mapZ(z)])
 
   const rooms: LayoutPlanRoom[] = template.plan.rooms.map(room => {
     const mapped = remap.get(room.id)
@@ -340,8 +413,8 @@ function adaptTemplate(
   const mappedId = (id: string) => remap.get(id)?.id ?? id
   const plan: LayoutPlan = {
     footprint: {
-      width: scale(template.plan.footprint.width),
-      depth: scale(template.plan.footprint.depth),
+      width: mapX(template.plan.footprint.width),
+      depth: mapZ(template.plan.footprint.depth),
       ...(template.plan.footprint.polygon
         ? { polygon: scalePolygon(template.plan.footprint.polygon) }
         : {}),
@@ -355,7 +428,9 @@ function adaptTemplate(
     })),
   }
   const notes = [
-    `复用参照户型「${template.meta.label}」（${template.id}），整体缩放到 ${Math.round(ratio * 100)}%`,
+    adaptation
+      ? `复用参照户型「${template.meta.label}」（${template.id}），在声明的可伸缩区域适配到 ${Math.round(ratio * 100)}% 面积`
+      : `复用参照户型「${template.meta.label}」（${template.id}），整体缩放到 ${Math.round(ratio * 100)}% 面积`,
   ]
   if (intent.rooms.some(room => room.targetAreaSqm !== undefined)) {
     notes.push('参照户型的房间比例优先，Intent 中的单房间目标面积未逐间套用')
@@ -379,7 +454,12 @@ export function findTemplateSeed(
   },
   // `trace` collects per-template rejection reasons for the request trace —
   // debug data only, never rendered to users.
-  options?: { targets?: PlanTargets; templatesDir?: string; trace?: string[] },
+  options?: {
+    targets?: PlanTargets
+    templatesDir?: string
+    trace?: string[]
+    matchTrace?: TemplateMatchTrace
+  },
 ): TemplateSeedResult | null {
   const trace = options?.trace
   if (strategy?.footprintHint) {
@@ -397,6 +477,10 @@ export function findTemplateSeed(
       candidates.push({ template, ratio: match.ratio, relaxedTypology: match.relaxedTypology })
     } else {
       trace?.push(`${template.id} rejected: ${match.reasons.join('; ')}`)
+      options?.matchTrace?.rejections.push({
+        templateId: template.id,
+        reasonCodes: [...new Set(match.reasons.map(rejectionCode))],
+      })
     }
   }
   // Typology-consistent hits outrank canonical-form relaxations; area
@@ -404,10 +488,21 @@ export function findTemplateSeed(
   candidates.sort((a, b) =>
     Number(a.relaxedTypology) - Number(b.relaxedTypology)
     || Math.abs(Math.log(a.ratio)) - Math.abs(Math.log(b.ratio)))
+  if (options?.matchTrace) {
+    options.matchTrace.candidates.push(...candidates.map(candidate => ({
+      templateId: candidate.template.id,
+      areaRatio: candidate.ratio,
+      relaxedTypology: candidate.relaxedTypology,
+    })))
+  }
   for (const { template, ratio } of candidates) {
     const adapted = adaptTemplate(intent, template, ratio)
     if (!adapted) {
       trace?.push(`${template.id} rejected: core-room remap produced duplicate ids`)
+      options?.matchTrace?.rejections.push({
+        templateId: template.id,
+        reasonCodes: ['core_room_id_collision'],
+      })
       continue
     }
     const validation = validateLayoutPlan(
@@ -417,9 +512,83 @@ export function findTemplateSeed(
     )
     if (validation.fatal.length > 0) {
       trace?.push(`${template.id} rejected: post-scale validation fatal: ${validation.fatal.join('; ')}`)
+      options?.matchTrace?.rejections.push({
+        templateId: template.id,
+        reasonCodes: ['post_adaptation_validation_fatal'],
+      })
       continue
     }
+    if (options?.matchTrace) options.matchTrace.selectedTemplateId = template.id
     return { ...adapted, validation }
   }
   return null
+}
+
+function intentFromTemplate(template: TemplateRecord, targetAreaSqm: number): LayoutIntent {
+  const ratio = targetAreaSqm / footprintArea(template.plan.footprint)
+  return {
+    targetTotalAreaSqm: targetAreaSqm,
+    rooms: template.plan.rooms.map(room => ({
+      id: room.id,
+      name: room.name,
+      type: room.type,
+      targetAreaSqm: Math.round(polygonArea(room.polygon) * ratio * 100) / 100,
+      requiresExteriorWindow: room.requiresExteriorWindow,
+    })),
+  }
+}
+
+export function findDirectTemplateSeed(
+  targetAreaSqm: number | undefined,
+  profile: NormProfile,
+  strategy: PartitionStrategyHint & {
+    footprintHint?: { widthM: number; depthM: number }
+    roomProgram?: string
+    serviceRoomCount?: number
+    kitchenMode?: 'open' | 'closed'
+  },
+  options?: { targets?: PlanTargets; templatesDir?: string },
+): { intent: LayoutIntent | null; seed: TemplateSeedResult | null; matchTrace: TemplateMatchTrace } {
+  const matchTrace: TemplateMatchTrace = {
+    mode: 'direct',
+    market: profile.id,
+    ...(strategy.roomProgram ? { roomProgram: strategy.roomProgram } : {}),
+    ...(targetAreaSqm !== undefined ? { targetAreaSqm } : {}),
+    candidates: [],
+    rejections: [],
+  }
+  if (!targetAreaSqm || !strategy.roomProgram || strategy.footprintHint) {
+    return { intent: null, seed: null, matchTrace }
+  }
+  const library = loadTemplateLibrary(options?.templatesDir)
+  const preferred = library.records
+    .filter(template => template.meta.quality === 'good')
+    .filter(template => template.meta.market === profile.id)
+    .filter(template => template.meta.roomProgram === strategy.roomProgram)
+    .filter(template => {
+      const hub = hubFormOf(template.plan.rooms)
+      return strategy.kitchenMode === 'open' ? hub !== 'separate' : hub === 'separate'
+    })
+    .filter(template => (options?.targets?.requiredRooms ?? []).every(required =>
+      countOfType(template.plan.rooms, required.type) >= required.count))
+    .filter(template => {
+      const demandedServiceRooms = strategy.serviceRoomCount ?? 0
+      if (demandedServiceRooms === 0) return true
+      return template.plan.rooms.filter(
+        room => room.type === 'storage' && isServiceRoomName(room.name),
+      ).length >= demandedServiceRooms
+    })
+    .sort((a, b) => {
+      const aRatio = targetAreaSqm / footprintArea(a.plan.footprint)
+      const bRatio = targetAreaSqm / footprintArea(b.plan.footprint)
+      return Math.abs(Math.log(aRatio)) - Math.abs(Math.log(bRatio)) || a.id.localeCompare(b.id)
+    })
+  const best = preferred[0]
+  if (!best) return { intent: null, seed: null, matchTrace }
+  const intent = intentFromTemplate(best, targetAreaSqm)
+  const seed = findTemplateSeed(intent, profile, strategy, {
+    ...options,
+    matchTrace,
+  })
+  return { intent, seed, matchTrace }
 }

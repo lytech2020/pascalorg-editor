@@ -16,7 +16,11 @@
 // dropped.
 // ---------------------------------------------------------------------------
 
-import { findMissingFurniture, type FurnitureRequirement } from './furniture-checklist'
+import {
+  findMissingFurniture,
+  isWardrobeStorageName,
+  type FurnitureRequirement,
+} from './furniture-checklist'
 import { pointInPolygon, polygonArea, type RoomType } from './layout-plan'
 import { callWithRetry, type McpCaller } from './scene-executor'
 
@@ -28,6 +32,8 @@ export type FurnitureRoom = {
   // create_room's zone node — the place_item target for floor items.
   zoneId: string | null
 }
+
+export type FurnitureConnection = { from: string; to: string }
 
 export type PlacedFurniture = {
   room: string
@@ -272,6 +278,7 @@ async function searchCandidates(
 
 export async function executeFurniturePlan(options: {
   rooms: FurnitureRoom[]
+  connections?: readonly FurnitureConnection[]
   levelId: string
   callMcp: McpCaller
   beforeCall?: () => void
@@ -279,7 +286,7 @@ export async function executeFurniturePlan(options: {
   // furniture checklist (see furniture-checklist.ts BATHROOM_SUBKINDS).
   market?: string
 }): Promise<FurnitureExecutionReport> {
-  const { rooms, levelId, callMcp, beforeCall, market } = options
+  const { rooms, connections = [], levelId, callMcp, beforeCall, market } = options
   const issues: string[] = []
   const placed: PlacedFurniture[] = []
   const missing: MissingFurniture[] = []
@@ -326,7 +333,21 @@ export async function executeFurniturePlan(options: {
   const candidateCache = new Map<string, Array<{ optionLabel: string; candidate: CatalogCandidate }>>()
 
   for (const room of roomsBySize) {
-    const requirements = findMissingFurniture(room.type, existingByRoom.get(room.id) ?? [], room.name, market)
+    const connectedRoomIds = new Set<string>()
+    for (const connection of connections) {
+      if (connection.from === room.id) connectedRoomIds.add(connection.to)
+      if (connection.to === room.id) connectedRoomIds.add(connection.from)
+    }
+    const hasConnectedWardrobeStorage = room.type === 'bedroom' && rooms.some(candidate =>
+      candidate.type === 'storage'
+      && connectedRoomIds.has(candidate.id)
+      && isWardrobeStorageName(candidate.name))
+    const requirements = findMissingFurniture(
+      room.type,
+      existingByRoom.get(room.id) ?? [],
+      room.name,
+      market,
+    ).filter(requirement => !(hasConnectedWardrobeStorage && requirement.key === 'wardrobe'))
     // Resolve every requirement's candidates before placing anything, then
     // pack hardest-first: the requirement whose SMALLEST candidate is largest
     // has the fewest valid spots, so it picks walls first.

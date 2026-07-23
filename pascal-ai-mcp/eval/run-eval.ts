@@ -15,7 +15,7 @@
 // spawn the MCP scene server as a stdio child process (the default).
 //
 // Usage:
-//   bun run eval/run-eval.ts                     # all cases, 1 run each
+//   bun run eval:provider                         # all cases, 1 run each (paid)
 //   bun run eval/run-eval.ts --repeat=3           # all cases, 3 runs each
 //   bun run eval/run-eval.ts --only=case-12-scope-boundary,case-03-two-bed-standard
 //   bun run eval/run-eval.ts --dry-run            # validate case files only, no model/MCP calls, no tokens spent
@@ -32,8 +32,11 @@ import { SqliteModelAttemptRecorder } from '../src/telemetry/model-attempt-recor
 import { WorkflowStepRepository } from '../src/persistence/workflow-step-repository'
 import { SceneBuildRepository } from '../src/persistence/scene-build-repository'
 import { AiAuditRepository } from '../src/persistence/audit-repository'
+import { SceneSpaceRepository } from '../src/persistence/scene-space-repository'
 import { SqliteCheckpointSaver } from '../src/persistence/sqlite-checkpoint-saver'
 import { WORKFLOW_GRAPH_VERSION } from '../src/workflow-identity'
+import { createLangGraphWorkflowRuntimeFactory } from '../src/adapters/workflow/langgraph-workflow-runtime'
+import { createOpenAiModelClients } from '../src/adapters/model/openai-model-clients'
 import type { ChatInput, ChatResult, PhaseToolTrace, SceneResult, WorkflowPhase } from '../src/types'
 import {
   canConfirmFromPhase,
@@ -127,10 +130,16 @@ type CaseRunResult = {
 const CASES_DIR = join(import.meta.dir, 'cases')
 const REPORT_ROOT = join(import.meta.dir, 'report')
 
-function parseArgs(): { repeat: number; only?: Set<string>; dryRun: boolean } {
+function parseArgs(): {
+  repeat: number
+  only?: Set<string>
+  dryRun: boolean
+  allowProviderCost: boolean
+} {
   let repeat = 1
   let only: Set<string> | undefined
   let dryRun = false
+  let allowProviderCost = false
   for (const arg of process.argv.slice(2)) {
     if (arg.startsWith('--repeat=')) {
       repeat = Math.max(1, Number.parseInt(arg.slice('--repeat='.length), 10) || 1)
@@ -139,8 +148,9 @@ function parseArgs(): { repeat: number; only?: Set<string>; dryRun: boolean } {
       only = new Set(arg.slice('--only='.length).split(',').map(s => s.trim()).filter(Boolean))
     }
     if (arg === '--dry-run') dryRun = true
+    if (arg === '--allow-provider-cost') allowProviderCost = true
   }
-  return { repeat, only, dryRun }
+  return { repeat, only, dryRun, allowProviderCost }
 }
 
 function loadCases(): EvalCase[] {
@@ -824,7 +834,7 @@ function renderSummaryMarkdown(summary: ReturnType<typeof buildSummary>, results
 }
 
 async function main(): Promise<void> {
-  const { repeat, only, dryRun } = parseArgs()
+  const { repeat, only, dryRun, allowProviderCost } = parseArgs()
   const allCases = loadCases()
   const cases = only ? allCases.filter(c => only.has(c.id)) : allCases
   if (cases.length === 0) {
@@ -836,6 +846,10 @@ async function main(): Promise<void> {
     runDryRun(cases, allCases)
     return
   }
+  if (!allowProviderCost) {
+    console.error('真实供应商评测可能产生费用；请使用 bun run eval:provider（或显式传 --allow-provider-cost）。')
+    process.exit(2)
+  }
 
   const config = loadConfig()
   const database = new AppDatabase(config.databaseFile)
@@ -846,6 +860,7 @@ async function main(): Promise<void> {
   const workflowSteps = new WorkflowStepRepository(database)
   const sceneBuilds = new SceneBuildRepository(database)
   const audits = new AiAuditRepository(database)
+  const sceneSpaces = new SceneSpaceRepository(database)
   const checkpointSaver = new SqliteCheckpointSaver(database, {
     graphVersion: WORKFLOW_GRAPH_VERSION,
     ttlMs: config.workflowCheckpointTtlMs,
@@ -862,6 +877,9 @@ async function main(): Promise<void> {
     sceneBuilds,
     checkpointSaver,
     audits,
+    sceneSpaces,
+    createLangGraphWorkflowRuntimeFactory(checkpointSaver),
+    createOpenAiModelClients(config),
   )
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
@@ -888,7 +906,14 @@ async function main(): Promise<void> {
   }
 
   const summary = buildSummary(results)
-  writeFileSync(join(reportDir, 'summary.json'), JSON.stringify(summary, null, 2))
+  writeFileSync(join(reportDir, 'summary.json'), JSON.stringify({
+    schemaVersion: 1,
+    mode: 'provider',
+    generatedAt: new Date().toISOString(),
+    repeat,
+    caseIds: cases.map(testCase => testCase.id),
+    metrics: summary,
+  }, null, 2))
   writeFileSync(join(reportDir, 'summary.md'), renderSummaryMarkdown(summary, results))
   // Scaffold blank human-review templates (one per raw run) and drop the
   // review 手顺 into the report dir, so every run comes ready to review.

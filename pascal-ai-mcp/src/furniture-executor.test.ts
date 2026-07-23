@@ -109,6 +109,27 @@ describe('executeFurniturePlan', () => {
     expect(violations).toEqual([])
   })
 
+  test('a connected closet room satisfies the bedroom wardrobe requirement', async () => {
+    const closet: FurnitureRoom = {
+      id: 'closet-1',
+      name: 'クローゼット',
+      type: 'storage',
+      polygon: [[4, 0], [5, 0], [5, 3.5], [4, 3.5]],
+      zoneId: 'zone-closet',
+    }
+    const { callMcp, calls } = makeMockMcp()
+    const report = await executeFurniturePlan({
+      rooms: [bedroom, closet],
+      connections: [{ from: bedroom.id, to: closet.id }],
+      levelId: 'level-1',
+      callMcp,
+    })
+
+    expect(report.missing).toEqual([])
+    expect(report.placed.map(entry => entry.label)).toEqual(['床'])
+    expect(calls.some(call => call.name === 'search_assets' && call.args.query === 'wardrobe')).toBe(false)
+  })
+
   test('irrelevant search hits are filtered by the checklist matcher (床 never becomes 床头柜)', async () => {
     const { callMcp } = makeMockMcp()
     const report = await executeFurniturePlan({ rooms: [bedroom], levelId: 'level-1', callMcp })

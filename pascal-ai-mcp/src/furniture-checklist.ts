@@ -32,11 +32,17 @@ function single(key: string, label: string, searchTerms: string[], match: RegExp
 // future localized catalog.
 // Item-name matchers are trilingual (中/日/英): catalog items are English
 // today, but modify-path scenes can contain user-named items in any language.
+const WARDROBE_MATCH = /衣柜|衣橱|wardrobe|closet|タンス|箪笥|ワードローブ|クローゼット/i
+
 const BEDROOM: FurnitureRequirement[] = [
   // 床头柜/床垫 must not satisfy the bed requirement.
   single('bed', '床', ['bed', '双人床', '床'], /\bbed\b|ベッド|(?<![头铺沙发]|床头)床(?!头|垫|品)/iu),
-  single('wardrobe', '衣柜', ['wardrobe', '衣柜'], /衣柜|衣橱|wardrobe|closet|タンス|箪笥|ワードローブ|クローゼット/i),
+  single('wardrobe', '衣柜', ['wardrobe', '衣柜'], WARDROBE_MATCH),
 ]
+
+export function isWardrobeStorageName(name: string): boolean {
+  return WARDROBE_MATCH.test(name) || /衣帽|walk-?in|ウォークイン|押入/i.test(name)
+}
 
 const LIVING: FurnitureRequirement[] = [
   single('sofa', '沙发', ['sofa', '沙发'], /沙发|sofa|couch|ソファ/i),

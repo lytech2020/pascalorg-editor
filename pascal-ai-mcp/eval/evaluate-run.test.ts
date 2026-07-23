@@ -472,4 +472,9 @@ describe('countZonesOfType：merged 只作缺位兜底，不与独立房间叠�
     expect(countZonesOfType('餐厅', ['客厅兼餐厅', '主卧'])).toBe(1)
     expect(countZonesOfType('餐厅', ['客厅兼餐厅', '餐厅'])).toBe(1)
   })
+  test('日式分离卫浴按功能组计数，不把トイレ/浴室/洗面室算成三卫', () => {
+    expect(countZonesOfType('卫生间', ['トイレ', '浴室', '洗面室'])).toBe(1)
+    expect(countZonesOfType('卫生间', ['トイレ1', 'トイレ2', '浴室', '洗面室'])).toBe(2)
+    expect(countZonesOfType('卫生间', ['卫生间', '客卫'])).toBe(2)
+  })
 })
