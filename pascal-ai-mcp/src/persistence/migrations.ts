@@ -519,6 +519,45 @@ export const MIGRATIONS: readonly Migration[] = [
         ON ai_template_rejections(reason_code, template_id);
     `,
   },
+  {
+    version: 13,
+    name: 'add_modification_mode_to_workflow_steps',
+    up: `
+      ALTER TABLE workflow_steps ADD COLUMN modification_mode TEXT
+        CHECK (modification_mode IS NULL OR modification_mode IN ('local_patch', 'plan_rebuild'));
+      ALTER TABLE workflow_steps ADD COLUMN modification_reason_code TEXT
+        CHECK (modification_reason_code IS NULL OR modification_reason_code IN (
+          'rename_only', 'furniture_only', 'rename_and_furniture',
+          'add_room', 'remove_room', 'resize_room',
+          'mixed_structural', 'unsupported_or_unknown'
+        ));
+      ALTER TABLE workflow_steps ADD COLUMN modification_operations_json TEXT
+        CHECK (
+          modification_operations_json IS NULL
+          OR (
+            json_valid(modification_operations_json)
+            AND json_type(modification_operations_json) = 'array'
+          )
+        );
+
+      CREATE INDEX workflow_steps_modification_mode_idx
+        ON workflow_steps(modification_mode, modification_reason_code, started_at)
+        WHERE modification_mode IS NOT NULL;
+    `,
+  },
+  {
+    version: 14,
+    name: 'track_request_execution_source',
+    up: `
+      ALTER TABLE ai_requests ADD COLUMN execution_source TEXT NOT NULL DEFAULT 'legacy'
+        CHECK (execution_source IN ('worker', 'direct', 'legacy'));
+
+      CREATE INDEX ai_requests_worker_outcome_idx
+        ON ai_requests(completed_at, status)
+        WHERE execution_source = 'worker'
+          AND status IN ('succeeded', 'failed', 'cancelled');
+    `,
+  },
 ]
 
 export function runMigrations(database: Database): void {

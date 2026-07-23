@@ -23,6 +23,9 @@ export function planIngestAction(input: ChatInput, session: WorkflowSession): In
 
   if (input.action === 'confirm') {
     if (session.phase === 'awaiting_modification_confirmation' && session.pendingModification) {
+      if (session.pendingModificationMode === 'plan_rebuild') {
+        session.modifyModeConfirmed = true
+      }
       session.phase = 'modifying'
       return { kind: 'route', reply: t(session.language, 'modifyConfirmed', {}), next: 'modify' }
     }
@@ -49,6 +52,11 @@ export function planIngestAction(input: ChatInput, session: WorkflowSession): In
   if (shouldRouteAsExistingSceneRequest(session.phase, message)) {
     delete session.pendingModification
     delete session.pendingOperation
+    delete session.pendingModificationMode
+    delete session.pendingModificationReasonCode
+    delete session.pendingModificationPlanHash
+    delete session.modifyModeConfirmed
+    delete session.modifyDriftConfirmed
     return { kind: 'route-existing', message }
   }
   if (session.phase === 'completed' || session.phase === 'completed_with_issues') {

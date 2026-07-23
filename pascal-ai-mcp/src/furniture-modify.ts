@@ -41,6 +41,8 @@ export type FurnitureModifyResult = {
   // swap whose replacement then failed) — the modify gates use it to waive
   // "missing equipment" failures the user's own removal caused.
   removed?: { roomName: string; itemName: string }
+  removedItemId?: string
+  addedItemId?: string
 }
 
 export type FurnitureModifyReport = {
@@ -263,17 +265,23 @@ export async function executeFurnitureModifyOps(options: {
             : `已删除「${room.name}」的「${target.name}」`
           : `删除「${target.name}」失败`,
         ...(ok ? { removed: { roomName: room.name, itemName: target.name } } : {}),
+        ...(ok ? { removedItemId: target.id } : {}),
       })
     } else if (op.op === 'add_furniture') {
       const catalog = await searchTerm(callMcp, op.item, issues, beforeCall)
       const placed = await placeCandidate(room, catalog)
       results.push('reason' in placed
         ? { op, ok: false, detail: `「${op.item}」放不进「${room.name}」：${placed.reason}` }
-        : { op, ok: true, detail: `已在「${room.name}」放置「${placed.candidate.name}」` })
+        : {
+            op,
+            ok: true,
+            detail: `已在「${room.name}」放置「${placed.candidate.name}」`,
+            addedItemId: placed.item.id,
+          })
     } else {
-      // swap：先解析旧物并算好新位置（旧物脚印豁免），成功才删旧放新；
-      // 新物放置失败时旧物原样保留（§5 的回滚以"先算后删"实现，避免真
-      // 删除后 place_item 失败留下空位）。
+      // Dry placement catches catalog/geometry failures before deletion. A
+      // later place_item failure can still leave the old item removed, so the
+      // result retains removedItemId and reports that partial outcome.
       const oldCatalog = await searchTerm(callMcp, op.from, issues, beforeCall)
       const matches = matchRoomItems(liveItems, room, op.from, new Set(oldCatalog.map(c => c.id)))
       if (matches.length === 0) {
@@ -310,8 +318,21 @@ export async function executeFurnitureModifyOps(options: {
       const placed = await placeCandidate(room, newCatalog, targetFp)
       const removedInfo = { removed: { roomName: room.name, itemName: target.name } }
       results.push('reason' in placed
-        ? { op, ok: false, detail: `已删除「${target.name}」但「${op.to}」放置失败：${placed.reason}`, ...removedInfo }
-        : { op, ok: true, detail: `已将「${room.name}」的「${target.name}」换为「${placed.candidate.name}」`, ...removedInfo })
+        ? {
+            op,
+            ok: false,
+            detail: `已删除「${target.name}」但「${op.to}」放置失败：${placed.reason}`,
+            ...removedInfo,
+            removedItemId: target.id,
+          }
+        : {
+            op,
+            ok: true,
+            detail: `已将「${room.name}」的「${target.name}」换为「${placed.candidate.name}」`,
+            ...removedInfo,
+            removedItemId: target.id,
+            addedItemId: placed.item.id,
+          })
     }
   }
 

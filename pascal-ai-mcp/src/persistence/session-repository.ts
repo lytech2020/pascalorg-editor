@@ -409,9 +409,9 @@ export class ChatRequestRepository implements ChatRequestWriter {
         status, scene_id, input_json, result_json, error_code,
         owner_instance_id, lease_expires_at, heartbeat_at, run_attempts,
         queued_at, started_at, completed_at, idempotency_key, input_hash, idempotency_subject,
-        workflow_run_id, graph_version
+        workflow_run_id, graph_version, execution_source
       ) VALUES (?, ?, ?, ?, ?, 'running', ?, NULL, NULL, NULL,
-        'direct', NULL, NULL, 1, ?, ?, NULL, NULL, NULL, 'local', ?, ?)
+        'direct', NULL, NULL, 1, ?, ?, NULL, NULL, NULL, 'local', ?, ?, 'direct')
     `)
     this.finishStatement = database.connection.prepare(`
       UPDATE ai_requests
@@ -442,9 +442,9 @@ export class ChatRequestRepository implements ChatRequestWriter {
         status, scene_id, input_json, result_json, error_code,
         owner_instance_id, lease_expires_at, heartbeat_at, run_attempts,
         queued_at, started_at, completed_at, idempotency_key, input_hash, idempotency_subject,
-        workflow_run_id, graph_version
+        workflow_run_id, graph_version, execution_source
       ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, NULL, NULL,
-        NULL, NULL, NULL, 0, ?, NULL, NULL, ?, ?, ?, ?, ?)
+        NULL, NULL, NULL, 0, ?, NULL, NULL, ?, ?, ?, ?, ?, 'worker')
     `)
     this.queuedBySessionStatement = database.connection.prepare(`
       SELECT * FROM ai_requests

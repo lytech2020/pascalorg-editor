@@ -6,6 +6,7 @@ import type { ChatMessage, WorkflowSession } from '../types'
 import type { DiagnosticsSummary } from './generate-service'
 import { finishSceneWorkflow, publicEditorUrl } from './generate-service'
 import type { WorkflowGraphState } from '../workflow-state'
+import { renderPrompt } from '../prompts/registry'
 
 export type IntentRemoval = { roomName: string; itemName: string }
 
@@ -25,7 +26,7 @@ export type ModifyWorkflowDependencies = {
     feedback: string,
     sceneId: string,
     loadedVersion: number | null,
-  ) => Promise<Partial<WorkflowGraphState> | null>
+  ) => Promise<Partial<WorkflowGraphState>>
   snapshotScene: (session: WorkflowSession) => Promise<SceneNodeSnapshot>
   runLegacyPhase: (session: WorkflowSession, purpose: string) => Promise<ModifyPhaseResult>
   dedupeSharedWalls: (
@@ -34,10 +35,11 @@ export type ModifyWorkflowDependencies = {
     protectedWallIds: Set<string>,
   ) => Promise<void>
   checkProtection: (
+    session: WorkflowSession,
     before: SceneNodeSnapshot,
     after: SceneNodeSnapshot,
     feedback: string,
-  ) => string[]
+  ) => Promise<string[]>
   refine: (
     session: WorkflowSession,
     purpose: string,
@@ -65,12 +67,6 @@ export type ModifyWorkflowDependencies = {
   planSnapshot: (plan: LayoutPlan) => string
 }
 
-const MODIFICATION_GUARD_PROMPT =
-  '结构保护要求：这是对已有场景的增量修改，只做实现本次请求所必需的改动。'
-  + '新增房间时优先让新隔墙与既有墙体拼接围合，不要移动、裁剪或删除既有墙体；'
-  + '新开的门优先安排在新隔墙上；不要改动与本次请求无关的门窗和家具。'
-  + '如果请求给出了新增房间的面积或数值范围，创建后必须用 get_zones 实测确认落在范围内再结束。'
-
 export async function runModifyWorkflow(
   state: WorkflowGraphState,
   dependencies: ModifyWorkflowDependencies,
@@ -90,8 +86,7 @@ export async function runModifyWorkflow(
     const loaded = await dependencies.loadScene(session, sceneId)
     const loadedVersion = finiteNumber(loaded.version)
     if (process.env.PASCAL_MODIFY_LEGACY !== '1') {
-      const fastPath = await dependencies.runPlanFirst(session, feedback, sceneId, loadedVersion)
-      if (fastPath) return fastPath
+      return dependencies.runPlanFirst(session, feedback, sceneId, loadedVersion)
     }
 
     const legacyNoSnapshot = !session.layoutIntent || !session.layoutPlan
@@ -104,16 +99,22 @@ export async function runModifyWorkflow(
     const planSnapshot = session.layoutPlan && !isDeleteOperation
       ? `\n${dependencies.planSnapshot(session.layoutPlan)}`
       : ''
+    const modificationGuard = renderPrompt('modification-guard', {}).parts.content
     const purpose = isDeleteOperation
       ? `用户已确认对当前场景执行${operation}操作：${feedback}`
-      : `用户已确认对当前场景执行${operation}操作：${feedback}\n${MODIFICATION_GUARD_PROMPT}${planSnapshot}`
+      : `用户已确认对当前场景执行${operation}操作：${feedback}\n${modificationGuard}${planSnapshot}`
     const phase = await dependencies.runLegacyPhase(session, purpose)
     if (!isDeleteOperation) {
       await dependencies.dedupeSharedWalls(session.sessionId, levelId, protectedWallIds)
     }
     const extraChecks = isDeleteOperation
       ? undefined
-      : async () => dependencies.checkProtection(beforeNodes, await dependencies.snapshotScene(session), feedback)
+      : async () => dependencies.checkProtection(
+        session,
+        beforeNodes,
+        await dependencies.snapshotScene(session),
+        feedback,
+      )
     const { diagnostics, repairRounds, toolNamesUsed, furnitureIssues } = await dependencies.refine(
       session,
       purpose,
@@ -129,6 +130,11 @@ export async function runModifyWorkflow(
     const gates = await dependencies.evaluateGates(session)
     delete session.pendingModification
     delete session.pendingOperation
+    delete session.pendingModificationMode
+    delete session.pendingModificationReasonCode
+    delete session.pendingModificationPlanHash
+    delete session.modifyModeConfirmed
+    delete session.modifyDriftConfirmed
     const { reply } = finishSceneWorkflow({
       session,
       sceneId,
@@ -153,6 +159,11 @@ export async function runModifyWorkflow(
       delete session.destructiveSceneWriteStarted
       delete session.pendingModification
       delete session.pendingOperation
+      delete session.pendingModificationMode
+      delete session.pendingModificationReasonCode
+      delete session.pendingModificationPlanHash
+      delete session.modifyModeConfirmed
+      delete session.modifyDriftConfirmed
       session.phase = session.sceneResult ? 'completed_with_issues' : 'failed'
       const reply = t(session.language, 'modifyDestructiveFailed', {
         sceneId,

@@ -2,7 +2,9 @@
 
 状态：**已落地（2026-07-13）**。M0–M3 全部完成，修改类 eval case-13/14/16/17/18 线上全绿（报告 2026-07-13T03-10 + 06-32/06-33）。落点全部在 pascal-ai-mcp（不动 packages/mcp）。
 
-> **legacy 路径处置（修正 §8-4 的拍板）**：旧自由编辑路径**保留**而非删除——它是无 intent 快照旧场景做结构修改的唯一回退（§7），删除会让存量场景失去结构修改能力。`PASCAL_MODIFY_LEGACY=1` 强制开关保留作对照实验。新生成的场景永远走 plan-first 路径。
+> **legacy 路径处置（2026-07-23 安全收口）**：旧自由编辑实现仍保留在显式的 `PASCAL_MODIFY_LEGACY=1` 对照开关后，但默认路径不再把未知操作、解析失败或缺少 Intent/Plan 快照的结构请求静默降级给它。缺快照时家具修改仍可执行；结构修改会安全拒绝并说明需要重新生成或建立规划快照。
+
+> **D2 修改模式（2026-07-23）**：每次解析后的操作先确定为 `local_patch` 或 `plan_rebuild`。前者只允许目标 zone/item 与必要的父级 children 变化，并在写后做确定性 scene diff；后者在任何场景写入前明确说明重建范围并要求确认。确认绑定解析后 ModifyOp 数组按确定性 JSON 序列化所得的 SHA-256，确认后若模型二次翻译产生不同操作会重新提示。模式、reason code 和 workflow step 终态共同构成可查询的审计结果。
 
 **与生成流程的边界**：修改流程不依赖生成流程的内部实现，只依赖三个契约——① `LayoutIntent` schema 向后兼容；② 生成完成后写全 session 快照（`layoutIntent` / `layoutPlan` / `strategy`，这是两条流程唯一的接口）；③ `partitionLayout` / `executeLayoutPlan` 签名扩展用可选参数。守住这三条，生成侧任意演进（新拓扑、调参、预设户型库产 plan）对修改侧透明，且质量提升自动流入修改侧（同一分区器/执行器）；稳定性锚点是 session 的旧 plan 快照而非当前生成算法，生成算法升级不会让存量场景的修改行为漂移。
 
@@ -40,7 +42,7 @@ parseModifyOps → 校验 op 引用（房间 id/名称能否解析到现有 plan
 │     ── 稳定性约束见 §4                                      │
 │   ↓ validateLayoutPlan（NormProfile 面积界天然生效）        │
 │   ↓ diff(旧 plan, 新 plan) → 用户可读的变更预览             │
-│   ↓ 确认后：结构重建（§6）→ 家具执行器 → gates              │
+│   ↓ 明示重建范围并确认后：结构重建（§6）→ 家具执行器 → gates │
 └────────────────────────────────────────────────────────────┘
    ↓
 session.layoutIntent / layoutPlan / zoneRoomTypes 快照全部刷新（修复病灶④）
@@ -94,7 +96,7 @@ type ModifyPlan = { ops: ModifyOp[]; note?: string }   // note：模型对歧义
 |---|---|
 | remove_furniture | `item` 经目录检索词匹配房间内现有 item 节点（zoneRoomTypes 定房间、catalog tags 定物品）→ MCP 删除节点；匹配多个时删最后放置的一个并在回复说明 |
 | add_furniture | 目录检索 → `rankCandidates` → `findWallPlacement` 贴墙扫描（带门净空/碰撞检查）→ 放置；放不下 → 失败原因如实回复（复用灶台修复后的"房间挤 vs 目录缺规格"细分） |
-| swap_furniture | remove + add 原子执行；add 失败则回滚 remove（先算好位置再删旧的） |
+| swap_furniture | 先计算新物品的可放位置，确认可放后才删除旧物品并添加新物品；不是依赖外部场景回滚 |
 
 改完重跑 `checkFurniturePlacement` + furniture gates，结果进回复。
 
@@ -102,38 +104,39 @@ type ModifyPlan = { ops: ModifyOp[]; note?: string }   // note：模型对歧义
 
 **v1 重建方式：结构全量重建**——新 plan 经 `executeLayoutPlan` 重建墙体/门窗/房间，家具执行器重摆。不做"结构增量 diff 施工"（那是 v2 优化，复杂度高、v1 收益低——重建本身零模型调用、秒级完成）。
 
-**手动编辑政策（待拍板，§8-1）**：重建会覆盖用户在编辑器里手改的结构。v1 建议方案 A：
+**手动编辑政策（已采用方案 A，§8-1）**：重建会覆盖用户在编辑器里手改的结构。所有 `plan_rebuild` 都会在写入前提示结构重建范围；检测到手工漂移时在同一提示中额外说明差异可能被覆盖：
 
 - 修改前对比现场与 `layoutPlan` 快照（复用 `structuralDrift` 快照比对）：
-  - 无漂移 → 直接走新流程；
-  - 有漂移 → 提示"检测到手动修改，AI 结构修改将以重新规划为准重建（家具类修改不受影响）"，用户确认后执行；**家具类 op 不受漂移影响，永远可用**；
+  - 无漂移 → 说明结构、开口和清单家具会重新生成，用户确认后执行；
+  - 有漂移 → 在同一确认中追加“手动差异可能被覆盖”；**家具类 op 不受漂移影响，仍走局部路径**；
 - 用户手动放置的家具（不在 furniture-checklist 内的 item）在重建后按原房间归属尽力重放（房间还在 → 重新扫描放置；房间没了 → 回复中列出）。
 
-**版本安全**：重建前 `persistScene` 留档旧版本，回复中带旧版本号——出问题可回滚（存储层已有版本机制，不新增）。
+**版本安全**：重建前版本号只作为审计边界记录。当前 MCP 接口不提供权威 restore-to-version，失败、取消或写后范围越界时不得承诺原场景已恢复，也不得根据日志盲目自动重放。
 
 ## 7. 与现有路由的衔接
 
-- `ingest()` 的意图分类（update/delete/create）不动；`awaiting_modification_confirmation` 确认机制不动（删除的二次确认保留——remove_room 属破坏性）；
+- `ingest()` 的意图分类（update/delete/create）不动；delete 路由的原确认仍保留，ModifyOp 判定为 `plan_rebuild` 后还必须完成一次带明确影响范围的模式确认；
 - `modify()` 内部整体替换为新管线；旧自由编辑路径保留在 `PASCAL_MODIFY_LEGACY=1` 环境变量后面（对照实验用，不进 AppConfig，与 `AI_PLAN_LLM_GEOMETRY` 同风格），稳定后删除；
-- 无 `layoutIntent` 快照的旧场景（新流程上线前生成的）：结构类 op 走 legacy 路径并在回复注明，家具类 op 照常走新路径（只需 zoneRoomTypes 或名称回退）。
+- 无 `layoutIntent`/`layoutPlan` 快照的旧场景（新流程上线前生成的）：家具类 op 照常走新路径（只需 zoneRoomTypes 或名称回退）；结构类 op 默认安全拒绝，不自动进入 legacy。
+- 当前 ModifyOp v1 不含门窗操作，也没有带明确目标位置的 `move_furniture`。此类请求会按未知操作安全拒绝；只有在增加确定性位置契约、执行器、目标范围声明和写后 diff 证明后，才能进入 `local_patch`。
 
 ## 8. 待拍板项
 
 | # | 问题 | 建议 |
 |---|---|---|
-| 1 | 手动编辑政策：漂移时结构修改是"确认后重建"（方案 A）还是"拒绝并引导用户手动改"（方案 B） | A——B 会让 AI 修改在真实使用中大概率不可用 |
+| 1 | 手动编辑政策：漂移时结构修改是"确认后重建"（方案 A）还是"拒绝并引导用户手动改"（方案 B） | **已采用 A**；所有结构重建均明示确认，漂移时追加覆盖风险 |
 | 2 | remove_room 后的面积语义：footprint 缩小（总面积减）还是其余房间瓜分（总面积不变） | ~~缩小为默认~~ **2026-07-14 修订（用户实测反馈：删卫生间导致全户型重排不可接受）**：单独 remove_room 优先**局部吸收**——被删房间矩形并入共享边最长的邻室（`absorbRoomInPlan`：走廊为最后候选；删走廊/玄关宿主/致孤房/并集不成单一多边形/面积 fatal 时回退稳定性重分区，此时 footprint 缩小语义生效）。**2026-07-14 二修（eval 复盘）：候选邻室逐个过形状预检（并集包围盒长宽比 ≤ maxRoomAspect，吸收方为 circulation 时豁免，与 validator 同语义——玄关并走廊本来就是长条），不合格 continue 试下一个邻居，全部不合格才回退重分区**——此前第一候选（共享边最长）并集成细长 L 就一票否决全部候选，田の字删卫生间被误判走了重分区。孤房检查同时修正：entry 宿主删除会把门重挂到吸收方（并集保留玄关每一面墙），不适用孤房否决——此前「厨房只开门到玄关」的布局删玄关被误判。吸收路径 footprint 与总面积不变、其余房间坐标零变化，拓扑无关（band 凹格/田の字格子/线性段通用） |
 | 3 | 稳定性位移阈值（§4 的 0.5m）与 deviationWeight 数值 | 落码时以 eval/预览实测定，文档只定语义 |
-| 4 | 旧流程退役时间 | case-13/14 + 新家具 eval case 全绿后删 legacy 路径 |
+| 4 | 旧流程退役时间 | 默认已禁止安全路径静默降级；显式对照开关何时物理删除另行决定 |
 
 ## 9. 实施批次 
 
 | 批次 | 内容 | 回归要求 |
 |---|---|---|
 | M0 | ✅ 完成（2026-07-13）：`src/modify-ops.ts`——ModifyOp schema + `parseModifyOps`（容错解析，部分成功保留合法 op + 错误清单）+ `resolveRoomRef`（id→名称→词表类型唯一，歧义报错）+ `applyModifyOps`（纯函数，面积过 `TYPE_TO_KIND`+`roomAreaBounds` 判界：fatal 拒绝/soft 警告） | 346 单测过；零模型调用可测 |
-| M1 | ✅ 完成（2026-07-13）：`src/furniture-modify.ts` 家具三件套（增=检索+贴墙扫描；删=目录 id 匹配→名称兜底，多匹配删最后放置；换=先算后删，放不下不删）+ agent 快速路径（`tryFurnitureModify`：一次模型调用译 op，空 ops/结构 op/解析失败静默回退 legacy；无 intent 快照的旧场景家具修改也可用）+ eval case-16/17/18（增/删/换，`itemChanges` 断言：item diff 匹配 + structureUntouched） | 353 单测过 + dry-run 18 用例 0 结构问题；线上 case-16/17/18 待余额恢复后跑 |
+| M1 | ✅ 完成（2026-07-13）：`src/furniture-modify.ts` 家具三件套（增=检索+贴墙扫描；删=目录 id 匹配→名称兜底，多匹配删最后放置；换=先算后删，放不下不删）+ agent 快速路径（一次模型调用译 op；无 intent 快照的旧场景家具修改也可用）+ eval case-16/17/18（增/删/换，`itemChanges` 断言：item diff 匹配 + structureUntouched）。当时的空 ops/解析失败 legacy 降级已由 2026-07-23 安全收口取代。 | 353 单测过 + dry-run 18 用例 0 结构问题；线上 case-16/17/18 待余额恢复后跑 |
 | M2 | ✅ 完成（2026-07-13）：稳定性机制（`partitionLayout` 第 4 参数 `{previousPlan}`：宽度搜索收敛为旧 W + `planDeviation`×`deviationWeight` 进候选罚分 + 锁定无解时放开轮廓重搜记 note）+ agent 结构管线（`tryPlanFirstModify`：翻译 op → `applyModifyOps` → deriveStrategy → 稳定性重分区 → validator → 结构全量重建（清 zone/wall/slab/ceiling/item 后 `executeLayoutPlan` + 清单家具重摆）→ session 三快照 + zoneRoomTypes 刷新；rename-only 走 `apply_patch` 改 zone 名不重建；拒绝路径 `rejectPlanFirstModify` 引用具体原因）+ 小书房入枢纽嵌入。**v1 与原设计的偏差**：diff 预览不再单独一轮确认——修改本就有确认环节，变更明细（applyModifyOps/partition notes）在重建后随回复给出；预生成预览等 ingest 侧接入翻译后再评估 | 357 单测过（case-13/14 复刻为离线分区断言 + 轮廓回退断言 + 无 stability 参数时与旧行为逐字段相等）；预览 SVG 逐字节不变 |
-| M3 | **离线部分 ✅（2026-07-13）**：漂移检测（`sceneDriftedFromPlan`：房间数 + 排序面积档对比，容差 max(0.8㎡, 10%)——刻意不比名称（rename 是合法非结构编辑，rename 后 plan 快照名称同步）也不比墙几何（v1 无持久节点快照））+ 确认握手（漂移时警告一次 `modifyDriftWarning`，`session.modifyDriftConfirmed` 标记，同一 pending 请求确认后重建；换新请求时标记作废）+ `PASCAL_MODIFY_LEGACY=1` 开关（强制走旧路径，对照实验用）。旧场景回退路径已随 M2 落地（无快照 → 结构修改回 legacy，家具修改照常）。**线上 eval ✅（2026-07-13）**：case-13/16/17 绿于 03-10 报告；case-14（resize 补偿后主卧 16.9㎡ ≥16，锁宽 12.06m 保持）与 case-18（衣柜误删修复后：-1 床 +1 床、结构零变化、gates 全过 quality 100）绿于 06-32/06-33 报告 | 364 单测过；legacy 保留为旧场景回退（见文档头注） |
+| M3 | **离线部分 ✅（2026-07-13）**：漂移检测（`sceneDriftedFromPlan`：房间数 + 排序面积档对比，容差 max(0.8㎡, 10%)——刻意不比名称（rename 是合法非结构编辑，rename 后 plan 快照名称同步）也不比墙几何（v1 无持久节点快照））+ 漂移确认握手 + `PASCAL_MODIFY_LEGACY=1` 对照开关。2026-07-23 起确认已扩大为所有 `plan_rebuild`，缺快照结构请求也不再默认回退 legacy。**线上 eval ✅（2026-07-13）**：case-13/16/17 绿于 03-10 报告；case-14（resize 补偿后主卧 16.9㎡ ≥16，锁宽 12.06m 保持）与 case-18（衣柜误删修复后：-1 床 +1 床、结构零变化、gates 全过 quality 100）绿于 06-32/06-33 报告 | 364 单测过；历史基线保留，当前默认安全语义见文档头注 |
 
 M0–M2 核心为确定性代码，模型服务不可用也能开发（ModifyOp 翻译用 fixture 测）；唯一新模型 prompt（修改请求 → ModifyOp JSON）在 M1 一并写好但可后验。
 
@@ -142,7 +145,7 @@ M0–M2 核心为确定性代码，模型服务不可用也能开发（ModifyOp 
 | 修正 | 内容 |
 |---|---|
 | 词表桥 | `findVocabularyOption`（furniture-checklist）：翻译器输出用户语言的家具词，目录是英文——检索与房内物品匹配都过三语词表桥 |
-| 翻译重试 | ModifyOp 解析**缺陷**重试 ≤2 轮（喂错误清单）；空 ops 是"超出词汇表"信号，不重试直接回 legacy |
+| 翻译重试 | ModifyOp 解析**缺陷**重试 ≤2 轮（喂错误清单）；空 ops 是"超出词汇表"信号。2026-07-23 起默认安全拒绝，不再直接回 legacy |
 | resize 欠额补偿 | 分区器均匀缩放使 resize 目标系统性偏低几个点 → 按欠额比例通胀目标重分区一次，仍不达标则如实记 note |
 | prompt 硬化 | 房间称呼映射（主卧→卧室1 类）；brief 抽取稳定 key（total_area/room_program）；evaluateBrief 几何/功能判定放宽到值匹配，防信息完整请求误入澄清 |
 | eval 适配 plan-first | `setupFrom`（同 session 先生成基准场景以获得快照，与 baseSceneId 互斥）；`preserveExteriorWidth`（§4 锁宽语义的诚实断言，替代"原墙零改动"——全量重建下原墙必然重建）；`allowedGateFailures`（case-17 删床后"缺床"是正确结果） |
@@ -158,8 +161,8 @@ M0–M2 核心为确定性代码，模型服务不可用也能开发（ModifyOp 
 | gates 需求真相 | `gateTargetsForSession`：**仅当 `programEditedByModify`（结构修改重建时置位）后**以 `layoutIntent` 为需求真相，生成时 brief 仍是独立检验（2026-07-14 修正：否则模型少出一间卧室会自己给自己判卷——case-04 复盘）；legacy 场景恒用 brief |
 | 手动家具重放（§6 兑现） | `isChecklistItem` + `replayManualItems`：重建前从场景快照采集非清单 item（含原房间归属），重建后按房间名重扫描摆放；房间没了/放不下/资产失效 → 逐件列入回复，不静默丢弃 |
 | 补偿 plan 未用 bug | resize 欠额补偿产出的 `plan`/`planNotes` 此前未被重建与快照使用（仍用 `partition.plan`，case-14 因未触发补偿而侥幸通过）——重建/`session.layoutPlan`/notes 全部改用补偿后结果 |
-| 旧场景注明（§7 兑现） | 无快照场景走 legacy 时回复追加 `modifyLegacyNoSnapshot` 说明 |
-| 版本号（§6 兑现） | 结构重建回复追加 `modifyPreviousVersion`（修改前版本号，可回滚） |
+| 旧场景注明（§7 历史实现） | 曾为无快照场景走 legacy 时追加 `modifyLegacyNoSnapshot`；2026-07-23 起默认结构请求安全拒绝，只有显式对照开关仍会进入 legacy |
+| 版本号（§6 兑现） | 结构重建回复追加 `modifyPreviousVersion`；该版本号仅作审计引用，当前接口不支持自动恢复 |
 | case-19 断言教训 | 删除大房间会让"双带+走廊"退化为单带，锁旧宽几何无解 → 分区器按 §4 放开轮廓重搜（设计内行为）——remove 类案例不断言锁宽，锁宽断言只适用于 add/resize |
 | **局部删除吸收（2026-07-14）** | 用户实测：田の字下删卫生间导致全户型重排（格子拓扑房间数变化 = 格子重分配，稳定性机制无候选可选）。修复：`unionAdjacentPolygons`（layout-plan，边消除法轴对齐多边形并集）+ `absorbRoomInPlan`（partitioner，§8-2 修订语义）+ agent 吸收优先路径（验证过 validator 才走，fatal 回退重分区）+ 重建尾段抽出 `rebuildScenePlanFirst` 共享 + eval `preserveRoomPolygons` 断言（非豁免房间多边形逐点比对）+ case-20 线上 ✅（删卫生间：外轮廓不变、其余房间零移动、gates 过） |
 | **修改路径 gates 归责（§6 三修，2026-07-14）** | 用户实测：手动删光厨房家具后让 AI 放一把椅子，每轮修改都重报「厨房缺少必备设备」并压成 `completed_with_issues`；通过 AI 删除更拧巴——删除执行成功却被判「门槛未过」。语义修正：**gates 只追责「AI 本次做砸的、且用户没要求的」**。两层过滤（`effectiveGateFailures`，纯函数）：① 基线差分——`tryPlanFirstModify` 在 ops 执行前取一次 gates 基线（零模型调用），收尾只对新增失败判 phase；② 意图豁免——本次 remove/swap 实际删除的家具（`FurnitureModifyResult.removed` 记录房间+物名）经 `requirementLabelsSatisfiedBy` 映射回清单需求标签，对应的 missing-equipment/furniture 新失败不计。被滤掉的失败降级为一句中性备注（`modifyGatesWaived`），生成路径全量跑不受影响 |

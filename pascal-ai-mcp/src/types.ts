@@ -1,5 +1,6 @@
 import type { LayoutIntent, LayoutPlan, RoomType } from './layout-plan'
 import type { StrategyDecision } from './strategy'
+import type { ModificationMode, ModificationModeReason } from './domain/modification-mode'
 
 export type ChatRole = 'system' | 'user' | 'assistant' | 'tool'
 
@@ -200,6 +201,10 @@ export type WorkflowSession = {
   sceneResult?: SceneResult
   pendingModification?: string
   pendingOperation?: 'create' | 'update' | 'delete'
+  pendingModificationMode?: ModificationMode
+  pendingModificationReasonCode?: ModificationModeReason
+  pendingModificationPlanHash?: string
+  modifyModeConfirmed?: boolean
   // Set by the plan-first structural rebuild: the user has EDITED the room
   // program via modify ops, so the completion gates must judge against the
   // (kept-current) layoutIntent instead of the original brief. Never set by

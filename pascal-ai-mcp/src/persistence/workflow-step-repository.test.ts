@@ -38,6 +38,46 @@ describe('WorkflowStepRepository (T2.2)', () => {
     }
   })
 
+  test('associates a modification decision with its request step without user text', () => {
+    const database = new AppDatabase(':memory:')
+    try {
+      const requests = new ChatRequestRepository(database)
+      requests.start({
+        requestId: 'request-mode',
+        traceId: 'trace-mode',
+        sessionId: 'session-mode',
+        kind: 'chat',
+        startedAt: '2026-07-23T00:00:00.000Z',
+      })
+      const repository = new WorkflowStepRepository(database)
+      const step = repository.start({
+        requestId: 'request-mode',
+        sessionId: 'session-mode',
+        operationKey: 'modify-plan',
+        startedAt: '2026-07-23T00:00:01.000Z',
+      })
+      expect(repository.recordModificationDecision(step.stepId, {
+        mode: 'local_patch',
+        reasonCode: 'rename_and_furniture',
+        operationTypes: ['add_furniture', 'rename_room'],
+      })).toBe(true)
+      expect(repository.finish(
+        step.stepId,
+        'succeeded',
+        '2026-07-23T00:00:02.000Z',
+      )).toBe(true)
+      expect(repository.findByRequestId('request-mode')[0]).toMatchObject({
+        status: 'succeeded',
+        modificationMode: 'local_patch',
+        modificationReasonCode: 'rename_and_furniture',
+        modificationOperationTypes: ['add_furniture', 'rename_room'],
+      })
+      expect(JSON.stringify(repository.findByRequestId('request-mode'))).not.toContain('用户原文')
+    } finally {
+      database.close()
+    }
+  })
+
   test('marks only running steps failed-recoverable after an interrupted request', () => {
     const database = new AppDatabase(':memory:')
     try {

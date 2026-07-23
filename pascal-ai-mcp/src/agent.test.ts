@@ -561,6 +561,19 @@ describe('ingest state machine: planIngestAction', () => {
     const plan = planIngestAction(input({ action: 'confirm' }), s)
     expect(plan).toMatchObject({ kind: 'route', next: 'modify' })
     expect(s.phase).toBe('modifying')
+    expect(s.modifyModeConfirmed).toBeUndefined()
+  })
+
+  test('confirm records explicit consent for a classified plan rebuild', () => {
+    const s = session({
+      phase: 'awaiting_modification_confirmation',
+      pendingModification: '把卧室扩大',
+      pendingModificationMode: 'plan_rebuild',
+      pendingModificationReasonCode: 'resize_room',
+    })
+    const plan = planIngestAction(input({ action: 'confirm' }), s)
+    expect(plan).toMatchObject({ kind: 'route', next: 'modify' })
+    expect(s.modifyModeConfirmed).toBe(true)
   })
 
   test('confirm when nothing is confirmable is rejected', () => {
@@ -621,6 +634,27 @@ describe('modify-failure recovery', () => {
     expect(shouldRouteAsExistingSceneRequest('awaiting_modification_confirmation', '换个方向开门')).toBe(true)
     expect(shouldRouteAsExistingSceneRequest('awaiting_modification_confirmation', '   ')).toBe(false)
     expect(shouldRouteAsExistingSceneRequest('completed', '换个方向开门')).toBe(false)
+    const s = session({
+      phase: 'awaiting_modification_confirmation',
+      pendingModification: '扩大卧室',
+      pendingOperation: 'update',
+      pendingModificationMode: 'plan_rebuild',
+      pendingModificationReasonCode: 'resize_room',
+      pendingModificationPlanHash: 'hash-a',
+      modifyModeConfirmed: true,
+      modifyDriftConfirmed: true,
+    })
+    expect(planIngestAction(input({ message: '只改房间名' }), s)).toEqual({
+      kind: 'route-existing',
+      message: '只改房间名',
+    })
+    expect(s).not.toHaveProperty('pendingModification')
+    expect(s).not.toHaveProperty('pendingOperation')
+    expect(s).not.toHaveProperty('pendingModificationMode')
+    expect(s).not.toHaveProperty('pendingModificationReasonCode')
+    expect(s).not.toHaveProperty('pendingModificationPlanHash')
+    expect(s).not.toHaveProperty('modifyModeConfirmed')
+    expect(s).not.toHaveProperty('modifyDriftConfirmed')
   })
 })
 

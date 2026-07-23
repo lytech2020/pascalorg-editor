@@ -32,6 +32,13 @@ Rule source of truth lives in `docs/` (change flow: edit doc → sync code → e
 - [docs/LAYOUT_STRATEGY_DESIGN.md](docs/LAYOUT_STRATEGY_DESIGN.md) — 策略层规则与拓扑细则（areaBand / typology / kitchenMode / 打分参数）
 - [docs/NORMS_PROFILE_DESIGN.md](docs/NORMS_PROFILE_DESIGN.md) — default / JP 规范档案与参数来源（NormProfile）
 - [docs/MODIFY_REDESIGN.md](docs/MODIFY_REDESIGN.md) — 修改流程重设计（Modify = 编辑 Intent；草案，待拍板）
+- [docs/PROMPT_MANAGEMENT.md](docs/PROMPT_MANAGEMENT.md) — Prompt registry、版本/hash、审计与回退约束
+- [docs/OPERATIONS.md](docs/OPERATIONS.md) — 内部 readiness、`ops:check`、告警阈值与脱敏 reason code
+- [docs/INTERNAL_DEPLOYMENT_RUNBOOK.md](docs/INTERNAL_DEPLOYMENT_RUNBOOK.md) — 三层内部部署、探活、停机、备份与回退
+- [docs/INTERNAL_DEPLOYMENT_DRILLS.md](docs/INTERNAL_DEPLOYMENT_DRILLS.md) — E3–E9 自动演练、外部证据与 Go/No-Go
+- [docs/CRUD_ACCEPTANCE.md](docs/CRUD_ACCEPTANCE.md) — AI 增删改查覆盖矩阵、付费抽查与浏览器步骤
+- [docs/LOG_AND_STORAGE_POLICY.md](docs/LOG_AND_STORAGE_POLICY.md) — 日志轮转、磁盘阈值与只读增长检查
+- [docs/RELEASE_GATE.md](docs/RELEASE_GATE.md) — 无费用发布 Gate、版本摘要与显式付费 provider 抽查
 
 ## Configuration
 
@@ -99,6 +106,10 @@ LangGraph checkpoint tables live in the same `AI_MCP_DATABASE_FILE` and use `AI_
 On SIGTERM/SIGINT the server stops accepting HTTP requests and claiming queue jobs, waits up to `AI_MCP_DRAIN_TIMEOUT_MS` (default 5000) for handlers and claimed jobs to drain, then closes the checkpoint saver, MCP and the database. A drain timeout exits non-zero.
 
 `GET /ready` is an internal readiness endpoint protected by `AI_MCP_READINESS_TOKEN`. It checks that SQLite and the LangGraph checkpoint tables can acquire real write transactions, the template library accepts traffic, MCP responds to `ping`, and model-attempt telemetry is not degraded. Model-provider configuration is reported as degraded information but does not by itself make readiness fail. `/health` remains an unauthenticated, minimal liveness response.
+
+`bun run ops:check` reuses that authenticated readiness result and adds read-only queue wait, worker-lease, recent failure-rate, and stable error-code metrics. The running server evaluates the same operational snapshot periodically and emits cooldown-aware `warning`, `critical`, and `recovered` JSON events. Configuration and the complete reason-code list are documented in `docs/OPERATIONS.md`.
+
+`bun run storage:check` is read-only and reports disk usage, database size, artifact size, schema version and audit-row counts. `bun run internal:check -- --automated-only` runs the zero-cost E3–E8 recovery, fault, concurrency, backup, storage and CRUD drills. A final `GO` additionally requires provider, browser, clean-startup and controlled rollback evidence from the exact commit.
 
 If an MCP transport closes or a request fails at the transport layer, the AI-side client retires that connection generation immediately. It retries connection establishment up to `PASCAL_MCP_RECONNECT_ATTEMPTS` with bounded backoff, then opens a short circuit controlled by `PASCAL_MCP_CIRCUIT_COOLDOWN_MS`. Mutating MCP tool calls are never replayed automatically. While MCP is not ready, the queue worker leaves unclaimed requests queued; a successful readiness probe wakes it again.
 

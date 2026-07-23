@@ -46,6 +46,7 @@ export type RequestHooks = {
   temperature?: number
   operation?: string
   promptVersion?: string
+  promptHash?: string
 }
 
 export type ModelCallResult<T> = {

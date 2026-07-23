@@ -91,6 +91,20 @@ describe('buildLayoutPlan (intent path)', () => {
     expect(result.validation.fatal).toEqual([])
   })
 
+  test('passes the registry-owned version and hash to the model boundary', async () => {
+    let audit: { promptVersion: string; promptHash: string } | undefined
+    const result = await buildLayoutPlan(
+      { briefSummary: '一居室，55㎡，含厨房卫生间', targets: { totalAreaSqm: 55 } },
+      async (_messages, _tag, prompt) => {
+        audit = prompt
+        return JSON.stringify(oneBedroomIntent)
+      },
+    )
+    expect(result.ok).toBe(true)
+    expect(audit?.promptVersion).toBe('plan:intent:v1')
+    expect(audit?.promptHash).toMatch(/^[0-9a-f]{64}$/)
+  })
+
   test('a malformed first reply triggers a correction round quoting the defect', async () => {
     const { complete, seen } = scriptedModel([
       '这里是我的规划思路……（没有 JSON）',

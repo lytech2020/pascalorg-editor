@@ -123,6 +123,37 @@ describe('attempt telemetry (T1.1)', () => {
     expect(attempt?.latencyMs).toBeGreaterThanOrEqual(0)
   })
 
+  test('uses registry-supplied prompt identity instead of deriving it from dynamic messages', async () => {
+    globalThis.fetch = (async () =>
+      Response.json({ choices: [{ message: { role: 'assistant', content: 'ok' } }] })) as unknown as typeof fetch
+    const attempts: import('./ports/model-client').ModelAttemptResult[] = []
+    await makeClient().complete(
+      [{ role: 'system', content: 'rendered prompt containing runtime guide data' }],
+      's1',
+      {
+        promptVersion: 'scene-agent:v7',
+        promptHash: 'b'.repeat(64),
+        onAttemptFinished: attempt => attempts.push(attempt),
+      },
+    )
+    expect(attempts[0]?.promptVersion).toBe('scene-agent:v7')
+    expect(attempts[0]?.promptHash).toBe('b'.repeat(64))
+  })
+
+  test('rejects an audited operation without registry prompt identity before fetch', async () => {
+    let fetches = 0
+    globalThis.fetch = (async () => {
+      fetches++
+      return Response.json({ choices: [{ message: { role: 'assistant', content: 'ok' } }] })
+    }) as unknown as typeof fetch
+    await expect(makeClient().complete(
+      [{ role: 'system', content: 'dynamic rendered prompt' }],
+      's1',
+      { operation: 'extract' },
+    )).rejects.toThrow('requires registry promptVersion and promptHash')
+    expect(fetches).toBe(0)
+  })
+
   // Absent usage must stay absent — a 0 would be indistinguishable from a
   // provider-reported zero.
   test('missing usage yields undefined, never 0', async () => {
@@ -275,6 +306,8 @@ describe('attempt telemetry (T1.1)', () => {
     const client = makeClient()
     const hooks = {
       operation: 'extract',
+      promptVersion: 'extract:v1',
+      promptHash: 'a'.repeat(64),
       onAttemptFinished: (a: import('./ports/model-client').ModelAttemptResult) => attempts.push(a),
     }
     await client.complete([{ role: 'user', content: 'hi' }], 'sess-1:extract:0', hooks)

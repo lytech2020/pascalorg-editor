@@ -7,6 +7,7 @@ import {
 } from '../persistence/model-call-repository'
 import { OpenAiCompatibleClient } from '../openai-compatible'
 import type { ModelAttemptResult } from '../ports/model-client'
+import { renderPrompt } from '../prompts/registry'
 import { SqliteModelAttemptRecorder } from './model-attempt-recorder'
 
 const originalFetch = globalThis.fetch
@@ -71,16 +72,22 @@ describe('SqliteModelAttemptRecorder', () => {
       temperature: 0.2,
       retryBaseDelayMs: 1,
     })
+    const prompt = renderPrompt('extract', {
+      briefJson: '{}',
+      message: 'user question must not be stored',
+      inputType: '纯文字需求',
+    })
     try {
       await client.complete(
         [
-          { role: 'system', content: 'system prompt must not be stored' },
-          { role: 'user', content: 'user question must not be stored' },
+          { role: 'system', content: prompt.parts.system },
+          { role: 'user', content: prompt.parts.user },
         ],
         'session-1:extract:0',
         {
           operation: 'extract',
-          promptVersion: 'extract-v1',
+          promptVersion: prompt.promptVersion,
+          promptHash: prompt.promptHash,
           onAttemptStarted: () => budgetCount++,
           onAttemptFinished: result => recorder.record(identity, result),
         },
@@ -97,10 +104,10 @@ describe('SqliteModelAttemptRecorder', () => {
       expect(rows[1]?.total_tokens).toBe(14)
       expect(rows[1]?.model).toBe('actual-model')
       expect(rows[1]?.provider_request_id).toBe('provider-request-1')
-      expect(rows[1]?.prompt_version).toBe('extract-v1')
-      expect(rows[1]?.prompt_hash).toMatch(/^[0-9a-f]{64}$/)
+      expect(rows[1]?.prompt_version).toBe(prompt.promptVersion)
+      expect(rows[1]?.prompt_hash).toBe(prompt.promptHash)
       expect(JSON.parse(rows[1]?.request_params ?? '{}')).toEqual({ temperature: 0.2 })
-      expect(JSON.stringify(rows)).not.toContain('system prompt must not be stored')
+      expect(JSON.stringify(rows)).not.toContain(prompt.parts.system)
       expect(JSON.stringify(rows)).not.toContain('user question must not be stored')
       expect(recorder.status()).toEqual({ ok: true, failureCount: 0 })
     } finally {

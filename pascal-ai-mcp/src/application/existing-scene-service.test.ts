@@ -11,6 +11,21 @@ describe('existing scene application service', () => {
     expect(result.session.pendingOperation).toBe('delete')
   })
 
+  test('a new modification clears stale mode consent from the previous request', () => {
+    const session = baseSession()
+    session.pendingModificationMode = 'plan_rebuild'
+    session.pendingModificationReasonCode = 'remove_room'
+    session.pendingModificationPlanHash = 'hash-a'
+    session.modifyModeConfirmed = true
+    session.modifyDriftConfirmed = true
+    const result = planExistingSceneRequest(session, 'rename the bedroom', 'update')
+    expect(result.session.pendingModificationMode).toBeUndefined()
+    expect(result.session.pendingModificationReasonCode).toBeUndefined()
+    expect(result.session.pendingModificationPlanHash).toBeUndefined()
+    expect(result.session.modifyModeConfirmed).toBeUndefined()
+    expect(result.session.modifyDriftConfirmed).toBeUndefined()
+  })
+
   test('inspection owns state transitions without importing a scene adapter', async () => {
     const session = baseSession()
     let loaded = ''

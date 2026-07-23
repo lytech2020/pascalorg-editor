@@ -35,6 +35,10 @@ import { SceneSpaceRepository } from './persistence/scene-space-repository'
 import { WORKFLOW_GRAPH_VERSION } from './workflow-identity'
 import { createLangGraphWorkflowRuntimeFactory } from './adapters/workflow/langgraph-workflow-runtime'
 import { createOpenAiModelClients } from './adapters/model/openai-model-clients'
+import { ReadinessService } from './application/readiness-service'
+import { OpsAlertTracker, OpsService } from './application/ops-service'
+import { loadOpsConfig } from './ops-config'
+import { OpsMetricsRepository } from './persistence/ops-metrics-repository'
 
 const config = loadConfig()
 const database = new AppDatabase(config.databaseFile)
@@ -108,6 +112,24 @@ const worker = new RequestWorker(requests, sessions, requestPayloads, agent, {
 mcp.onStatusChange(status => {
   if (status.ready) worker.notify()
 })
+const readiness = new ReadinessService({
+  databaseWritable: () => database.isWritable(),
+  checkpointWritable: () => checkpointSaver.isWritable(),
+  checkMcpReady: () => mcp.checkReady(),
+  mcpStatus: () => mcp.status(),
+  telemetryStatus: () => modelAttempts.status(),
+  templates: { ...templateHealthSummary, acceptsTraffic: templatesAcceptTraffic },
+  graphVersion: WORKFLOW_GRAPH_VERSION,
+  modelConfigured: Boolean(config.aiApiKey),
+  onMcpReady: () => worker.notify(),
+})
+const opsConfig = loadOpsConfig()
+const opsMetrics = new OpsMetricsRepository(database.connection)
+const opsService = new OpsService({
+  readiness: async () => ({ reachable: true, report: await readiness.check() }),
+  metrics: (now, failureWindowMs) => opsMetrics.snapshot(now, failureWindowMs),
+}, opsConfig)
+const opsAlerts = new OpsAlertTracker(opsConfig.alertCooldownMs)
 if (templatesAcceptTraffic) worker.start()
 else await worker.recoverExpired()
 // Keep Bun's transport safety cap above the application limit so ordinary
@@ -171,27 +193,8 @@ async function handle(request: Request): Promise<Response> {
         401,
       )
     }
-    const mcpReady = await mcp.checkReady()
-    if (mcpReady) worker.notify()
-    const databaseReady = database.isWritable()
-    const checkpointReady = checkpointSaver.isWritable()
-    const telemetry = modelAttempts.status()
-    const ready = databaseReady && checkpointReady && templatesAcceptTraffic && mcpReady && telemetry.ok
-    return json({
-      ready,
-      checks: {
-        database: { ready: databaseReady },
-        checkpoints: { ready: checkpointReady, graphVersion: WORKFLOW_GRAPH_VERSION },
-        templates: { ...templateHealthSummary, acceptsTraffic: templatesAcceptTraffic },
-        mcp: mcp.status(),
-        telemetry: { ready: telemetry.ok, failureCount: telemetry.failureCount },
-        modelProvider: {
-          ready: true,
-          configured: Boolean(config.aiApiKey),
-          degraded: !config.aiApiKey,
-        },
-      },
-    }, ready ? 200 : 503)
+    const report = await readiness.check()
+    return json(report, report.ready ? 200 : 503)
   }
 
   if (request.method === 'GET' && url.pathname === '/tools') {
@@ -496,13 +499,17 @@ console.log(`pascal-ai-mcp listening on http://${server.hostname}:${server.port}
 console.log(
   `config: provider=${config.aiProvider} model=${config.aiModel} mcpMode=${config.mcpMode} configured=${Boolean(config.aiApiKey)} maxBodyMB=${Math.round(config.maxRequestBodyBytes / 1024 / 1024)} transportMaxBodyMB=${Math.round(transportMaxRequestBodyBytes / 1024 / 1024)} workerConcurrency=${config.requestWorkerConcurrency} queueDepth=${config.requestQueueDepth}`,
 )
+let shuttingDown = false
+let opsMonitorPromise: Promise<void> | undefined
+const opsMonitorTimer = setInterval(runOpsMonitor, opsConfig.checkIntervalMs)
+opsMonitorTimer.unref()
+runOpsMonitor()
 
 // Graceful shutdown (ARCHITECTURE_TASKS.md T0.4/T1.5/T2.1): stop accepting
 // work and drain claimed queue jobs before closing MCP and SQLite. A drain
 // timeout exits non-zero so supervisors don't mistake dropped state for a
 // clean stop. SIGKILL bypasses this path; the expired lease is then marked
 // process_interrupted by the next worker and is deliberately not replayed.
-let shuttingDown = false
 async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) {
     // Second signal: the operator wants out now.
@@ -510,6 +517,7 @@ async function shutdown(signal: string): Promise<void> {
     process.exit(1)
   }
   shuttingDown = true
+  clearInterval(opsMonitorTimer)
   worker.stopAccepting()
   console.log(`received ${signal}, shutting down`)
   let exitCode = 0
@@ -529,6 +537,14 @@ async function shutdown(signal: string): Promise<void> {
   } catch (error) {
     console.error('shutdown: gave up waiting for request worker:', errorMessage(error))
     process.exit(1)
+  }
+  if (opsMonitorPromise) {
+    try {
+      await withTimeout(opsMonitorPromise, config.shutdownDrainTimeoutMs, 'ops monitor')
+    } catch (error) {
+      console.error('shutdown: gave up waiting for ops monitor:', errorMessage(error))
+      exitCode = 1
+    }
   }
   try {
     checkpointSaver.close()
@@ -623,4 +639,36 @@ function isValidIdempotencyKey(value: unknown): value is string {
 function readinessAuthorized(request: Request): boolean {
   if (!config.readinessToken) return false
   return request.headers.get('authorization') === `Bearer ${config.readinessToken}`
+}
+
+function runOpsMonitor(): void {
+  if (opsMonitorPromise || shuttingDown) return
+  opsMonitorPromise = opsService.check()
+    .then(emitOpsEvents)
+    .catch(() => {
+      const checkedAt = new Date().toISOString()
+      emitOpsEvents({
+        checkedAt,
+        healthy: false,
+        exitCode: 2,
+        readiness: { reachable: false, errorCode: 'ops_monitor_failed' },
+        findings: [{
+          severity: 'critical',
+          reasonCode: 'ops_monitor_failed',
+          details: {},
+        }],
+      })
+    })
+    .finally(() => {
+      opsMonitorPromise = undefined
+    })
+}
+
+function emitOpsEvents(report: Awaited<ReturnType<OpsService['check']>>): void {
+  for (const event of opsAlerts.update(report)) {
+    const line = JSON.stringify(event)
+    if (event.level === 'critical') console.error(line)
+    else if (event.level === 'warning') console.warn(line)
+    else console.log(line)
+  }
 }

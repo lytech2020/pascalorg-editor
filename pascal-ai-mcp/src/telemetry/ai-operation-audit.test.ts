@@ -3,6 +3,10 @@ import { AiAuditRepository, type AiAuditWriter } from '../persistence/audit-repo
 import { AppDatabase } from '../persistence/database'
 import { ChatRequestRepository } from '../persistence/session-repository'
 import { WorkflowStepRepository } from '../persistence/workflow-step-repository'
+import {
+  createValidationRegistry,
+  recordDirectValidationResults,
+} from '../application/validation-service'
 import { AiOperationAuditor, summarizeToolArgs } from './ai-operation-audit'
 
 function auditFixture() {
@@ -194,6 +198,48 @@ describe('AI operation audit', () => {
     expect(JSON.stringify(summary)).not.toContain('base64,secret')
     expect(JSON.stringify(summary)).not.toContain('Bearer secret')
     expect(JSON.stringify(summary)).not.toContain('user said do not retain')
+  })
+
+  test('preserves the legacy validator sequence and count when registry results are persisted', async () => {
+    const fixture = auditFixture()
+    const registry = createValidationRegistry()
+    try {
+      const stages = [
+        await registry.runStage('plan', { layoutPlanFailure: { failureCount: 2 } }),
+        await registry.runStage('verification', {
+          completion: { zones: [], walls: [], items: [], targets: {} },
+        }),
+        await registry.runStage('verification', {
+          sceneDiagnostics: {
+            validation: { valid: true, errors: [] },
+            verificationIssues: [],
+            collisions: [],
+            doorlessRooms: [],
+            strayWindows: [],
+            requirementMismatches: [],
+            isolatedBedrooms: [],
+            furniturePlacementIssues: [],
+          },
+        }),
+      ]
+      for (const results of stages) {
+        recordDirectValidationResults(results, result => fixture.auditor.recordValidation(
+          fixture.identity,
+          result.validatorId,
+          result.status,
+          result.issueCount,
+          result.summary,
+        ))
+      }
+
+      expect(fixture.repository.findValidationsByRequest('request-1').map(row => row.validator)).toEqual([
+        'layout-plan',
+        'completion-gates',
+        'scene-diagnostics',
+      ])
+    } finally {
+      fixture.database.close()
+    }
   })
 
   test('fails closed before a tool call when the start record cannot be persisted', async () => {

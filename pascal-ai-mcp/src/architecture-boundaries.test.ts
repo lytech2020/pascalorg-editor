@@ -23,6 +23,13 @@ describe('application/domain dependency boundaries', () => {
       'persistence', 'adapters', 'server', 'mcp', 'openai-compatible', '@langchain', 'bun:sqlite', './config',
     ])
   })
+
+  test('prompt definitions do not depend on model, persistence or workflow adapters', () => {
+    assertNoForbiddenDependencies('prompts', [
+      'application', 'ports', 'persistence', 'adapters', 'server', 'mcp',
+      'openai-compatible', '@langchain', 'bun:sqlite', './config',
+    ])
+  })
 })
 
 function assertNoForbiddenDependencies(directory: string, forbidden: string[]): void {

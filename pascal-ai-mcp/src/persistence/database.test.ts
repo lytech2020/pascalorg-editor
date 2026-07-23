@@ -25,6 +25,8 @@ describe('AppDatabase migrations', () => {
         { version: 10, name: 'add_scope_guardrail_audit' },
         { version: 11, name: 'add_ai_scene_space_semantics' },
         { version: 12, name: 'add_template_match_audit' },
+        { version: 13, name: 'add_modification_mode_to_workflow_steps' },
+        { version: 14, name: 'track_request_execution_source' },
       ])
       expect(
         first.connection.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ai_model_calls'").get(),
@@ -34,7 +36,7 @@ describe('AppDatabase migrations', () => {
       const reopened = new AppDatabase(file)
       expect(
         reopened.connection.query('SELECT COUNT(*) AS count FROM schema_migrations').get(),
-      ).toEqual({ count: 12 })
+      ).toEqual({ count: 14 })
       reopened.close()
     } finally {
       rmSync(dir, { recursive: true, force: true })

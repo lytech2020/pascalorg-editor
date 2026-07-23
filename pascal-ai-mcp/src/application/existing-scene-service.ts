@@ -32,6 +32,10 @@ export function planExistingSceneRequest(
 
   session.pendingModification = message
   session.pendingOperation = intent
+  delete session.pendingModificationMode
+  delete session.pendingModificationReasonCode
+  delete session.pendingModificationPlanHash
+  delete session.modifyModeConfirmed
   delete session.modifyDriftConfirmed
   if (intent === 'delete') {
     session.phase = 'awaiting_modification_confirmation'

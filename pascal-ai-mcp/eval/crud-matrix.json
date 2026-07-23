@@ -1,0 +1,133 @@
+{
+  "schemaVersion": 1,
+  "operations": [
+    {
+      "id": "create-layout",
+      "verb": "create",
+      "target": "room",
+      "disposition": "supported",
+      "deterministicEvidence": ["plan-builder", "scene-executor"],
+      "providerCases": ["case-03-two-bed-standard"]
+    },
+    {
+      "id": "add-room",
+      "verb": "create",
+      "target": "room",
+      "disposition": "supported",
+      "deterministicEvidence": ["modify-ops:add_room", "layout-partitioner:case-13"],
+      "providerCases": ["case-13-modify-add-room"]
+    },
+    {
+      "id": "remove-room",
+      "verb": "delete",
+      "target": "room",
+      "disposition": "supported",
+      "deterministicEvidence": ["modify-ops:remove_room", "local-patch-scope"],
+      "providerCases": ["case-19-modify-remove-room", "case-20-modify-remove-room-local"]
+    },
+    {
+      "id": "rename-room",
+      "verb": "update",
+      "target": "room",
+      "disposition": "supported",
+      "deterministicEvidence": ["modification-mode:rename_only", "local-patch-scope"],
+      "providerCases": ["case-24-modify-rename"]
+    },
+    {
+      "id": "resize-room",
+      "verb": "update",
+      "target": "room",
+      "disposition": "supported",
+      "deterministicEvidence": ["modify-ops:resize_room", "layout-partitioner:case-14"],
+      "providerCases": ["case-14-modify-resize"]
+    },
+    {
+      "id": "query-scene",
+      "verb": "read",
+      "target": "scene",
+      "disposition": "supported",
+      "deterministicEvidence": ["inspect-prompt", "read-only-tool-policy"],
+      "providerCases": []
+    },
+    {
+      "id": "create-openings-with-layout",
+      "verb": "create",
+      "target": "opening",
+      "disposition": "supported",
+      "deterministicEvidence": ["scene-executor:openings", "completion-gates:connectivity"],
+      "providerCases": ["case-03-two-bed-standard"]
+    },
+    {
+      "id": "direct-opening-edit",
+      "verb": "update",
+      "target": "opening",
+      "disposition": "safe_rejection",
+      "deterministicEvidence": ["modification-mode:unsupported_or_unknown"],
+      "providerCases": []
+    },
+    {
+      "id": "direct-opening-delete",
+      "verb": "delete",
+      "target": "opening",
+      "disposition": "safe_rejection",
+      "deterministicEvidence": ["modification-mode:unsupported_or_unknown"],
+      "providerCases": []
+    },
+    {
+      "id": "add-furniture",
+      "verb": "create",
+      "target": "furniture",
+      "disposition": "supported",
+      "deterministicEvidence": ["furniture-modify:add_furniture", "local-patch-scope"],
+      "providerCases": ["case-16-modify-add-furniture"]
+    },
+    {
+      "id": "remove-furniture",
+      "verb": "delete",
+      "target": "furniture",
+      "disposition": "supported",
+      "deterministicEvidence": ["furniture-modify:remove_furniture", "local-patch-scope"],
+      "providerCases": ["case-17-modify-remove-furniture"]
+    },
+    {
+      "id": "replace-furniture",
+      "verb": "update",
+      "target": "furniture",
+      "disposition": "supported",
+      "deterministicEvidence": ["furniture-modify:swap_furniture", "local-patch-scope"],
+      "providerCases": ["case-18-modify-swap-furniture"]
+    },
+    {
+      "id": "move-furniture-with-position",
+      "verb": "update",
+      "target": "furniture",
+      "disposition": "safe_rejection",
+      "deterministicEvidence": ["modification-mode:unsupported_or_unknown"],
+      "providerCases": []
+    },
+    {
+      "id": "chained-modification",
+      "verb": "mixed",
+      "target": "scene",
+      "disposition": "supported",
+      "deterministicEvidence": ["modify-ops:order-independent", "workflow:session-snapshot"],
+      "providerCases": ["case-23-modify-chained"]
+    },
+    {
+      "id": "ambiguous-or-missing-target",
+      "verb": "mixed",
+      "target": "scene",
+      "disposition": "safe_rejection",
+      "deterministicEvidence": ["modify-ops:invalid", "modification-mode:unsupported_or_unknown"],
+      "providerCases": []
+    },
+    {
+      "id": "interrupted-scene-write",
+      "verb": "mixed",
+      "target": "scene",
+      "disposition": "failed_recoverable",
+      "deterministicEvidence": ["durable-agent:safe-plan-boundary", "request-worker:process_interrupted"],
+      "providerCases": []
+    }
+  ]
+}

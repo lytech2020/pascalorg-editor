@@ -1,4 +1,5 @@
-import { evaluateCompletionGates, type GateFailure, type GateReport, type GateWall } from './completion-gates'
+import { createHash } from 'node:crypto'
+import type { GateFailure, GateReport, GateWall } from './completion-gates'
 import type { AppConfig } from './config'
 import { detectLanguage, issueText, t, type Lang } from './lang/i18n'
 import { classifySceneIntentFallback, isSceneQuestion, type SceneIntent } from './lang/intent-vocab'
@@ -25,10 +26,22 @@ import { computeLayoutQuality } from './layout-metrics'
 import { kitchenIsCirculation } from './layout-plan'
 import type { IssueL10n, LayoutIntent, LayoutPlan, RoomType } from './layout-plan'
 import { buildLayoutPlan, type PlanBuildResult } from './plan-builder'
-import { validateLayoutPlan, type PlanTargets } from './plan-validator'
+import type { PlanTargets, PlanValidation } from './plan-validator'
 import { executeLayoutPlan, toolPayload, type McpCaller, type SceneExecutionReport } from './scene-executor'
 import { classifyScopeRequest, SCOPE_POLICY_VERSION } from './domain/guardrail/scope-policy'
 import { directTemplateEligibility } from './domain/policy/direct-template-policy'
+import type { ValidationStage } from './domain/validation-registry'
+import {
+  classifyModificationMode,
+  confirmedModificationMatches,
+  needsModificationConfirmation,
+  type ModificationModeDecision,
+} from './domain/modification-mode'
+import {
+  validateLocalPatchScope,
+  type LocalPatchAllowance,
+  type LocalPatchScopeFinding,
+} from './domain/local-patch-scope'
 import {
   findDoorlessRooms,
   findIsolatedBedrooms,
@@ -72,6 +85,20 @@ import {
   publicEditorUrl,
   runGenerateWorkflow,
 } from './application/generate-service'
+import {
+  createValidationRegistry,
+  readMcpValidationSources,
+  recordDirectValidationResults,
+  VALIDATOR_IDS,
+  validationUnavailableReason,
+  validationValue,
+  type ValidationContext,
+} from './application/validation-service'
+import {
+  renderPrompt,
+  type PromptAuditMetadata,
+  type RenderedPrompt,
+} from './prompts/registry'
 
 // Re-exported for eval/run-eval.ts, which historically imported it from here.
 export { toolPayload }
@@ -147,28 +174,6 @@ const CONFIRMATION_VALUES = new Set<ConfirmationStatus>([
 // scratch (see `countActiveContentNodes` / `shouldModifyExistingScene`).
 const SCAFFOLDING_NODE_TYPES = new Set(['project', 'site', 'building', 'level', 'story', 'storey'])
 
-// M1/M2 (docs/MODIFY_REDESIGN.md §3): translates a modify request into
-// ModifyOps — the model's ONLY job on the plan-first modify path; every op
-// is executed deterministically. Requests outside the op vocabulary (move a
-// wall, reposition a door…) must come back as empty ops so they fall through
-// to the legacy path.
-const MODIFY_OPS_SYSTEM_PROMPT = `你是场景修改请求解析器。把用户请求翻译成结构化操作列表，只返回一个 JSON 对象，不要任何解释或 Markdown 代码块。
-返回 {"ops":[...]}，每个 op 只能是以下七种：
-  {"op":"add_room","room":{"name":"<房间名>","type":"<bedroom|living|living_kitchen|dining|kitchen|bathroom|study|storage|balcony|other>","targetAreaSqm":<可选，数字>},"near":"<可选，希望邻接的房间名>"}
-  {"op":"remove_room","room":"<房间名>"}
-  {"op":"resize_room","room":"<房间名>","targetAreaSqm":<数字>}
-  {"op":"rename_room","room":"<房间名>","name":"<新名称>"}
-  {"op":"add_furniture","room":"<房间名>","item":"<家具名>"}
-  {"op":"remove_furniture","room":"<房间名>","item":"<家具名>"}
-  {"op":"swap_furniture","room":"<房间名>","from":"<现有家具>","to":"<新家具>"}
-规则：
-- room/near 引用现有房间时必须使用房间清单里的名称原文；
-- 用户的称呼与清单不同字面但指向明确时，翻译成清单名再输出：如清单是「卧室1/卧室2」这类编号名，主卧=卧室1、次卧=卧室2、依此类推（master/主人房→主卧，kids room/儿童房→次卧类推）；不要因称呼不同就返回空 ops；
-- item/from/to 用简短通用词（如 沙发、书桌、床、衣柜），不要带修饰语；
-- 一次请求可以输出多个 op，按用户叙述顺序排列；
-- 只描述用户明确要求的改动，不要自作主张补充；
-- 若请求超出以上七种操作能表达的范围（如移动某面墙、调整门窗位置、整体换风格），或你无法确定，返回 {"ops":[]}。`
-
 // Thrown at a loop boundary inside a long-running generation/modification
 // when the user has asked to cancel, so the in-flight work unwinds promptly
 // instead of finishing a run the user no longer wants.
@@ -200,6 +205,13 @@ class DestructiveSceneWriteError extends Error {
     super(`Destructive rebuild of scene ${sceneId} failed after writes began: ${errorMessage(cause)}`)
     this.name = 'DestructiveSceneWriteError'
     this.cause = cause
+  }
+}
+
+class LocalPatchScopeViolationError extends Error {
+  constructor(readonly findings: LocalPatchScopeFinding[]) {
+    super(`local patch changed nodes outside its allowed scope (${findings.length})`)
+    this.name = 'LocalPatchScopeViolationError'
   }
 }
 
@@ -279,6 +291,7 @@ export class PascalAiAgent {
   private readonly workflow: WorkflowRuntime
   private readonly toolAuditor: AiOperationAuditor
   private readonly spaceService: SceneSpaceService
+  private readonly validationRegistry = createValidationRegistry()
   private readonly sessionLocks = new Map<string, Promise<ChatResult>>()
   private readonly sessionVersions = new Map<string, number>()
   // Sessions with a cancel requested while a run is in flight. The running
@@ -485,6 +498,10 @@ export class PascalAiAgent {
     if (recovery.template === 'staleDestructive') {
       delete updated.pendingModification
       delete updated.pendingOperation
+      delete updated.pendingModificationMode
+      delete updated.pendingModificationReasonCode
+      delete updated.pendingModificationPlanHash
+      delete updated.modifyModeConfirmed
       delete updated.destructiveSceneWriteStarted
     }
     const reply = t(updated.language, recovery.template, {})
@@ -578,6 +595,47 @@ export class PascalAiAgent {
         else this.activeWorkflowSteps.delete(session.sessionId)
       }
     }
+  }
+
+  private recordModificationDecision(
+    sessionId: string,
+    decision: ModificationModeDecision,
+  ): void {
+    const step = this.activeWorkflowSteps.get(sessionId)
+    if (!step || !this.workflowSteps?.recordModificationDecision) return
+    if (!this.workflowSteps.recordModificationDecision(step.stepId, decision)) {
+      throw new Error(`workflow step ${step.stepId} cannot record modification mode`)
+    }
+  }
+
+  private async verifyLocalPatchScope(
+    session: WorkflowSession,
+    before: SceneNodeSnapshot,
+    allowances: LocalPatchAllowance[],
+  ): Promise<void> {
+    let after: SceneNodeSnapshot
+    try {
+      after = snapshotSceneNodes(
+        toolPayload(await this.callMcp(session.sessionId, 'get_scene', {})),
+      )
+    } catch (error) {
+      await this.runValidationStage(session, 'modify', {
+        unavailable: {
+          validatorId: VALIDATOR_IDS.localPatchScope,
+          reason: validationUnavailableReason(error),
+        },
+      })
+      throw error
+    }
+    const findings = validateLocalPatchScope(before, after, allowances)
+    const results = await this.runValidationStage(session, 'modify', {
+      localPatchScope: { findings },
+    })
+    const recorded = validationValue<LocalPatchScopeFinding[]>(
+      results,
+      VALIDATOR_IDS.localPatchScope,
+    )
+    if (recorded.length > 0) throw new LocalPatchScopeViolationError(recorded)
   }
 
   private async runChat(input: ChatInput): Promise<ChatResult> {
@@ -915,6 +973,25 @@ export class PascalAiAgent {
     )
   }
 
+  private async runValidationStage(
+    session: WorkflowSession,
+    stage: ValidationStage,
+    context: ValidationContext,
+    recordDirect = true,
+  ) {
+    const results = await this.validationRegistry.runStage(stage, context)
+    if (recordDirect) {
+      recordDirectValidationResults(results, result => this.recordValidation(
+        session,
+        result.validatorId,
+        result.status,
+        result.issueCount,
+        result.summary,
+      ))
+    }
+    return results
+  }
+
   // Counts one model API attempt against both the per-turn and the cumulative
   // per-session budgets, throwing once either ceiling is crossed. A no-op when
   // no budget is registered (e.g. calls made outside a `runChat`), so it can
@@ -1050,22 +1127,18 @@ export class PascalAiAgent {
       // Exclude the last entry: it's `message` itself, already pushed to
       // session.messages by the caller before this runs.
       const history = recentConversationText(session.messages.slice(0, -1))
+      const prompt = renderPrompt('scene-intent', {
+        history,
+        latest: message,
+      })
       const result = await this.withFastModel(session.sessionId, (model, hooks) =>
         model.json<{ intent?: unknown }>(
           [
-            {
-              role: 'system',
-              content: 'Classify a request about an existing architectural scene. Use the recent conversation to resolve references like pronouns, "that one", or "same as before". Return JSON only: {"intent":"query|create|update|delete|ambiguous|off_topic"}. Query must be read-only. Use off_topic only when the message is clearly unrelated to both this scene and architectural/interior design (e.g. weather, small talk, general knowledge). Use ambiguous when the message plausibly concerns the scene but the requested action or target is unclear even with context.',
-            },
-            {
-              role: 'user',
-              content: history
-                ? `Recent conversation:\n${history}\n\nLatest message to classify: ${message}`
-                : message,
-            },
+            { role: 'system', content: prompt.parts.system },
+            { role: 'user', content: prompt.parts.user },
           ],
           'scene-intent',
-          { ...hooks, operation: 'scene-intent', promptVersion: 'scene-intent:v1' },
+          { ...hooks, operation: 'scene-intent', ...promptAudit(prompt) },
         ),
       )
       if (isSceneIntent(result.output.intent)) return result.output.intent
@@ -1197,7 +1270,7 @@ export class PascalAiAgent {
     const { diagnostics, repairRounds, toolNamesUsed, furnitureIssues } = await this.refineAndDiagnose(
       session,
       '在当前已有户型的基础上实现已确认需求。现有墙体、房间和开口是源数据；只做满足需求所必需的增量修改，禁止用模板替换整个场景，禁止删除无关结构。',
-      { phaseLabel: '在已有户型上应用已确认需求' },
+      { phaseLabel: '在已有户型上应用已确认需求', validationStage: 'modify' },
     )
     const sceneVersion = await this.persistScene(
       session.sessionId,
@@ -1205,7 +1278,7 @@ export class PascalAiAgent {
       diagnostics.validation.valid,
       nullableNumber(loaded.version),
     )
-    const gates = await this.evaluateGates(session)
+    const gates = await this.evaluateGates(session, 'modify')
     const { reply } = finishSceneWorkflow({
       session,
       sceneId,
@@ -1251,7 +1324,14 @@ export class PascalAiAgent {
       ),
       dedupeSharedWalls: (sessionId, levelId, protectedWallIds) =>
         this.dedupeSharedWalls(sessionId, levelId, protectedWallIds),
-      checkProtection: checkModificationProtection,
+      checkProtection: async (session, before, after, feedback) => {
+        const results = await this.runValidationStage(session, 'modify', {
+          modificationProtection: {
+            evaluate: () => checkModificationProtection(before, after, feedback),
+          },
+        })
+        return validationValue<string[]>(results, VALIDATOR_IDS.modificationProtection)
+      },
       refine: async (session, purpose, phase, extraChecks) => this.refineAndDiagnose(
         session,
         purpose,
@@ -1261,11 +1341,12 @@ export class PascalAiAgent {
           toolNamesUsed: phase.toolNamesUsed,
           furnitureIssues: phase.furnitureIssues,
           ...(extraChecks ? { extraChecks } : {}),
+          validationStage: 'modify',
         },
       ),
       persistScene: (sessionId, sceneId, valid, expectedVersion) =>
         this.persistScene(sessionId, sceneId, valid, expectedVersion),
-      evaluateGates: session => this.evaluateGates(session),
+      evaluateGates: session => this.evaluateGates(session, 'modify'),
       clearDestructiveWrite: sessionId => this.destructiveWrites.delete(sessionId),
       isCancellationError: error => error instanceof GenerationCancelledError,
       errorMessage,
@@ -1277,13 +1358,18 @@ export class PascalAiAgent {
     feedback: string,
     sceneId: string,
     loadedVersion: number | null,
-  ): Promise<Partial<WorkflowGraphState> | null> {
+  ): Promise<Partial<WorkflowGraphState>> {
     // Live room list from zones; types come from the authoritative map when
     // the scene was built plan-first, name classification otherwise — so the
     // furniture path also works for legacy scenes without an intent snapshot.
     const zonesPayload = toolPayload(await this.callMcp(session.sessionId, 'get_zones', {}))
     const zones = Array.isArray(zonesPayload.zones) ? zonesPayload.zones.filter(isZoneSummary) : []
-    if (zones.length === 0) return null
+    if (zones.length === 0) {
+      return this.finishSafeModificationRejection(
+        session,
+        t(session.language, 'modifyLocalUnavailable', {}),
+      )
+    }
     const zoneTypes = this.resolveZoneTypes(session, zones)
     const rooms: FurnitureRoom[] = zones.map(zone => ({
       id: zone.id,
@@ -1306,23 +1392,26 @@ export class PascalAiAgent {
     // (MODIFY_REDESIGN.md §2: 解析失败 → 修正 prompt 重试 ≤2 轮) — falling to
     // legacy on a transient formatting slip would silently downgrade a clean
     // furniture request to the free-edit path.
-    const userContent = `当前房间清单：${rooms.map(room => room.name).join('、')}\n用户请求：${feedback}`
+    const roomList = rooms.map(room => room.name).join('、')
     let parsed: ReturnType<typeof parseModifyOps> | null = null
     for (let attempt = 0; attempt < 2; attempt++) {
+      const prompt = renderPrompt('modify-ops', {
+        roomList,
+        request: feedback,
+        errors: parsed?.errors.join('；') ?? '',
+      })
       trace.modelCalls++
       const raw = await this.withModelFallback(session.sessionId, (model, hooks) =>
         model.complete([
-          { role: 'system', content: MODIFY_OPS_SYSTEM_PROMPT },
+          { role: 'system', content: prompt.parts.system },
           {
             role: 'user',
-            content: attempt === 0 || !parsed
-              ? userContent
-              : `${userContent}\n上一次输出解析失败：${parsed.errors.join('；')}。请严格按 schema 修正后重新只输出 JSON。`,
+            content: attempt === 0 || !parsed ? prompt.parts.user : prompt.parts.retryUser,
           },
         ], `${session.sessionId}:modify:ops`, {
           ...hooks,
           operation: 'modify-ops',
-          promptVersion: 'modify-ops:v1',
+          ...promptAudit(prompt),
           temperature: this.config.aiTemperatureGeometry,
         }).then(result => result.output),
       )
@@ -1331,15 +1420,40 @@ export class PascalAiAgent {
       // errors is the translator deliberately saying "out of scope".
       if (parsed.errors.length === 0) break
     }
-    // Empty ops is the translator's "out of vocabulary / not sure" signal;
-    // persistent parse defects mean this isn't a clean request — both defer
-    // to the legacy path.
-    if (!parsed?.plan || parsed.errors.length > 0) return null
+    // Empty ops is the translator's "out of vocabulary / not sure" signal.
+    // Do not silently downgrade it to the unconstrained legacy editor.
+    if (!parsed?.plan || parsed.errors.length > 0) {
+      const decision = classifyModificationMode([])
+      this.recordModificationDecision(session.sessionId, decision)
+      return this.finishSafeModificationRejection(
+        session,
+        t(session.language, 'modifyUnsupportedSafe', {}),
+      )
+    }
+    const modificationDecision = classifyModificationMode(parsed.plan.ops)
+    this.recordModificationDecision(session.sessionId, modificationDecision)
+    const modificationPlanHash = createHash('sha256')
+      .update(JSON.stringify(parsed.plan.ops))
+      .digest('hex')
+    const confirmedCurrentPlan = confirmedModificationMatches(
+      modificationDecision,
+      modificationPlanHash,
+      {
+        mode: session.pendingModificationMode,
+        reasonCode: session.pendingModificationReasonCode,
+        planHash: session.pendingModificationPlanHash,
+        confirmed: session.modifyModeConfirmed,
+      },
+    )
+    session.pendingModificationMode = modificationDecision.mode
+    session.pendingModificationReasonCode = modificationDecision.reasonCode
+    session.pendingModificationPlanHash = modificationPlanHash
+    if (!confirmedCurrentPlan) delete session.modifyModeConfirmed
 
     // §6 三修 gates 归责基线：修改前场景已有的 gate 失败（用户此前手动
     // 删过的设备等）是继承状态，不是本次修改的账——收尾时只对新增失败
     // 判 phase（见 effectiveGateFailures）。纯本地 MCP 读取，零模型调用。
-    const baselineGateFailures = (await this.evaluateGates(session)).report.failures
+    const baselineGateFailures = (await this.evaluateGates(session, 'modify')).report.failures
     const removalsOf = (report: FurnitureModifyReport | null): IntentRemoval[] =>
       report?.results.flatMap(result => (result.removed ? [result.removed] : [])) ?? []
 
@@ -1347,7 +1461,15 @@ export class PascalAiAgent {
       op.op === 'add_furniture' || op.op === 'remove_furniture' || op.op === 'swap_furniture')
     if (furnitureOnly) {
       const levelId = await this.findLevelId(session)
-      if (!levelId) return null
+      if (!levelId) {
+        return this.finishSafeModificationRejection(
+          session,
+          t(session.language, 'modifyLocalUnavailable', {}),
+        )
+      }
+      const beforeSnapshot = snapshotSceneNodes(
+        toolPayload(await this.callMcp(session.sessionId, 'get_scene', {})),
+      )
       const report = await executeFurnitureModifyOps({
         ops: parsed.plan.ops as FurnitureModifyOp[],
         rooms,
@@ -1355,6 +1477,11 @@ export class PascalAiAgent {
         callMcp: traceMcp,
         beforeCall,
       })
+      await this.verifyLocalPatchScope(
+        session,
+        beforeSnapshot,
+        localPatchAllowances([], report, rooms, parsed.plan.ops as FurnitureModifyOp[], levelId),
+      )
       trace.converged = true
       return this.finishPlanFirstModify(session, sceneId, loadedVersion, trace, {
         okDetails: report.results.filter(r => r.ok).map(r => r.detail),
@@ -1365,18 +1492,25 @@ export class PascalAiAgent {
     }
 
     // --- structural / rename path (M2) — needs the plan-first snapshots ---
-    if (!session.layoutIntent || !session.layoutPlan) return null
-    // §6 manual-edit policy (方案 A): a structural rebuild would overwrite
-    // hand edits, so a detected drift warns once and proceeds only after the
-    // user confirms the SAME pending request. Furniture ops never get here.
-    if (sceneDriftedFromPlan(zones, session.layoutPlan)) {
-      if (!session.modifyDriftConfirmed) {
-        session.modifyDriftConfirmed = true
-        session.phase = 'awaiting_modification_confirmation'
-        const reply = t(session.language, 'modifyDriftWarning', {})
-        session.messages.push({ role: 'assistant', content: reply })
-        return { session, reply, next: 'finish' }
-      }
+    if (!session.layoutIntent || !session.layoutPlan) {
+      return this.finishSafeModificationRejection(
+        session,
+        t(
+          session.language,
+          modificationDecision.mode === 'plan_rebuild'
+            ? 'modifyRebuildUnavailable'
+            : 'modifyUnsupportedSafe',
+          {},
+        ),
+      )
+    }
+    if (needsModificationConfirmation(modificationDecision, confirmedCurrentPlan)) {
+      const manualDrift = sceneDriftedFromPlan(zones, session.layoutPlan)
+      if (manualDrift) session.modifyDriftConfirmed = true
+      session.phase = 'awaiting_modification_confirmation'
+      const reply = t(session.language, 'modifyRebuildConfirm', { manualDrift })
+      session.messages.push({ role: 'assistant', content: reply })
+      return { session, reply, next: 'finish' }
     }
     delete session.modifyDriftConfirmed
     const profile = resolveNormProfile(this.config.normProfile)
@@ -1405,12 +1539,33 @@ export class PascalAiAgent {
           const localAdjacency = session.layoutIntent.adjacency
             ?.filter(pair => pair.a !== resolved.room.id && pair.b !== resolved.room.id)
           if (localAdjacency && localAdjacency.length > 0) localIntent.adjacency = localAdjacency
-          const localValidation = validateLayoutPlan(
-            absorbed.plan,
-            gateTargetsForSession({ brief: session.brief, layoutIntent: localIntent, programEditedByModify: true }),
-            profile,
+          const localValidationResults = await this.runValidationStage(session, 'modify', {
+            layoutPlan: {
+              plan: absorbed.plan,
+              targets: gateTargetsForSession({
+                brief: session.brief,
+                layoutIntent: localIntent,
+                programEditedByModify: true,
+              }),
+              profile,
+            },
+          }, false)
+          const localValidation = validationValue<PlanValidation>(
+            localValidationResults,
+            VALIDATOR_IDS.layoutPlan,
           )
           if (localValidation.fatal.length === 0) {
+            await this.runValidationStage(session, 'modify', {
+              layoutPlan: {
+                plan: absorbed.plan,
+                targets: gateTargetsForSession({
+                  brief: session.brief,
+                  layoutIntent: localIntent,
+                  programEditedByModify: true,
+                }),
+                profile,
+              },
+            })
             return this.rebuildScenePlanFirst({
               session,
               sceneId,
@@ -1421,7 +1576,7 @@ export class PascalAiAgent {
               zones,
               intent: localIntent,
               plan: absorbed.plan,
-              planNotes: [`局部删除：「${resolved.room.name}」并入「${absorbed.absorbedInto.name}」，其余房间保持原位`],
+              planNotes: [`重建方案：「${resolved.room.name}」并入「${absorbed.absorbedInto.name}」，其余房间规划位置保持不变`],
               // Re-derived from the post-removal intent — the absorbed plan
               // keeps its geometry either way, but the snapshot must not
               // carry a strategy (e.g. tanoji) the new room count no longer
@@ -1459,6 +1614,18 @@ export class PascalAiAgent {
         const zoneId = zoneIdByName.get(entry.oldName)
         return zoneId ? [{ op: 'update', id: zoneId, data: { name: entry.newName } }] : []
       })
+      const localLevelId = applied.furnitureOps.length > 0
+        ? await this.findLevelId(session)
+        : null
+      if (applied.furnitureOps.length > 0 && !localLevelId) {
+        return this.finishSafeModificationRejection(
+          session,
+          t(session.language, 'modifyLocalUnavailable', {}),
+        )
+      }
+      const beforeSnapshot = snapshotSceneNodes(
+        toolPayload(await this.callMcp(session.sessionId, 'get_scene', {})),
+      )
       if (patches.length > 0) await traceMcp('apply_patch', { patches })
       session.layoutIntent = applied.intent
       // Keep the plan snapshot's names in step, or the rename would read as
@@ -1472,16 +1639,25 @@ export class PascalAiAgent {
       }
       let furnReport: FurnitureModifyReport | null = null
       if (applied.furnitureOps.length > 0) {
-        const levelId = await this.findLevelId(session)
-        if (!levelId) return null
         furnReport = await executeFurnitureModifyOps({
           ops: applied.furnitureOps,
           rooms,
-          levelId,
+          levelId: localLevelId!,
           callMcp: traceMcp,
           beforeCall,
         })
       }
+      await this.verifyLocalPatchScope(
+        session,
+        beforeSnapshot,
+        localPatchAllowances(
+          patches.map(patch => patch.id),
+          furnReport,
+          rooms,
+          applied.furnitureOps,
+          localLevelId,
+        ),
+      )
       trace.converged = true
       return this.finishPlanFirstModify(session, sceneId, loadedVersion, trace, {
         okDetails: [...applied.notes, ...(furnReport?.results.filter(r => r.ok).map(r => r.detail) ?? [])],
@@ -1555,7 +1731,10 @@ export class PascalAiAgent {
         ]
       }
     }
-    const validation = validateLayoutPlan(plan, targets, profile)
+    const validationResults = await this.runValidationStage(session, 'modify', {
+      layoutPlan: { plan, targets, profile },
+    })
+    const validation = validationValue<PlanValidation>(validationResults, VALIDATOR_IDS.layoutPlan)
     if (validation.fatal.length > 0) return this.rejectPlanFirstModify(session, validation.fatal)
 
     return this.rebuildScenePlanFirst({
@@ -1595,7 +1774,7 @@ export class PascalAiAgent {
     furnitureOps: FurnitureModifyOp[]
     appliedNotes: string[]
     baselineGateFailures: GateFailure[]
-  }): Promise<Partial<WorkflowGraphState> | null> {
+  }): Promise<Partial<WorkflowGraphState>> {
     const {
       session, sceneId, loadedVersion, trace, traceMcp, beforeCall,
       zones, intent, plan, planNotes, strategy, furnitureOps, appliedNotes,
@@ -1603,7 +1782,12 @@ export class PascalAiAgent {
     } = options
     const nodes = snapshotSceneNodes(toolPayload(await this.callMcp(session.sessionId, 'get_scene', {})))
     const levelId = Object.entries(nodes).find(([, node]) => node.type === 'level')?.[0] ?? null
-    if (!levelId) return null
+    if (!levelId) {
+      return this.finishSafeModificationRejection(
+        session,
+        t(session.language, 'modifyRebuildUnavailable', {}),
+      )
+    }
     // §6 manual-item replay: items outside the furniture checklist (decor,
     // user-picked extras) don't come back through the furnishing pass —
     // capture them (with their pre-rebuild room) before everything is
@@ -1758,8 +1942,29 @@ export class PascalAiAgent {
   ): Partial<WorkflowGraphState> {
     delete session.pendingModification
     delete session.pendingOperation
+    delete session.pendingModificationMode
+    delete session.pendingModificationReasonCode
+    delete session.pendingModificationPlanHash
+    delete session.modifyModeConfirmed
+    delete session.modifyDriftConfirmed
     session.phase = modifyFailureRecovery(false, Boolean(session.sceneResult)).phase
     const reply = t(session.language, 'modifyFailedNoRetry', { error: errors.join('；') })
+    session.messages.push({ role: 'assistant', content: reply })
+    return { session, reply, next: 'finish' }
+  }
+
+  private finishSafeModificationRejection(
+    session: WorkflowSession,
+    reply: string,
+  ): Partial<WorkflowGraphState> {
+    delete session.pendingModification
+    delete session.pendingOperation
+    delete session.pendingModificationMode
+    delete session.pendingModificationReasonCode
+    delete session.pendingModificationPlanHash
+    delete session.modifyModeConfirmed
+    delete session.modifyDriftConfirmed
+    session.phase = session.sceneResult?.remainingIssueCount ? 'completed_with_issues' : 'completed'
     session.messages.push({ role: 'assistant', content: reply })
     return { session, reply, next: 'finish' }
   }
@@ -1779,14 +1984,14 @@ export class PascalAiAgent {
       intentRemovals?: IntentRemoval[]
     },
   ): Promise<Partial<WorkflowGraphState>> {
-    const diagnostics = await this.collectDiagnostics(session)
+    const diagnostics = await this.collectDiagnostics(session, 'modify')
     const sceneVersion = await this.persistScene(
       session.sessionId,
       sceneId,
       diagnostics.validation.valid,
       loadedVersion,
     )
-    const gates = await this.evaluateGates(session)
+    const gates = await this.evaluateGates(session, 'modify')
     const { effective, waived } = effectiveGateFailures(
       gates.report.failures,
       results.baselineGateFailures,
@@ -1821,6 +2026,11 @@ export class PascalAiAgent {
       : 'completed_with_issues'
     delete session.pendingModification
     delete session.pendingOperation
+    delete session.pendingModificationMode
+    delete session.pendingModificationReasonCode
+    delete session.pendingModificationPlanHash
+    delete session.modifyModeConfirmed
+    delete session.modifyDriftConfirmed
     const base = buildCompletionReply({
       lang: session.language ?? 'en',
       successText: t(session.language, 'modifySuccess', {}),
@@ -1866,13 +2076,10 @@ export class PascalAiAgent {
     // Exclude the last entry: it's `question` itself, already pushed to
     // session.messages by routeExistingSceneRequest before this runs.
     const history = recentConversationBlock(session.messages.slice(0, -1))
+    const prompt = renderPrompt('inspect', { history, question })
     const messages: ChatMessage[] = [
-      {
-        role: 'system',
-        content:
-          'Inspect the active Pascal scene and answer the user accurately. Use read-only tools when needed. Never mutate the scene. State what you verified, identify relevant node ids when useful, and distinguish measured facts from uncertainty. Use the recent conversation to resolve references like "that wall" or "the one I mentioned". If the question is unrelated to the scene and to architectural/interior design (e.g. weather, small talk), do not call any tools — briefly say you can only help with the floor plan. Reply in the language of the user\'s message (default to English if unclear).',
-      },
-      { role: 'user', content: `${history}${question}` },
+      { role: 'system', content: prompt.parts.system },
+      { role: 'user', content: prompt.parts.user },
     ]
     for (let round = 0; round < this.config.maxToolRounds; round++) {
       this.throwIfCancelled(session.sessionId)
@@ -1880,7 +2087,7 @@ export class PascalAiAgent {
         model.chat(messages, tools, `${session.sessionId}:inspect`, {
           ...hooks,
           operation: 'inspect',
-          promptVersion: 'inspect:v1',
+          ...promptAudit(prompt),
         }),
       )
       const assistant = completion.choices[0]?.message
@@ -1905,21 +2112,13 @@ export class PascalAiAgent {
     message: string,
     imageDataUrl?: string,
   ): Promise<ExtractionResponse> {
-    const prompt = `你是 Pascal 户型设计输入分析器。请只返回 JSON，不要返回 Markdown。
-任务：把最新输入合并到已有结构化需求中。严格区分“图纸/图片中的现状”和“用户希望实现的设计目标”。禁止把推断写成用户事实。
-
-每个信息项格式：
-{"key":"稳定的snake_case键","label":"用户语言的名称","value":"值或数组","source":"user|system_recognition|agent_inference|default_assumption|pending_confirmation","confidence":0到1,"confirmationStatus":"unconfirmed|confirmed|rejected","evidence":"简短依据"}
-
-输出字段：existingCondition、designGoals、hardConstraints、assumptions、uncertainties、conflicts、questions、overallConfidence、imageUsable、imageReason、relevant。
-relevant 为布尔值：仅当输入（文字和图片都算）与住宅户型、房间布局、室内设计完全无关时才为 false（如问天气、闲聊、常识问答）；只要沾边或含户型图就为 true。relevant 为 false 时其余字段返回空即可。
-conflicts 格式：{"key":"...","existingValue":"...","requestedValue":"...","question":"..."}。
-常见信息用稳定 key：总面积 "total_area"、房间构成 "room_program"、卧室数 "bedroom_count"（数字）、边界/开间进深 "boundary_dimensions"。用户给出"N室/N卧/NLDK"时必须同时产出数字型 bedroom_count。
-用户给出总面积或房间构成时，它们是已确认的设计目标（designGoals，confidence≥0.9），不要因"面积口径未说明"之类的次要歧义把它们降级或列为 uncertainties——按建筑面积理解即可。
-questions 每次最多 3 个，只问会改变空间结构的问题；questions 和所有 label 使用用户输入的语言（无法判断时用英语）。
-已有需求：${JSON.stringify(session.brief)}
-最新文字：${message || '无附带文字'}
-输入类型：${imageDataUrl ? '单张户型图；图片是现状依据，文字是目标或指令。请尽量从图中识别墙体、门、窗、房间及其大致布局/尺寸，作为 existingCondition 现状事实（识别不确定的放入 uncertainties，不要写成用户确认的事实）' : '纯文字需求'}`
+    const prompt = renderPrompt('extract', {
+      briefJson: JSON.stringify(session.brief),
+      message: message || '无附带文字',
+      inputType: imageDataUrl
+        ? '单张户型图；图片是现状依据，文字是目标或指令。请尽量从图中识别墙体、门、窗、房间及其大致布局/尺寸，作为 existingCondition 现状事实（识别不确定的放入 uncertainties，不要写成用户确认的事实）'
+        : '纯文字需求',
+    })
 
     // Retry once on malformed JSON — this call is exactly the kind of
     // strict-JSON-mode request that
@@ -1928,8 +2127,8 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     let lastError: unknown
     for (let attempt = 0; attempt < 2; attempt++) {
       const attemptPrompt = attempt > 0
-        ? `${prompt}\n上一次输出不是合法 JSON，这一次必须严格只返回 JSON，不要加任何说明、前后缀或 Markdown 代码块标记。`
-        : prompt
+        ? `${prompt.parts.user}\n${prompt.parts.retry}`
+        : prompt.parts.user
       const content: ChatMessage['content'] = imageDataUrl
         ? [
             { type: 'text', text: attemptPrompt },
@@ -1941,11 +2140,11 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
         return await this.withModelFallback(session.sessionId, (model, hooks) =>
           model.json<ExtractionResponse>(
             [
-              { role: 'system', content: 'Extract architectural requirements into valid JSON only.' },
+              { role: 'system', content: prompt.parts.system },
               { role: 'user', content },
             ],
             `${session.sessionId}:extract:${attempt}`,
-            { ...hooks, operation: 'extract', promptVersion: 'extract:v1' },
+            { ...hooks, operation: 'extract', ...promptAudit(prompt) },
           ).then(result => result.output),
         )
       } catch (error) {
@@ -1967,33 +2166,19 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     return this.agentGuidePromise
   }
 
-  /**
-   * Base system prompt for `runSceneAgent`, extended with (a) the "Scene
-   * Creation Rules" section pulled live from the MCP `pascal://agent-guide`
-   * resource when available, and (b) a couple of conventions adapted from
-   * the MCP `from_brief`/`iterate_on_feedback` prompts' shared design
-   * guidance (support-space completeness, apply_patch bundling) that our
-   * own hand-written prompt didn't previously cover.
-   */
-  private async buildSceneAgentSystemPrompt(): Promise<string> {
-    const base =
-      'You are the Pascal scene generation and repair agent. Work only on the active Pascal scene. For user feedback, make the minimum change requested and never alter unrelated geometry. Prefer semantic room tools and atomic apply_patch. Preserve confirmed requirements, avoid destructive broad changes, inspect before mutation, and validate before finishing. When calling add_door or add_window, only set `position` (0..1 along the wall); the `t` field is a legacy alias for the same value — never set both, and never set `t` alone.\n\nImportant limitation of the automated checks: `check_collisions` only compares unrotated axis-aligned bounding boxes between pairs of items — it ignores each item\'s `rotation`, and it never checks an item against walls or against its room/zone polygon. `verify_scene` and `validate_scene` do not inspect item placement at all. Passing all three does NOT mean furniture is placed sensibly. So whenever you place or move an item (place_item, furnish_room, or an apply_patch that touches an item node), you must reason about placement yourself: call get_zones and find_nodes (or get_level_summary) for the target room first to see the room polygon and existing items, account for the item\'s own rotated footprint, keep it inside the room polygon, keep clearance from doors/walkways, and avoid visually overlapping other furniture even if check_collisions would not flag it.'
-
-    const supplement =
-      'Only add support spaces (kitchen, living/dining, bathroom(s), entry/hallway, storage/laundry) that the confirmed brief itself calls for — either by naming them directly, or by describing the scope as a full home/apartment/unit. A bedroom count alone is not such a signal: if the user only asked for N bedrooms, do not add a kitchen, living room, or bathroom on your own initiative. When several placements belong to one logical change, bundle them into a single apply_patch call so they share one undo step.'
-
+  private async buildSceneAgentPrompt(
+    purpose: string,
+    history: string,
+    brief: string,
+  ): Promise<RenderedPrompt<'scene-agent'>> {
     const guide = await this.getAgentGuide()
     const sceneCreationRules = guide ? extractMarkdownSection(guide, 'Scene Creation Rules') : undefined
-
-    return [
-      base,
-      supplement,
-      sceneCreationRules
-        ? `Additional scene-creation conventions from the Pascal MCP agent guide (project/version/save mechanics in it do not apply here — ignore those):\n${sceneCreationRules}`
-        : undefined,
-    ]
-      .filter((part): part is string => Boolean(part))
-      .join('\n\n')
+    return renderPrompt('scene-agent', {
+      guide: sceneCreationRules ?? '',
+      purpose,
+      history,
+      brief,
+    })
   }
 
   private async runSceneAgent(
@@ -2003,6 +2188,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     toolNamesUsed: Set<string> = new Set(),
     furnitureIssues: string[] = [],
     trace?: PhaseToolTrace,
+    auditPrompt?: PromptAuditMetadata,
   ): Promise<{
     messages: ChatMessage[]
     converged: boolean
@@ -2042,19 +2228,24 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     // what earlier phases/repair rounds already tried, instead of starting
     // from a blank slate every time.
     const isNewThread = !conversation
+    const historyBlock = isNewThread ? recentConversationBlock(session.messages) : ''
+    const prompt = await this.buildSceneAgentPrompt(
+      purpose,
+      historyBlock,
+      session.summary || formatSummary(session.brief),
+    )
     const messages: ChatMessage[] = conversation ?? [
       {
         role: 'system',
-        content: await this.buildSceneAgentSystemPrompt(),
+        content: prompt.parts.system,
       },
     ]
     // Only inject conversation history when this call starts a fresh thread
     // (repair rounds and later phases already carry it forward in `messages`
     // itself, so repeating it every round would just waste tokens).
-    const historyBlock = isNewThread ? recentConversationBlock(session.messages) : ''
     messages.push({
       role: 'user',
-      content: `${purpose}\n${historyBlock}Confirmed brief (authoritative for dimensions, room list, and hard constraints):\n${session.summary || formatSummary(session.brief)}`,
+      content: prompt.parts.user,
     })
 
     for (let round = 0; round < this.config.maxToolRounds; round++) {
@@ -2063,7 +2254,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
         model.chat(messages, tools, `${session.sessionId}:scene`, {
           ...hooks,
           operation: 'scene-agent',
-          promptVersion: 'scene-agent:v1',
+          ...promptAudit(auditPrompt ?? prompt),
         }),
       )
       const assistant = completion.choices[0]?.message
@@ -2108,13 +2299,20 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     while (!result.converged && attempt < PascalAiAgent.PHASE_CONTINUATION_ATTEMPTS) {
       attempt++
       trace.continuationAttempts = attempt
+      const continuation = renderPrompt('scene-agent', {
+        guide: '',
+        purpose,
+        history: '',
+        brief: '',
+      })
       result = await this.runSceneAgent(
         session,
-        `${purpose}\n上一轮已经达到工具调用轮次上限，任务还没有做完。请先用 get_zones 检查当前场景的真实状态，只继续完成尚未做完的部分，不要重复已经做好的操作。`,
+        continuation.parts.continuation,
         result.messages,
         result.toolNamesUsed,
         result.furnitureIssues,
         trace,
+        continuation,
       )
     }
     trace.converged = result.converged
@@ -2340,7 +2538,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
         briefSummary,
         targets,
       },
-      async (messages, tag) => {
+      async (messages, tag, prompt) => {
         this.throwIfCancelled(session.sessionId)
         trace.modelCalls++
         return this.withModelFallback(session.sessionId, (model, hooks) =>
@@ -2349,7 +2547,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
             // plan-builder tags carry the round number ("plan:intent:2") —
             // strip it so the label stays aggregatable.
             operation: tag.replace(/:\d+$/, ''),
-            promptVersion: `${tag.replace(/:\d+$/, '')}:v1`,
+            ...promptAudit(prompt),
             temperature,
           }).then(result => result.output),
         )
@@ -2385,27 +2583,9 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
         )
       }
     }
-    if (result.ok) {
-      this.recordValidation(
-        session,
-        'layout-plan',
-        result.validation.fatal.length === 0 ? 'passed' : 'failed',
-        result.validation.fatal.length + result.validation.warnings.length,
-        {
-          fatalCount: result.validation.fatal.length,
-          warningCount: result.validation.warnings.length,
-          score: result.validation.score,
-        },
-      )
-    } else {
-      this.recordValidation(
-        session,
-        'layout-plan',
-        'failed',
-        result.failures.length,
-        { fatalCount: result.failures.length, warningCount: 0 },
-      )
-    }
+    await this.runValidationStage(session, 'plan', result.ok
+      ? { layoutPlan: { plan: result.plan, targets, profile, validation: result.validation } }
+      : { layoutPlanFailure: { failureCount: result.failures.length } })
     return result
   }
 
@@ -2428,15 +2608,30 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     }
   }
 
-  private async evaluateGates(session: WorkflowSession): Promise<{
+  private async evaluateGates(
+    session: WorkflowSession,
+    stage: ValidationStage = 'verification',
+  ): Promise<{
     report: GateReport
     layoutQuality: number
   }> {
-    const [zonesRaw, wallsRaw, summaryRaw] = await Promise.all([
-      this.callMcp(session.sessionId, 'get_zones', {}),
-      this.callMcp(session.sessionId, 'get_walls', {}),
-      this.callMcp(session.sessionId, 'get_level_summary', {}),
-    ])
+    let sources: [unknown, unknown, unknown]
+    try {
+      sources = await Promise.all([
+        this.callMcp(session.sessionId, 'get_zones', {}),
+        this.callMcp(session.sessionId, 'get_walls', {}),
+        this.callMcp(session.sessionId, 'get_level_summary', {}),
+      ])
+    } catch (error) {
+      await this.runValidationStage(session, stage, {
+        unavailable: {
+          validatorId: VALIDATOR_IDS.completionGates,
+          reason: validationUnavailableReason(error),
+        },
+      })
+      throw error
+    }
+    const [zonesRaw, wallsRaw, summaryRaw] = sources
     const zonesPayload = toolPayload(zonesRaw)
     const wallsPayload = toolPayload(wallsRaw)
     const summaryPayload = toolPayload(summaryRaw)
@@ -2452,27 +2647,24 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     // forever), the brief for legacy scenes.
     const planTargets = gateTargetsForSession(session)
     const requiredWindowRoomTypes = windowRoomTypesFromBrief(session.brief)
-    const report = evaluateCompletionGates(zones, walls, items, {
+    const completion = {
+      zones,
+      walls,
+      items,
+      targets: {
       ...(planTargets.totalAreaSqm !== undefined ? { totalAreaSqm: planTargets.totalAreaSqm } : {}),
       ...(planTargets.requiredRooms ? { requiredRooms: planTargets.requiredRooms } : {}),
       ...(requiredWindowRoomTypes.length > 0 ? { requiredWindowRoomTypes } : {}),
       ...(Object.keys(zoneTypes).length > 0 ? { zoneTypes } : {}),
       market: resolveNormProfile(this.config.normProfile).id,
-    })
+      },
+    }
+    const validationResults = await this.runValidationStage(session, stage, { completion })
+    const report = validationValue<GateReport>(validationResults, VALIDATOR_IDS.completionGates)
     const layoutQuality = computeLayoutQuality(zones, walls, {
       ...(planTargets.totalAreaSqm !== undefined ? { targetTotalAreaSqm: planTargets.totalAreaSqm } : {}),
       ...(Object.keys(zoneTypes).length > 0 ? { zoneTypes } : {}),
     }).score
-    this.recordValidation(
-      session,
-      'completion-gates',
-      report.passed ? 'passed' : 'failed',
-      report.failures.length,
-      {
-        failedGates: [...new Set(report.failures.map(failure => failure.gate))].sort(),
-        failureKinds: [...new Set(report.failures.map(failure => failure.id))].sort(),
-      },
-    )
     return { report, layoutQuality }
   }
 
@@ -2590,12 +2782,16 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     // (gates 1–5) belongs to the plan layer — repairing decorations on a
     // scene that is about to be cleared and rebuilt would only burn model
     // calls, so verification is skipped entirely in that case.
-    const preGates = await this.runWorkflowStep(session, 'gates', () => this.evaluateGates(session))
+    const preGates = await this.runWorkflowStep(
+      session,
+      'gates',
+      () => this.evaluateGates(session, 'furniture'),
+    )
     const structuralFailures = preGates.report.failures
       .filter(failure => failure.gate <= 5)
       .map(failure => failure.message)
     if (structuralFailures.length > 0) {
-      const diagnostics = await this.collectDiagnostics(session)
+      const diagnostics = await this.collectDiagnostics(session, 'structure')
       return {
         diagnostics,
         repairRounds: 0,
@@ -2631,7 +2827,11 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     })
     // Re-judge the gates after repairs (repair rounds may have re-hosted a
     // window or refit furniture; the lock guarantees structure is unchanged).
-    const postGates = await this.runWorkflowStep(session, 'gates', () => this.evaluateGates(session))
+    const postGates = await this.runWorkflowStep(
+      session,
+      'gates',
+      () => this.evaluateGates(session, 'verification'),
+    )
     return {
       ...result,
       executionIssues: report.executionIssues,
@@ -2666,6 +2866,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
       // §8 批次 D 每轮 persistScene：called after every repair round with the
       // round's validation state, so each round leaves a saved version.
       persistAfterRound?: (valid: boolean) => Promise<void>
+      validationStage?: ValidationStage
     } = {},
   ): Promise<{
     diagnostics: Awaited<ReturnType<PascalAiAgent['collectDiagnostics']>>
@@ -2703,8 +2904,9 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
       if (extra.length === 0) return diagnostics
       return { ...diagnostics, requirementMismatches: [...diagnostics.requirementMismatches, ...extra] }
     }
-    let diagnostics = await this.collectDiagnostics(session)
-    diagnostics = await this.repairKnownOpeningBounds(diagnostics, session)
+    const validationStage = options.validationStage ?? 'verification'
+    let diagnostics = await this.collectDiagnostics(session, validationStage)
+    diagnostics = await this.repairKnownOpeningBounds(diagnostics, session, validationStage)
     diagnostics = await withExtraChecks(diagnostics)
     let repairRounds = 0
     const structureViolations: string[] = []
@@ -2718,16 +2920,22 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
       this.throwIfCancelled(session.sessionId)
       repairRounds++
       const repairTrace = startPhaseTrace(session, `自动修正第${repairRounds}轮`)
+      const repairPrompt = renderPrompt('repair', {
+        purpose,
+        round: String(repairRounds),
+        diagnostics: JSON.stringify(diagnostics),
+      })
       const result = await this.runWorkflowStep(
         session,
         `repair:${repairRounds}`,
         () => this.runSceneAgent(
           session,
-          `${purpose}\n自动修正第 ${repairRounds} 轮。必须先检查相关节点，再用工具修复以下具体问题；不要只解释，也不要推翻已确认需求：${JSON.stringify(diagnostics)}`,
+          repairPrompt.parts.user,
           conversation,
           toolNamesUsed,
           furnitureIssues,
           repairTrace,
+          repairPrompt,
         ),
       )
       repairTrace.converged = result.converged
@@ -2754,15 +2962,15 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
           structureViolations.push(
             `自动修正第 ${repairRounds} 轮试图改动房间结构（${drift.slice(0, 3).join('；')}${drift.length > 3 ? '……' : ''}），该轮改动已整体撤销`,
           )
-          diagnostics = await this.collectDiagnostics(session)
-          diagnostics = await this.repairKnownOpeningBounds(diagnostics, session)
+          diagnostics = await this.collectDiagnostics(session, validationStage)
+          diagnostics = await this.repairKnownOpeningBounds(diagnostics, session, validationStage)
           diagnostics = await withExtraChecks(diagnostics)
           break
         }
         lockSnapshot = afterSnapshot
       }
-      diagnostics = await this.collectDiagnostics(session)
-      diagnostics = await this.repairKnownOpeningBounds(diagnostics, session)
+      diagnostics = await this.collectDiagnostics(session, validationStage)
+      diagnostics = await this.repairKnownOpeningBounds(diagnostics, session, validationStage)
       diagnostics = await withExtraChecks(diagnostics)
       if (options.persistAfterRound) {
         await options.persistAfterRound(diagnostics.validation.valid)
@@ -2774,6 +2982,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
   private async repairKnownOpeningBounds(
     diagnostics: Awaited<ReturnType<PascalAiAgent['collectDiagnostics']>>,
     session: WorkflowSession,
+    validationStage: ValidationStage = 'verification',
   ): Promise<Awaited<ReturnType<PascalAiAgent['collectDiagnostics']>>> {
     const ids = dedupe(
       diagnostics.verificationIssues.flatMap(issue => {
@@ -2798,7 +3007,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     }
     if (patches.length === 0) return diagnostics
     await this.callMcp(session.sessionId, 'apply_patch', { patches })
-    return this.collectDiagnostics(session)
+    return this.collectDiagnostics(session, validationStage)
   }
 
   private async persistScene(
@@ -2898,7 +3107,10 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     return { ...args, position: [position[0], 0, position[2]] }
   }
 
-  private async collectDiagnostics(session: WorkflowSession): Promise<{
+  private async collectDiagnostics(
+    session: WorkflowSession,
+    stage: ValidationStage = 'verification',
+  ): Promise<{
     validation: { valid: boolean; errors: string[] }
     verificationIssues: string[]
     collisions: Array<{ aId: string; bId: string; kind: string }>
@@ -2910,14 +3122,24 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
     strayWallIds: string[]
     mismatchL10n: Array<MismatchFinding['l10n']>
   }> {
-    const [validationRaw, verificationRaw, collisionsRaw, zonesRaw, wallsRaw, levelSummaryRaw] = await Promise.all([
-      this.callMcp(session.sessionId, 'validate_scene', {}),
-      this.callMcp(session.sessionId, 'verify_scene', {}),
-      this.callMcp(session.sessionId, 'check_collisions', {}),
-      this.callMcp(session.sessionId, 'get_zones', {}),
-      this.callMcp(session.sessionId, 'get_walls', {}),
-      this.callMcp(session.sessionId, 'get_level_summary', {}),
-    ])
+    let sources: [Awaited<ReturnType<typeof readMcpValidationSources>>, unknown, unknown, unknown]
+    try {
+      sources = await Promise.all([
+        readMcpValidationSources((name, args) => this.callMcp(session.sessionId, name, args)),
+        this.callMcp(session.sessionId, 'get_zones', {}),
+        this.callMcp(session.sessionId, 'get_walls', {}),
+        this.callMcp(session.sessionId, 'get_level_summary', {}),
+      ])
+    } catch (error) {
+      await this.runValidationStage(session, stage, {
+        unavailable: {
+          validatorId: VALIDATOR_IDS.sceneDiagnostics,
+          reason: validationUnavailableReason(error),
+        },
+      })
+      throw error
+    }
+    const [{ validationRaw, verificationRaw, collisionsRaw }, zonesRaw, wallsRaw, levelSummaryRaw] = sources
     const validationPayload = toolPayload(validationRaw)
     const verificationPayload = toolPayload(verificationRaw)
     const collisionPayload = toolPayload(collisionsRaw)
@@ -2948,6 +3170,7 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
       ...checkAreaRequirements(zones, session.brief),
     ]
     const strayWallIds = findStrayWindows(zones, walls)
+    const furniturePlacementIssues = checkFurniturePlacement(zones, walls, items)
     const diagnostics = {
       validation: {
         valid: validationPayload.valid === true,
@@ -2959,31 +3182,23 @@ questions 每次最多 3 个，只问会改变空间结构的问题；questions 
       strayWindows: strayWallIds.map(wallId => issueText('zh', 'strayWindow', { wallId })),
       requirementMismatches: mismatchFindings.map(finding => finding.message),
       isolatedBedrooms: findIsolatedBedrooms(zones, walls, zoneTypes),
-      furniturePlacementIssues: checkFurniturePlacement(zones, walls, items),
+      furniturePlacementIssues,
       // Structured sources for reply-language re-rendering (see
       // describeRemainingIssues). Extra strings appended later by
       // extraChecks have no l10n and pass through untranslated.
       strayWallIds,
       mismatchL10n: mismatchFindings.map(finding => finding.l10n),
     }
-    const issueCounts = {
-      validationErrors: diagnostics.validation.errors.length,
-      verificationIssues: diagnostics.verificationIssues.length,
-      collisions: diagnostics.collisions.length,
-      doorlessRooms: diagnostics.doorlessRooms.length,
-      strayWindows: diagnostics.strayWindows.length,
-      requirementMismatches: diagnostics.requirementMismatches.length,
-      isolatedBedrooms: diagnostics.isolatedBedrooms.length,
-      furniturePlacementIssues: diagnostics.furniturePlacementIssues.length,
-    }
-    const issueCount = Object.values(issueCounts).reduce((sum, count) => sum + count, 0)
-    this.recordValidation(
-      session,
-      'scene-diagnostics',
-      issueCount === 0 ? 'passed' : 'failed',
-      issueCount,
-      issueCounts,
-    )
+    await this.runValidationStage(session, stage, {
+      mcpValidation: {
+        valid: diagnostics.validation.valid,
+        errors: diagnostics.validation.errors,
+        verificationIssues: diagnostics.verificationIssues,
+        collisions: diagnostics.collisions,
+      },
+      furniturePlacementIssues,
+      sceneDiagnostics: diagnostics,
+    })
     return diagnostics
   }
 
@@ -3690,6 +3905,46 @@ export function snapshotSceneNodes(payload: Record<string, unknown>): SceneNodeS
   return out
 }
 
+function localPatchAllowances(
+  renamedZoneIds: string[],
+  report: FurnitureModifyReport | null,
+  rooms: FurnitureRoom[],
+  operations: FurnitureModifyOp[],
+  levelId: string | null,
+): LocalPatchAllowance[] {
+  const fieldsByNode = new Map<string, Set<string> | 'all'>()
+  const allowFields = (nodeId: string | null | undefined, fields: string[] | 'all') => {
+    if (!nodeId) return
+    if (fields === 'all' || fieldsByNode.get(nodeId) === 'all') {
+      fieldsByNode.set(nodeId, 'all')
+      return
+    }
+    const current = fieldsByNode.get(nodeId)
+    const merged = current instanceof Set ? current : new Set<string>()
+    for (const field of fields) merged.add(field)
+    fieldsByNode.set(nodeId, merged)
+  }
+
+  for (const zoneId of renamedZoneIds) allowFields(zoneId, ['name'])
+  for (const result of report?.results ?? []) {
+    allowFields(result.removedItemId, 'all')
+    allowFields(result.addedItemId, 'all')
+  }
+  for (const operation of operations) {
+    const room = rooms.find(entry =>
+      entry.id === operation.room
+      || entry.zoneId === operation.room
+      || entry.name === operation.room)
+    allowFields(room?.zoneId, ['children'])
+  }
+  if (operations.length > 0) allowFields(levelId, ['children'])
+
+  return [...fieldsByNode.entries()].map(([nodeId, fields]) => ({
+    nodeId,
+    fields: fields === 'all' ? 'all' : [...fields].sort(),
+  }))
+}
+
 // 1mm: genuine edits move geometry by far more; re-serialization noise never does.
 const GEOM_FIELD_EPS = 0.001
 
@@ -4349,6 +4604,13 @@ function latestAssistantReply(session: WorkflowSession): string {
     if (message?.role === 'assistant' && typeof message.content === 'string') return message.content
   }
   return ''
+}
+
+function promptAudit(prompt: PromptAuditMetadata): PromptAuditMetadata {
+  return {
+    promptVersion: prompt.promptVersion,
+    promptHash: prompt.promptHash,
+  }
 }
 
 function errorMessage(error: unknown): string {

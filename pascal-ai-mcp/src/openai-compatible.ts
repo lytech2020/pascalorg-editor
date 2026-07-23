@@ -77,6 +77,7 @@ export class OpenAiCompatibleClient {
     extras: Record<string, unknown> = {},
     hooks: RequestHooks = {},
   ): Promise<ChatCompletionResponse> {
+    assertAuditedPromptIdentity(hooks)
     const body = JSON.stringify({
       ...(this.options.provider === 'azure-openai' ? {} : { model: this.options.model }),
       messages,
@@ -84,7 +85,7 @@ export class OpenAiCompatibleClient {
       ...(this.options.provider === 'azure-openai' ? {} : { session_id: sessionId }),
       ...extras,
     })
-    const promptHash = systemPromptHash(messages)
+    const promptHash = hooks.promptHash ?? systemPromptHash(messages)
     const requestParams = requestParamsFrom(
       extras,
       hooks.temperature ?? this.options.temperature,
@@ -317,6 +318,15 @@ function systemPromptHash(messages: ChatMessage[]): string {
     .filter(message => message.role === 'system')
     .map(message => message.content ?? null)
   return createHash('sha256').update(JSON.stringify(systemMessages)).digest('hex')
+}
+
+function assertAuditedPromptIdentity(hooks: RequestHooks): void {
+  if (!hooks.operation) return
+  if (!hooks.promptVersion || !hooks.promptHash) {
+    throw new Error(
+      `audited model operation "${hooks.operation}" requires registry promptVersion and promptHash`,
+    )
+  }
 }
 
 function requestParamsFrom(

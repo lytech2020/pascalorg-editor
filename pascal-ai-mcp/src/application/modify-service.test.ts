@@ -4,6 +4,8 @@ import {
   effectiveGateFailures,
   finishModificationFailure,
   modifyFailureRecovery,
+  runModifyWorkflow,
+  type ModifyWorkflowDependencies,
 } from './modify-service'
 
 describe('modify application service', () => {
@@ -32,6 +34,62 @@ describe('modify application service', () => {
     const result = finishModificationFailure(session, 'failed', '连接中断')
     expect(result.session.phase).toBe('awaiting_modification_confirmation')
     expect(result.reply).toContain('连接中断')
+    expect(result.reply).toContain('部分操作可能已经提交')
+    expect(result.reply).not.toContain('原场景')
+  })
+
+  test('uses the classified plan-first result without entering free editing', async () => {
+    const previousLegacyFlag = process.env.PASCAL_MODIFY_LEGACY
+    delete process.env.PASCAL_MODIFY_LEGACY
+    let legacyCalls = 0
+    const dependencies: ModifyWorkflowDependencies = {
+      persistSession: () => {},
+      loadScene: async () => ({ version: 4 }),
+      runPlanFirst: async session => ({
+        session: { ...session, phase: 'completed' },
+        reply: '安全拒绝：场景未修改',
+        next: 'finish',
+      }),
+      snapshotScene: async () => {
+        throw new Error('snapshotScene must not run after plan-first classification')
+      },
+      runLegacyPhase: async () => {
+        legacyCalls++
+        return { messages: [], toolNamesUsed: new Set(), furnitureIssues: [] }
+      },
+      dedupeSharedWalls: async () => {},
+      checkProtection: async () => [],
+      refine: async () => {
+        throw new Error('refine must not run after plan-first classification')
+      },
+      persistScene: async () => null,
+      evaluateGates: async () => ({
+        report: { passed: true, failures: [] },
+        layoutQuality: 1,
+      }),
+      clearDestructiveWrite: () => false,
+      isCancellationError: () => false,
+      errorMessage: error => String(error),
+      planSnapshot: () => '',
+    }
+    const session = {
+      ...baseSession(),
+      sceneId: 'scene-1',
+      pendingOperation: 'update' as const,
+    }
+    try {
+      const result = await runModifyWorkflow({
+        input: { sessionId: session.sessionId },
+        session,
+        reply: '',
+        next: 'modify',
+      }, dependencies)
+      expect(result.reply).toBe('安全拒绝：场景未修改')
+      expect(legacyCalls).toBe(0)
+    } finally {
+      if (previousLegacyFlag === undefined) delete process.env.PASCAL_MODIFY_LEGACY
+      else process.env.PASCAL_MODIFY_LEGACY = previousLegacyFlag
+    }
   })
 })
 

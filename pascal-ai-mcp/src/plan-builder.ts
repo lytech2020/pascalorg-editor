@@ -33,10 +33,15 @@ import { DEFAULT_NORM_PROFILE, type NormProfile } from './norms/profile'
 import { validateLayoutPlan, type PlanTargets, type PlanValidation } from './plan-validator'
 import { applyStrategy, strategyPromptLines, type StrategyDecision } from './strategy'
 import type { ChatMessage } from './types'
+import { renderPrompt, type PromptAuditMetadata } from './prompts/registry'
 
 // One plain-text completion (no tools). The agent wires this to its model
 // client with fallback + call budgeting; tests inject a stub.
-export type CompleteText = (messages: ChatMessage[], tag: string) => Promise<string>
+export type CompleteText = (
+  messages: ChatMessage[],
+  tag: string,
+  prompt: PromptAuditMetadata,
+) => Promise<string>
 
 export type PlanBuildOptions = {
   // Total model attempts (1 initial + corrections). §9 budgets "Intent 1–3".
@@ -88,50 +93,6 @@ export type PlanBuildFailure = {
 export type PlanBuildResult = PlanBuildSuccess | PlanBuildFailure
 
 const DEFAULT_MAX_ROUNDS = 3
-
-const INTENT_SYSTEM_PROMPT = `你是户型规划器。只返回一个 JSON 对象，不要任何解释或 Markdown 代码块。
-JSON 结构（LayoutIntent，只有语义，没有任何坐标）：
-{
-  "targetTotalAreaSqm": <目标总面积，数字，㎡>,
-  "rooms": [
-    {
-      "id": "<唯一 id，如 bedroom-1>",
-      "name": "<展示名，如 主卧>",
-      "type": "<${ROOM_TYPES.join('|')}>",
-      "targetAreaSqm": <可选，目标面积>,
-      "requiresExteriorWindow": <可选，布尔>
-    }
-  ],
-  "adjacency": [ { "a": "<房间id>", "b": "<房间id>" } ]  // 可选，仅超出常规动线的额外邻接意愿
-}
-
-规则：
-- 房间清单必须完整覆盖需求里明确要求的房间；需求描述为完整住宅时补齐必要配套（厨房、卫生间、客厅/餐厅、玄关等），只要求 N 间卧室时不要自作主张加配套。
-- 需求要求开放式厨房时，输出一间 type 为 living_kitchen 的房间代替独立的 living + kitchen，不要再单独输出厨房。
-- 动线空间（走廊/玄关）不需要你规划——分区器会按需自动加，除非需求明确要求。
-- targetAreaSqm 缺省时按房型默认值分配，各房间面积之和不必精确等于总面积，分区器会整体缩放。
-- 卧室/客厅/书房默认需要外窗，不需要重复声明；只在需求特别要求（或明确不要窗）时设置 requiresExteriorWindow。\n- 房间的 name 使用用户需求所用的语言（中文需求用中文名、日本語なら日本語、英语用英语）；id 一律用英文小写。`
-
-const PLAN_SYSTEM_PROMPT = `你是户型规划器。只返回一个 JSON 对象，不要任何解释或 Markdown 代码块。
-JSON 结构（LayoutPlan，含坐标，单位米，原点 (0,0)，轴对齐）：
-{
-  "footprint": { "width": <宽>, "depth": <深> },
-  "entry": { "roomId": "<入户房间 id>" },
-  "rooms": [
-    {
-      "id": "<唯一 id>", "name": "<展示名>",
-      "type": "<${ROOM_TYPES.join('|')}>",
-      "polygon": [[x,z], ...],  // 轴对齐多边形，全部房间精确铺满 footprint、互不重叠
-      "requiresExteriorWindow": <布尔>
-    }
-  ],
-  "connections": [ { "from": "<房间id>", "to": "<房间id>", "type": "door" } ]
-}
-要求：铺满无缝隙、无重叠；需要外窗的房间至少一条边贴 footprint 边界（≥0.9m）；每条 connection 的两房间共享边 ≥0.9m；全部房间经门从入户房间可达；卧室不得只能穿过厨房/卫生间/其他卧室到达公共空间。`
-
-function correctionPrompt(findings: string[]): string {
-  return `上一轮的规划存在以下必须修正的问题：\n${findings.map(f => `- ${f}`).join('\n')}\n请重新输出完整修正后的 JSON（只返回 JSON 对象本身），针对每条问题调整房间清单、房型或面积，不要重复同样的错误。`
-}
 
 // Tolerant parse for the experimental LLM-geometry path. Deliberately
 // minimal: shape defects surface as validator fatals, which feed the same
@@ -257,24 +218,23 @@ export async function buildLayoutPlan(
       }
     }
   }
+  const promptId = llmGeometry ? 'plan:geometry' as const : 'plan:intent' as const
+  const promptVariables = {
+    briefSummary: inputs.briefSummary,
+    totalArea: inputs.targets.totalAreaSqm !== undefined ? String(inputs.targets.totalAreaSqm) : '',
+    requiredRooms: inputs.targets.requiredRooms?.length
+      ? inputs.targets.requiredRooms.map(r => `${r.type}×${r.count}`).join('、')
+      : '',
+    strategy: options.strategy && !llmGeometry ? strategyPromptLines(options.strategy) : '',
+    priorFailures: options.priorFailures?.length
+      ? options.priorFailures.map(f => `- ${f}`).join('\n')
+      : '',
+    findings: '',
+  }
+  const prompt = renderPrompt(promptId, promptVariables)
   const messages: ChatMessage[] = [
-    { role: 'system', content: llmGeometry ? PLAN_SYSTEM_PROMPT : INTENT_SYSTEM_PROMPT },
-    {
-      role: 'user',
-      content: [
-        `已确认的结构化需求（房间清单、面积和硬性约束以此为准）：\n${inputs.briefSummary}`,
-        inputs.targets.totalAreaSqm !== undefined
-          ? `目标总面积：${inputs.targets.totalAreaSqm}㎡（±10% 内）`
-          : undefined,
-        inputs.targets.requiredRooms?.length
-          ? `必须包含的房型：${inputs.targets.requiredRooms.map(r => `${r.type}×${r.count}`).join('、')}`
-          : undefined,
-        options.strategy && !llmGeometry ? strategyPromptLines(options.strategy) : undefined,
-        options.priorFailures?.length
-          ? `上一次按规划建成的场景验收失败，原因如下，这次规划必须规避：\n${options.priorFailures.map(f => `- ${f}`).join('\n')}`
-          : undefined,
-      ].filter(Boolean).join('\n'),
-    },
+    { role: 'system', content: prompt.parts.system },
+    { role: 'user', content: prompt.parts.user },
   ]
 
   let modelCalls = 0
@@ -295,7 +255,7 @@ export async function buildLayoutPlan(
       }
   for (let round = 0; round < maxRounds; round++) {
     modelCalls++
-    const reply = await complete(messages, `plan:${llmGeometry ? 'geometry' : 'intent'}:${round}`)
+    const reply = await complete(messages, `${promptId}:${round}`, prompt)
     messages.push({ role: 'assistant', content: reply })
 
     const attempt = llmGeometry
@@ -307,7 +267,13 @@ export async function buildLayoutPlan(
     lastFailuresL10n = attempt.failuresL10n
     lastSeedTrace = attempt.seedTrace
     lastTemplateTrace = attempt.templateTrace ?? lastTemplateTrace
-    messages.push({ role: 'user', content: correctionPrompt(attempt.failures) })
+    messages.push({
+      role: 'user',
+      content: renderPrompt(promptId, {
+        ...promptVariables,
+        findings: attempt.failures.map(f => `- ${f}`).join('\n'),
+      }).parts.correction,
+    })
   }
   return {
     ok: false,

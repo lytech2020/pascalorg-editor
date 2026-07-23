@@ -76,19 +76,19 @@ export const MESSAGES = {
     () => 'Changes were applied to the existing floor plan and passed all automated checks.',
   ),
   modifyCancelled: def<Record<string, never>>(
-    () => '已在修改过程中取消。原场景保持不变，发送确认即可重试同一修改，或直接描述新的修改需求。',
-    () => '修正をキャンセルしました。元のシーンは変更されていません。確認を送信すると同じ修正を再試行できます。新しい修正内容を入力しても構いません。',
-    () => 'The modification was cancelled. The original scene is unchanged — send a confirmation to retry the same change, or describe a new one.',
+    () => '已停止后续修改操作。若取消前已有写入，场景可能保留部分变化；请先检查当前场景。修改要求仍然保留，发送确认可重试，或直接描述新的修改需求。',
+    () => '以降の修正処理を停止しました。キャンセル前に書き込みが始まっていた場合、シーンに一部の変更が残っている可能性があります。まず現在のシーンを確認してください。修正内容は保持されているため、確認を送信して再試行するか、新しい修正内容を入力できます。',
+    () => 'Further modification work was stopped. If writes began before cancellation, the scene may contain partial changes; inspect it first. Your request is retained — confirm to retry, or describe a new change.',
   ),
   modifyFailedRetry: def<{ error: string }>(
-    p => `场景修改失败：${p.error}。原场景和修改要求都已保留，发送确认即可重试同一操作，或直接描述新的修改需求。`,
-    p => `シーンの修正に失敗しました：${p.error}。元のシーンと修正内容は保持されています。確認を送信すると再試行できます。新しい修正内容を入力しても構いません。`,
-    p => `Scene modification failed: ${p.error}. The original scene and your request are preserved — send a confirmation to retry, or describe a new change.`,
+    p => `场景修改失败：${p.error}。修改要求已保留，但部分操作可能已经提交；请先检查当前场景，再发送确认重试或描述新的修改需求。`,
+    p => `シーンの修正に失敗しました：${p.error}。修正内容は保持されていますが、一部の操作がすでに反映されている可能性があります。現在のシーンを確認してから、確認を送信して再試行するか、新しい修正内容を入力してください。`,
+    p => `Scene modification failed: ${p.error}. Your request is retained, but some operations may already be committed; inspect the scene before confirming a retry or describing a new change.`,
   ),
   modifyFailedNoRetry: def<{ error: string }>(
-    p => `场景修改失败：${p.error}。原场景已保留，可以重新描述需要的修改。`,
-    p => `シーンの修正に失敗しました：${p.error}。元のシーンは保持されています。修正内容をもう一度入力してください。`,
-    p => `Scene modification failed: ${p.error}. The original scene is preserved — please describe the change again.`,
+    p => `场景修改失败：${p.error}。系统无法确认场景已恢复到修改前状态；请先检查当前场景，再重新描述需要的修改。`,
+    p => `シーンの修正に失敗しました：${p.error}。修正前の状態に戻ったことは確認できません。現在のシーンを確認してから、修正内容をもう一度入力してください。`,
+    p => `Scene modification failed: ${p.error}. The system cannot confirm that the scene returned to its pre-change state; inspect it before describing the change again.`,
   ),
   modifyDestructiveFailed: def<{ sceneId: string; error: string }>(
     p => `场景 ${p.sceneId} 的结构重建在写入开始后失败：${p.error}。当前接口不支持权威 checkpoint 恢复，场景可能处于部分修改状态；系统已禁止自动重试。请先在编辑器中检查该场景，再决定手工修复或重新生成。`,
@@ -99,6 +99,26 @@ export const MESSAGES = {
     () => '检测到当前场景与原规划之间存在手动修改的差异。继续执行这次结构修改会按新规划重建结构，手动改动可能被覆盖（家具类修改不受影响）。发送确认以继续，或重新描述修改需求。',
     () => '現在のシーンと元のプランに手動編集による差分が検出されました。この構造修正を続行すると新しいプランに基づいて再構築され、手動の変更は上書きされる可能性があります（家具の変更は影響を受けません）。続行するには確認を送信するか、修正内容を改めて入力してください。',
     () => 'Manual edits were detected between the current scene and the original plan. Proceeding with this structural change will rebuild the structure from the new plan and may overwrite them (furniture changes are unaffected). Send a confirmation to proceed, or describe a different change.',
+  ),
+  modifyRebuildConfirm: def<{ manualDrift: boolean }>(
+    p => `这项修改需要按新的 Plan 重建当前楼层结构：现有房间、墙体、门窗和清单家具会被重新生成，额外手工家具会尽量重新放置，但位置可能变化。${p.manualDrift ? '另外检测到场景存在手工编辑，这些差异可能被覆盖。' : ''}确认前不会更改场景；发送确认继续，或重新描述修改需求。`,
+    p => `この修正では、新しい Plan に基づいて現在の階の構造を再構築する必要があります。既存の部屋・壁・開口部・チェックリスト家具は再生成され、追加の手動家具は可能な限り再配置されますが、位置が変わることがあります。${p.manualDrift ? 'また、シーンに手動編集が検出されており、その差分が上書きされる可能性があります。' : ''}確認前にシーンは変更されません。続行するには確認を送信するか、修正内容を改めて入力してください。`,
+    p => `This change requires rebuilding the current floor from a new Plan. Existing rooms, walls, openings, and checklist furniture will be regenerated; extra manually placed furniture will be replayed where possible, but its position may change. ${p.manualDrift ? 'Manual scene edits were also detected and may be overwritten. ' : ''}Nothing changes before confirmation. Confirm to continue, or describe a different change.`,
+  ),
+  modifyUnsupportedSafe: def<Record<string, never>>(
+    () => '无法把这项请求安全地归类为已支持的局部修改或结构重建，因此没有更改场景。请明确描述房间或家具的增加、删除、面积调整或改名；门窗类修改暂不自动执行。',
+    () => 'このリクエストを、対応済みの局所修正または構造再構築として安全に分類できなかったため、シーンは変更していません。部屋や家具の追加・削除、面積変更、名称変更を明確に指定してください。開口部の変更は現在、自動実行の対象外です。',
+    () => 'This request could not be safely classified as a supported local patch or structural rebuild, so the scene was not changed. Clearly request room or furniture additions/removals, room resizing, or renaming; opening changes are not yet executed automatically.',
+  ),
+  modifyRebuildUnavailable: def<Record<string, never>>(
+    () => '该场景缺少结构重建所需的 Intent/Plan 快照或可用楼层结构，因此没有执行结构修改。家具类局部修改仍可使用；如需调整房间结构，请先检查或重新生成户型。',
+    () => 'このシーンには構造再構築に必要な Intent/Plan スナップショットまたは利用可能な階構造がないため、構造修正は実行していません。家具の局所修正は引き続き利用できます。部屋構成を変更するには、間取りを確認または再生成してください。',
+    () => 'This scene lacks the Intent/Plan snapshot or usable level structure required for a structural rebuild, so no structural change was made. Furniture-only local changes remain available; inspect or regenerate the floor plan before changing room structure.',
+  ),
+  modifyLocalUnavailable: def<Record<string, never>>(
+    () => '当前场景缺少执行这项局部修改所需的房间或楼层结构，因此没有继续施工，也没有转入自由编辑。请先检查或重新生成场景后再试。',
+    () => '現在のシーンには、この局所修正に必要な部屋または階の構造がないため、処理を続行せず、自由編集にも切り替えていません。シーンを確認または再生成してから再度お試しください。',
+    () => 'The scene lacks the room or level structure required for this local patch, so no further work was performed and it was not downgraded to free editing. Inspect or regenerate the scene before retrying.',
   ),
   modifyLegacyNoSnapshot: def<Record<string, never>>(
     () => '说明：该场景缺少规划快照（较早生成），本次修改通过兼容路径执行。',
