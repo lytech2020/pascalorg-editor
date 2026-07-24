@@ -135,6 +135,21 @@ export const MESSAGES = {
     () => '他の部屋を変更せずに、この修正を安全に完了することはできませんでした。この空間の削除や調整は、隣接する壁・ドア・玄関からの動線・他の部屋に影響する可能性があります。そのため、シーンへ書き込む前に停止しており、現在のシーンは変更されていません。エディタで手動調整することをおすすめします。',
     () => 'This change cannot currently be completed safely while keeping the other rooms unchanged. Removing or adjusting this space could affect adjacent walls, doors, entry circulation, or other rooms, so the operation stopped before writing and the current scene was not changed. Please make this adjustment manually in the editor.',
   ),
+  modifyPriorWriteUncertain: def<{ sceneId: string }>(
+    p => `上一次修改的写入结果尚未确认（场景 ${p.sceneId}），因此本次没有执行新的修改。请先在编辑器中检查或重新加载场景；确认当前状态后，请输入文字“确认”来解除保护。解除后，结构快照会失效，后续结构修改需重新生成户型。`,
+    p => `前回の修正結果が未確認のため（シーン ${p.sceneId}）、新しい修正は実行していません。まずエディタでシーンを確認または再読み込みし、状態を確認したら文字で「確認」と入力して保護を解除してください。解除後は構造スナップショットが無効になり、以後の構造修正には間取りの再生成が必要です。`,
+    p => `The previous change's write result is still unconfirmed (scene ${p.sceneId}), so this new change was not run. Check or reload the scene, then type “confirm” to acknowledge its current state and clear the protection. Structural snapshots will be invalidated, so later structural edits require regenerating the layout.`,
+  ),
+  modifyPriorWriteAcknowledged: def<{ sceneId: string }>(
+    p => `已确认场景 ${p.sceneId} 的当前状态并解除写入保护。由于上一次结果无法可靠核对，原结构快照已作废；家具修改可以重新发起，结构修改请先重新生成户型。`,
+    p => `シーン ${p.sceneId} の現在状態を確認済みとして書き込み保護を解除しました。前回結果を安全に照合できないため構造スナップショットは無効化しました。家具修正は再依頼でき、構造修正は先に間取りを再生成してください。`,
+    p => `The current state of scene ${p.sceneId} has been acknowledged and write protection cleared. Because the prior result could not be verified safely, the structural snapshot was invalidated. Furniture edits may be re-submitted; regenerate the layout before structural edits.`,
+  ),
+  modifyLocalRebuildOffer: def<{ reason: string }>(
+    () => '无法只改动这一处而不影响相邻房间来完成这项修改，因此在写入场景前已停止，当前场景没有被修改。如果允许对整个户型重新排布（其余房间的位置可能改变），请回复「允许整体重排」后再发起本次修改。',
+    () => 'この修正を、隣接する部屋に影響を与えずにこの箇所だけで完了することはできませんでした。そのため、シーンへ書き込む前に停止しており、現在のシーンは変更されていません。間取り全体の再配置（他の部屋の位置が変わる可能性があります）を許可する場合は、「全体の再配置を許可」と返信してから、もう一度この修正を依頼してください。',
+    () => 'This change could not be completed in place without affecting neighbouring rooms, so it stopped before writing and the current scene was not changed. If a full re-layout is acceptable (other rooms may move), reply allowing an overall re-layout and re-issue the request.',
+  ),
   modifyUnsupportedSafe: def<Record<string, never>>(
     () => '无法把这项请求安全地归类为已支持的局部修改或结构重建，因此没有更改场景。请明确描述房间或家具的增加、删除、面积调整或改名；门窗类修改暂不自动执行。',
     () => 'このリクエストを、対応済みの局所修正または構造再構築として安全に分類できなかったため、シーンは変更していません。部屋や家具の追加・削除、面積変更、名称変更を明確に指定してください。開口部の変更は現在、自動実行の対象外です。',

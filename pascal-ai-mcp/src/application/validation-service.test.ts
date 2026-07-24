@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import { checkFurniturePlacement, checkModificationProtection } from '../agent'
 import { evaluateCompletionGates, type GateReport } from '../completion-gates'
+import { applyLocalStructuralEdits } from '../domain/local-structural-edit'
+import { validateModifiedLayoutPlan } from '../domain/local-structural-validation'
 import type { LayoutPlan } from '../layout-plan'
 import { DEFAULT_NORM_PROFILE } from '../norms/profile'
 import { validateLayoutPlan, type PlanValidation } from '../plan-validator'
@@ -31,6 +33,23 @@ function plan(): LayoutPlan {
     connections: [
       { from: 'living-1', to: 'bedroom-1', type: 'door' },
       { from: 'living-1', to: 'bath-1', type: 'door' },
+    ],
+  }
+}
+
+function localStructuralPlan(): LayoutPlan {
+  return {
+    footprint: { width: 10, depth: 6 },
+    entry: { roomId: 'ldk' },
+    rooms: [
+      { id: 'ldk', name: 'LDK', type: 'living_kitchen', polygon: rect(0, 0, 6, 6), requiresExteriorWindow: true },
+      { id: 'bed1', name: '卧室1', type: 'bedroom', polygon: rect(6, 0, 4, 3), requiresExteriorWindow: true },
+      { id: 'bed2', name: '卧室2', type: 'bedroom', polygon: rect(6, 3, 4, 3), requiresExteriorWindow: true },
+    ],
+    connections: [
+      { from: 'ldk', to: 'bed1', type: 'door' },
+      { from: 'ldk', to: 'bed2', type: 'door' },
+      { from: 'bed1', to: 'bed2', type: 'door' },
     ],
   }
 }
@@ -126,6 +145,44 @@ describe('validation application service', () => {
     })
     expect(validationValue<string[]>(results, VALIDATOR_IDS.modificationProtection)).toEqual(expected)
     expect(directValidationResults(results)).toEqual([])
+  })
+
+  test('records local structural outcomes and validation through the registry', async () => {
+    const before = localStructuralPlan()
+    const outcome = applyLocalStructuralEdits(before, [{
+      op: {
+        operationId: 'op-0',
+        op: 'add_room',
+        room: { name: '储物间', type: 'storage', targetAreaSqm: 3 },
+        near: 'ldk',
+      },
+    }], DEFAULT_NORM_PROFILE)
+    expect(outcome.ok).toBe(true)
+    if (!outcome.ok) return
+    const validation = validateModifiedLayoutPlan({
+      before,
+      after: outcome.plan,
+      affectedRoomIds: outcome.affectedRoomIds,
+      profile: DEFAULT_NORM_PROFILE,
+    })
+    const results = await createValidationRegistry().runStage('modify', {
+      localStructuralEdit: { outcome },
+      localStructuralValidation: { result: validation },
+    })
+    expect(directValidationResults(results).map(result => result.validatorId)).toEqual([
+      VALIDATOR_IDS.localStructuralEdit,
+      VALIDATOR_IDS.localStructuralValidation,
+    ])
+    expect(results.find(result => result.validatorId === VALIDATOR_IDS.localStructuralEdit)?.summary)
+      .toMatchObject({
+        operationOutcomes: ['op-0:add_room:applied:local_add_applied'],
+        operationCount: 1,
+      })
+    expect(results.find(result => result.validatorId === VALIDATOR_IDS.localStructuralValidation)?.summary)
+      .toMatchObject({
+        fatalCount: 0,
+        warningCount: validation.warnings.length,
+      })
   })
 
   test('records local patch scope as a direct stopping result without node details', async () => {

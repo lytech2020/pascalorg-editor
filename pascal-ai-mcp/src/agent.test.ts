@@ -640,6 +640,19 @@ describe('ingest state machine: planIngestAction', () => {
     expect(plan).toEqual({ kind: 'route-existing', message: '在南墙加一扇窗' })
   })
 
+  test('an explicit text acknowledgement bypasses intent classification for an uncertain write', () => {
+    const s = session({
+      phase: 'completed_with_issues',
+      sceneId: 'scene-1',
+      modificationWriteEffect: 'write_attempted',
+    })
+    const plan = planIngestAction(input({ message: '确认' }), s)
+    expect(plan).toMatchObject({ kind: 'route', next: 'modify' })
+    expect(s.phase).toBe('modifying')
+    expect(s.pendingModification).toBe('确认')
+    expect(s.modificationWriteEffect).toBe('write_attempted')
+  })
+
   test('an over-long message is rejected before any work', () => {
     const plan = planIngestAction(input({ message: 'x'.repeat(5001) }), session())
     expect(plan.kind).toBe('reply')

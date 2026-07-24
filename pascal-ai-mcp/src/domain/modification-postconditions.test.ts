@@ -92,6 +92,58 @@ describe('modification postconditions', () => {
     })).toEqual([{ code: 'room_connection_missing', operationIndex: 0 }])
   })
 
+  test('resolves a living-room alias when checking an added room connection', () => {
+    const ldkBefore: LayoutPlan = {
+      ...before,
+      rooms: before.rooms.map(room => room.id === 'living'
+        ? { ...room, name: 'LDK', type: 'living_kitchen' as const }
+        : room),
+    }
+    const storage = {
+      id: 'storage',
+      name: '储物间',
+      type: 'storage' as const,
+      polygon: [[4.5, 0], [5.5, 0], [5.5, 2], [4.5, 2]] as Array<[number, number]>,
+      requiresExteriorWindow: false,
+    }
+    const after: LayoutPlan = {
+      ...ldkBefore,
+      rooms: [...ldkBefore.rooms, storage],
+      connections: [
+        ...ldkBefore.connections,
+        { from: 'living', to: 'storage', type: 'door' },
+      ],
+    }
+    expect(validateModificationPostconditions({
+      before: ldkBefore,
+      after,
+      plan: {
+        ops: [{
+          op: 'add_room',
+          room: { name: '储物间', type: 'storage', targetAreaSqm: 2 },
+          near: '客厅',
+        }],
+      },
+    })).toEqual([])
+  })
+
+  test('only the final rename for one stable room identity is authoritative', () => {
+    const after: LayoutPlan = {
+      ...before,
+      rooms: before.rooms.map(room => room.id === 'bed' ? { ...room, name: '儿童房' } : room),
+    }
+    expect(validateModificationPostconditions({
+      before,
+      after,
+      plan: {
+        ops: [
+          { op: 'rename_room', room: '主卧', name: '书房' },
+          { op: 'rename_room', room: '主卧', name: '儿童房' },
+        ],
+      },
+    })).toEqual([])
+  })
+
   test('a generic bathroom removal requires every split bathroom component to be gone', () => {
     const splitBefore: LayoutPlan = {
       ...before,

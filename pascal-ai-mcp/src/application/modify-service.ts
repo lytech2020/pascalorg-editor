@@ -80,6 +80,40 @@ export async function runModifyWorkflow(
     return { session, reply: t(session.language, 'modifyNoScene', {}), next: 'finish' }
   }
 
+  // §7 write-effect isolation: every modify attempt must start from a clean
+  // per-request side-effect state. A leftover uncertain/destructive flag on the
+  // session means a PREVIOUS attempt ended without resolving its write (a crash
+  // or a process restart) — do NOT let it pollute this attempt's failure
+  // attribution, and do NOT pretend the scene is fine. Surface it and ask the
+  // user to check/reload before running a fresh edit.
+  const priorWriteEffect = session.modificationWriteEffect
+  const priorWriteUncertain = session.destructiveSceneWriteStarted === true
+    || priorWriteEffect === 'write_attempted'
+    || priorWriteEffect === 'partial_write_confirmed'
+  if (priorWriteUncertain) {
+    if (isWriteAcknowledgement(state.input)) {
+      resetPerRequestWriteEffect(session)
+      clearPendingModificationState(session)
+      delete session.layoutIntent
+      delete session.layoutPlan
+      delete session.strategy
+      delete session.zoneRoomTypes
+      delete session.programEditedByModify
+      session.phase = session.sceneResult || session.sceneId ? 'completed_with_issues' : 'failed'
+      const reply = t(session.language, 'modifyPriorWriteAcknowledged', { sceneId })
+      session.messages.push({ role: 'assistant', content: reply })
+      dependencies.persistSession(session)
+      return { session, reply, next: 'finish' }
+    }
+    clearPendingModificationState(session)
+    session.phase = session.sceneResult || session.sceneId ? 'completed_with_issues' : 'failed'
+    const reply = t(session.language, 'modifyPriorWriteUncertain', { sceneId })
+    session.messages.push({ role: 'assistant', content: reply })
+    dependencies.persistSession(session)
+    return { session, reply, next: 'finish' }
+  }
+  resetPerRequestWriteEffect(session)
+
   try {
     session.toolTrace = []
     dependencies.persistSession(session)
@@ -169,19 +203,11 @@ export async function runModifyWorkflow(
     const clearModifyState = () => {
       delete session.destructiveSceneWriteStarted
       delete session.modificationWriteEffect
-      delete session.pendingModification
-      delete session.pendingOperation
-      delete session.pendingModificationMode
-      delete session.pendingModificationReasonCode
-      delete session.pendingModificationPlanHash
-      delete session.pendingModifyPlan
-      delete session.pendingClearTargets
-      delete session.modifyModeConfirmed
-      delete session.modifyDriftConfirmed
+      clearPendingModificationState(session)
     }
     if (writeEffect === 'write_confirmed' || writeEffect === 'partial_write_confirmed') {
       clearModifyState()
-      session.phase = session.sceneResult ? 'completed_with_issues' : 'failed'
+      session.phase = session.sceneResult || session.sceneId ? 'completed_with_issues' : 'failed'
       const reply = t(session.language, 'modifyDestructiveFailed', {
         sceneId,
         error: dependencies.errorMessage(error),
@@ -192,8 +218,8 @@ export async function runModifyWorkflow(
     if (writeEffect === 'write_attempted') {
       // A mutation's result is unknown (transport failure). Do not claim the
       // scene is fine, and do not auto-retry — surface the uncertainty.
-      clearModifyState()
-      session.phase = session.sceneResult ? 'completed_with_issues' : 'failed'
+      clearPendingModificationState(session)
+      session.phase = session.sceneResult || session.sceneId ? 'completed_with_issues' : 'failed'
       const reply = t(session.language, 'modifyResultUnknown', {
         sceneId,
         error: dependencies.errorMessage(error),
@@ -208,6 +234,23 @@ export async function runModifyWorkflow(
     }
     return finishModificationFailure(session, 'failed', dependencies.errorMessage(error))
   }
+}
+
+function clearPendingModificationState(session: WorkflowSession): void {
+  delete session.pendingModification
+  delete session.pendingOperation
+  delete session.pendingModificationMode
+  delete session.pendingModificationReasonCode
+  delete session.pendingModificationPlanHash
+  delete session.pendingModifyPlan
+  delete session.pendingClearTargets
+  delete session.modifyModeConfirmed
+  delete session.modifyDriftConfirmed
+}
+
+function isWriteAcknowledgement(input: WorkflowGraphState['input']): boolean {
+  const message = input.message?.trim() ?? ''
+  return /^(?:确认|我已确认|已检查并确认|確認|確認しました|confirm|confirmed)$/iu.test(message)
 }
 
 export function effectiveGateFailures(
@@ -268,4 +311,9 @@ export function finishModificationFailure(
 
 function finiteNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function resetPerRequestWriteEffect(session: WorkflowSession): void {
+  delete session.modificationWriteEffect
+  delete session.destructiveSceneWriteStarted
 }

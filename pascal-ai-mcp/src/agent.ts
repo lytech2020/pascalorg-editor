@@ -25,7 +25,7 @@ import {
   type FurnitureModifyReport,
   type ManualItem,
 } from './furniture-modify'
-import { absorbRoomsInPlan, partitionLayout } from './layout-partitioner'
+import { partitionLayout } from './layout-partitioner'
 import {
   applyModifyOps,
   parseModifyOps,
@@ -33,10 +33,20 @@ import {
   type FurnitureModifyOp,
   type ModifyPlan,
   type SkippedFurnitureOp,
+  type StructuralModifyOp,
 } from './modify-ops'
 import { computeLayoutQuality } from './layout-metrics'
-import { kitchenIsCirculation } from './layout-plan'
-import type { IssueL10n, LayoutIntent, LayoutPlan, RoomType } from './layout-plan'
+import { footprintArea, kitchenIsCirculation } from './layout-plan'
+import type { IssueL10n, LayoutIntent, LayoutIntentRoom, LayoutPlan, RoomType } from './layout-plan'
+import {
+  applyLocalStructuralEdits,
+  type LocalEditReasonCode,
+  type StructuralOpBinding,
+} from './domain/local-structural-edit'
+import {
+  validateModifiedLayoutPlan,
+  type ModifyValidationResult,
+} from './domain/local-structural-validation'
 import { buildLayoutPlan, type PlanBuildResult } from './plan-builder'
 import type { PlanTargets, PlanValidation } from './plan-validator'
 import { combineWriteEffects, executeLayoutPlan, toolPayload, type McpCaller, type SceneExecutionReport, type WriteEffectState } from './scene-executor'
@@ -57,7 +67,6 @@ import {
 } from './domain/local-patch-scope'
 import {
   normalizeSemanticRemovalPlan,
-  removalIntentRoomIdsForRef,
   removalRoomIdsForRef,
   validateExecutedPlan,
   validatePreservedPlan,
@@ -1722,139 +1731,20 @@ export class PascalAiAgent {
     delete session.modifyDriftConfirmed
     const profile = resolveNormProfile(this.config.normProfile)
 
-    // 局部删除吸收（§6，2026-07-14 语义修订，用户实测反馈驱动）：单独的
-    // remove_room 优先把房间矩形并入共享边最长的邻室——其余房间坐标一个
-    // 不动，footprint/总面积不变。候选邻室逐个过形状预检（并集长宽比 ≤
-    // maxRoomAspect，在 absorbRoomInPlan 循环内），全部不合格、几何上不可行
-    //（删走廊、玄关宿主、会产生孤房、并集不成单一多边形）或并集触发面积
-    // fatal 时，才落回下面的稳定性重分区（此时布局变化不可避免，notes 如实告知）。
-    if (parsed.plan.ops.length === 1 && parsed.plan.ops[0]!.op === 'remove_room') {
-      const removeOp = parsed.plan.ops[0] as { op: 'remove_room'; room: string }
-      const planRoomIds = removalRoomIdsForRef(session.layoutPlan, removeOp.room)
-      const intentRoomIds = removalIntentRoomIdsForRef(session.layoutIntent, removeOp.room)
-      if (planRoomIds.length > 0 && intentRoomIds.length > 0) {
-        const absorbed = absorbRoomsInPlan(
-          session.layoutPlan,
-          planRoomIds,
-          profile.partition.maxRoomAspect,
-        )
-        if (absorbed) {
-          const absorberIds = new Set(absorbed.absorbedInto.map(room => room.id))
-          if (absorberIds.size !== 1) {
-            await this.recordPreservationFindings(session, [{ code: 'strict_local_no_safe_plan' }])
-            return this.finishSafeModificationRejection(
-              session,
-              t(session.language, 'modifyStrictLocalUnavailable', {
-                reason: 'strict_local_no_safe_plan',
-              }),
-            )
-          }
-          const removedIntentIds = new Set(intentRoomIds)
-          const localRooms = session.layoutIntent.rooms
-            .filter(room => !removedIntentIds.has(room.id))
-            .map(room => {
-              const planned = absorbed.plan.rooms.find(candidate => candidate.id === room.id)
-              return planned
-                ? { ...room, targetAreaSqm: Math.round(polygonArea(planned.polygon) * 10) / 10 }
-                : room
-            })
-          const localIntent: LayoutIntent = {
-            targetTotalAreaSqm: session.layoutIntent.targetTotalAreaSqm,
-            rooms: localRooms,
-          }
-          const localAdjacency = session.layoutIntent.adjacency
-            ?.filter(pair => !removedIntentIds.has(pair.a) && !removedIntentIds.has(pair.b))
-          if (localAdjacency && localAdjacency.length > 0) localIntent.adjacency = localAdjacency
-          const localValidationResults = await this.runValidationStage(session, 'modify', {
-            layoutPlan: {
-              plan: absorbed.plan,
-              targets: gateTargetsForSession({
-                brief: session.brief,
-                layoutIntent: localIntent,
-                programEditedByModify: true,
-              }),
-              profile,
-            },
-          }, false)
-          const localValidation = validationValue<PlanValidation>(
-            localValidationResults,
-            VALIDATOR_IDS.layoutPlan,
-          )
-          if (localValidation.fatal.length === 0) {
-            const preservationFindings = await this.recordPreservationFindings(
-              session,
-              validatePreservedPlan(beforePlan, absorbed.plan, parsed.plan),
-            )
-            if (preservationFindings.length > 0) {
-              return this.finishSafeModificationRejection(
-                session,
-                t(session.language, 'modifyStrictLocalUnavailable', {
-                  reason: preservationFindings[0]!.code,
-                }),
-              )
-            }
-            await this.runValidationStage(session, 'modify', {
-              layoutPlan: {
-                plan: absorbed.plan,
-                targets: gateTargetsForSession({
-                  brief: session.brief,
-                  layoutIntent: localIntent,
-                  programEditedByModify: true,
-                }),
-                profile,
-              },
-            })
-            return this.rebuildScenePlanFirst({
-              session,
-              sceneId,
-              loadedVersion,
-              trace,
-              traceMcp,
-              beforeCall,
-              zones,
-              intent: localIntent,
-              plan: absorbed.plan,
-              planNotes: [
-                `重建方案：目标对应的 ${planRoomIds.length} 个空间已局部吸收，其余房间规划位置保持不变`,
-              ],
-              // Re-derived from the post-removal intent — the absorbed plan
-              // keeps its geometry either way, but the snapshot must not
-              // carry a strategy (e.g. tanoji) the new room count no longer
-              // satisfies.
-              strategy: deriveStrategy(deriveBriefFacts(session.summary || formatSummary(session.brief)), {
-                totalAreaSqm: localIntent.targetTotalAreaSqm,
-                requiredRooms: [...localIntent.rooms.reduce((acc, room) => {
-                  acc.set(room.type, (acc.get(room.type) ?? 0) + 1)
-                  return acc
-                }, new Map<RoomType, number>())].map(([type, count]) => ({ type, count })),
-              }, profile),
-              furnitureOps: [],
-              skippedFurnitureOps: [],
-              appliedNotes: [],
-              baselineGateFailures,
-              beforePlan,
-              modifyPlan: parsed.plan,
-            })
-          }
-        }
-      }
-      if (parsed.plan.preservation?.mode === 'strict_local') {
-        await this.recordPreservationFindings(session, [{ code: 'strict_local_no_safe_plan' }])
-        return this.finishSafeModificationRejection(
-          session,
-          t(session.language, 'modifyStrictLocalUnavailable', {
-            reason: 'strict_local_no_safe_plan',
-          }),
-        )
+    // Rename pairs resolve against the PRE-edit intent (old name → zone).
+    const renameByRoomId = new Map<string, { roomId: string; oldName: string; newName: string }>()
+    for (const op of parsed.plan.ops) {
+      if (op.op !== 'rename_room') continue
+      const resolved = resolveRoomRef(op.room, session.layoutIntent.rooms)
+      if ('room' in resolved) {
+        renameByRoomId.set(resolved.room.id, {
+          roomId: resolved.room.id,
+          oldName: resolved.room.name,
+          newName: op.name,
+        })
       }
     }
-
-    // Rename pairs resolve against the PRE-edit intent (old name → zone).
-    const renames = parsed.plan.ops.flatMap(op => {
-      if (op.op !== 'rename_room') return []
-      const resolved = resolveRoomRef(op.room, session.layoutIntent!.rooms)
-      return 'room' in resolved ? [{ oldName: resolved.room.name, newName: op.name }] : []
-    })
+    const renames = [...renameByRoomId.values()]
     const applied = applyModifyOps(session.layoutIntent, parsed.plan, profile)
     if (applied.errors.length > 0) return this.rejectPlanFirstModify(session, applied.errors)
 
@@ -1881,7 +1771,7 @@ export class PascalAiAgent {
       const renamedPlan: LayoutPlan = {
         ...session.layoutPlan,
         rooms: session.layoutPlan.rooms.map(room => {
-          const entry = renames.find(rename => rename.oldName === room.name)
+          const entry = renames.find(rename => rename.roomId === room.id)
           return entry ? { ...room, name: entry.newName } : room
         }),
       }
@@ -1971,9 +1861,149 @@ export class PascalAiAgent {
       })
     }
 
-    // Re-partition the edited intent under the stability constraint (§4),
-    // validate, then rebuild the scene deterministically (§6: v1 = full
-    // structural rebuild, zero model calls).
+    // --- structural path (§8 通用局部结构增删改) ---------------------------
+    // Try the DETERMINISTIC LOCAL engine first: add_room carves from a host,
+    // remove_room absorbs into a neighbour, resize_room slides one shared wall
+    // — every other room keeps its exact polygon and the footprint/total area
+    // never change. Only when the edit cannot be done safely — and the request
+    // permits it — do we fall back to a full stability re-partition. The local
+    // plan is validated with the MODIFY-specific diff validator, which
+    // grandfathers pre-existing issues on unrelated rooms (生成严格、修改增量化).
+    const structuralOps = parsed.plan.ops.filter(
+      (op): op is StructuralModifyOp =>
+        op.op === 'add_room' || op.op === 'remove_room' || op.op === 'resize_room',
+    )
+    const bindings: StructuralOpBinding[] = structuralOps.map(op => ({
+      op,
+      removalIds: op.op === 'remove_room'
+        ? removalRoomIdsForRef(session.layoutPlan!, op.room)
+        : undefined,
+    }))
+    const local = applyLocalStructuralEdits(session.layoutPlan, bindings, profile)
+    await this.runValidationStage(session, 'modify', {
+      localStructuralEdit: { outcome: local },
+    })
+    trace.notes = [
+      ...(trace.notes ?? []),
+      ...local.results.map(result => `local:${result.op}:${result.status}:${result.reasonCode}`),
+    ]
+    if (local.ok) {
+      // Apply any rename_room ops the engine left untouched (renames are pure
+      // metadata — matched old-name → room on the locally-edited plan) so a
+      // mixed "扩大主卧并把次卧改名儿童房" keeps the rename.
+      const localPlan: LayoutPlan = renames.length > 0
+        ? {
+          ...local.plan,
+          rooms: local.plan.rooms.map(room => {
+            const entry = renames.find(rename => rename.roomId === room.id)
+            return entry ? { ...room, name: entry.newName } : room
+          }),
+        }
+        : local.plan
+      const localValidationResults = await this.runValidationStage(session, 'modify', {
+        localStructuralValidation: {
+          result: validateModifiedLayoutPlan({
+            before: beforePlan,
+            after: localPlan,
+            affectedRoomIds: local.affectedRoomIds,
+            profile,
+          }),
+        },
+      })
+      const modifyValidation = validationValue<ModifyValidationResult>(
+        localValidationResults,
+        VALIDATOR_IDS.localStructuralValidation,
+      )
+      if (modifyValidation.fatal.length === 0) {
+        const preservationFindings = await this.recordPreservationFindings(
+          session,
+          validatePreservedPlan(beforePlan, localPlan, parsed.plan),
+        )
+        if (preservationFindings.length > 0) {
+          return this.finishSafeModificationRejection(
+            session,
+            t(session.language, 'modifyStrictLocalUnavailable', { reason: preservationFindings[0]!.code }),
+          )
+        }
+        const localIntent = intentFromLocalPlan(localPlan)
+        const localStrategy = deriveStrategy(
+          briefFactsFor(session.brief, session.summary || formatSummary(session.brief)),
+          planTargetsForIntent(localIntent),
+          profile,
+        )
+        const hasRemainingWrites = local.changed
+          || renames.length > 0
+          || applied.furnitureOps.length > 0
+        if (!hasRemainingWrites) {
+          session.layoutIntent = localIntent
+          session.layoutPlan = localPlan
+          session.strategy = localStrategy
+          session.programEditedByModify = true
+          this.persistSession(session)
+          await this.verifyModificationPostconditions(session, validateModificationPostconditions({
+            before: beforePlan,
+            after: localPlan,
+            plan: parsed.plan,
+          }))
+          trace.converged = true
+          return this.finishPlanFirstModify(session, sceneId, loadedVersion, trace, {
+            okDetails: [...applied.notes, ...local.notes],
+            failedDetails: [],
+            baselineGateFailures,
+            sceneWasWritten: false,
+          })
+        }
+        return this.rebuildScenePlanFirst({
+          session,
+          sceneId,
+          loadedVersion,
+          trace,
+          traceMcp,
+          beforeCall,
+          zones,
+          intent: localIntent,
+          plan: localPlan,
+          planNotes: local.notes,
+          strategy: localStrategy,
+          furnitureOps: applied.furnitureOps,
+          skippedFurnitureOps: applied.skippedFurnitureOps,
+          appliedNotes: applied.notes,
+          baselineGateFailures,
+          beforePlan,
+          modifyPlan: parsed.plan,
+        })
+      }
+      // Geometrically valid but introduces or worsens a fatal issue — record
+      // the structured findings and fall through to preservation-mode gating.
+      trace.notes = [
+        ...(trace.notes ?? []),
+        ...modifyValidation.fatal.map(finding => `modify-validation:${finding.code}:${finding.reason}`),
+      ]
+    }
+    // The local edit could not be applied safely. Honour the request's
+    // preservation intent — strict_local & best_effort NEVER auto-rebuild
+    // (§6.5：不允许局部失败后自动整体重排).
+    const localReason: LocalEditReasonCode = local.ok
+      ? 'geometry_would_be_invalid'
+      : local.rejection.reasonCode
+    const preservationMode = parsed.plan.preservation?.mode ?? 'allow_rebuild'
+    if (preservationMode === 'strict_local') {
+      return this.finishSafeModificationRejection(
+        session,
+        t(session.language, 'modifyStrictLocalUnavailable', { reason: localReason }),
+      )
+    }
+    if (preservationMode === 'best_effort') {
+      return this.finishSafeModificationRejection(
+        session,
+        t(session.language, 'modifyLocalRebuildOffer', { reason: localReason }),
+      )
+    }
+
+    // allow_rebuild: fall back to a full stability re-partition (§6.4.3 — the
+    // user already confirmed a structural rebuild for this plan). Re-partition
+    // the edited intent under the stability constraint (§4), validate, then
+    // rebuild the scene deterministically (§6: zero model calls).
     const intent = applied.intent
     const requiredRooms = [...intent.rooms.reduce((acc, room) => {
       acc.set(room.type, (acc.get(room.type) ?? 0) + 1)
@@ -3996,6 +4026,35 @@ function renderPlanFailure(message: string, l10n: IssueL10n | null, lang: Lang):
  * the model could see them in the tool result but nothing surfaced them in
  * the final reply. This captures human-readable notes for both cases.
  */
+// Re-derive a LayoutIntent from a locally-edited plan so gates, drift checks
+// and future modifies keep a snapshot that MATCHES the real geometry: room
+// areas come straight from the polygons and the total is the (unchanged)
+// footprint area — a local edit never grows the building (§8).
+function intentFromLocalPlan(plan: LayoutPlan): LayoutIntent {
+  const rooms: LayoutIntentRoom[] = plan.rooms.map(room => ({
+    id: room.id,
+    name: room.name,
+    type: room.type,
+    targetAreaSqm: Math.round(polygonArea(room.polygon) * 10) / 10,
+    ...(room.requiresExteriorWindow ? { requiresExteriorWindow: true } : {}),
+  }))
+  const intent: LayoutIntent = {
+    targetTotalAreaSqm: Math.round(footprintArea(plan.footprint) * 10) / 10,
+    rooms,
+  }
+  const adjacency = plan.connections.map(connection => ({ a: connection.from, b: connection.to }))
+  if (adjacency.length > 0) intent.adjacency = adjacency
+  return intent
+}
+
+function planTargetsForIntent(intent: LayoutIntent): PlanTargets {
+  const requiredRooms = [...intent.rooms.reduce((acc, room) => {
+    acc.set(room.type, (acc.get(room.type) ?? 0) + 1)
+    return acc
+  }, new Map<RoomType, number>())].map(([type, count]) => ({ type, count }))
+  return { totalAreaSqm: intent.targetTotalAreaSqm, requiredRooms }
+}
+
 // Creates a fresh per-phase trace and registers it on the session. Kept on
 // the session (not a local) so a phase that *throws* — e.g. structure
 // non-convergence — still leaves its trace in the persisted session for the

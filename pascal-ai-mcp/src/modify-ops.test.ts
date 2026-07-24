@@ -92,7 +92,7 @@ describe('resolveRoomRef', () => {
 describe('applyModifyOps', () => {
   const profile = DEFAULT_NORM_PROFILE
 
-  test('add_room appends with unique id, adjacency and total-area bump', () => {
+  test('add_room appends with unique id and adjacency, carving from the existing footprint (§6.1)', () => {
     const { intent, structural, notes, errors } = applyModifyOps(两居, {
       ops: [{ op: 'add_room', room: { name: '书房', type: 'study', targetAreaSqm: 7 }, near: '客厅' }],
     }, profile)
@@ -100,12 +100,55 @@ describe('applyModifyOps', () => {
     expect(structural).toBe(true)
     const study = intent.rooms.find(room => room.type === 'study')
     expect(study?.id).toBe('study-1')
-    expect(intent.targetTotalAreaSqm).toBe(82)
+    // §6.1: total floor area is unchanged — the new room is carved, not appended.
+    expect(intent.targetTotalAreaSqm).toBe(75)
     expect(intent.adjacency).toContainEqual({ a: 'study-1', b: 'living-1' })
     expect(notes.join()).toContain('书房')
     // Source intent untouched.
     expect(两居.rooms).toHaveLength(5)
     expect(两居.targetTotalAreaSqm).toBe(75)
+  })
+
+  test('resolves 客厅 to a combined LDK host for add_room', () => {
+    const source: LayoutIntent = {
+      targetTotalAreaSqm: 50,
+      rooms: [
+        { id: 'ldk-1', name: 'LDK', type: 'living_kitchen', targetAreaSqm: 35 },
+        { id: 'bedroom-1', name: '卧室', type: 'bedroom', targetAreaSqm: 15 },
+      ],
+    }
+    const applied = applyModifyOps(source, {
+      ops: [{ op: 'add_room', room: { name: '储物间', type: 'storage', targetAreaSqm: 2 }, near: '客厅' }],
+    }, profile)
+    expect(applied.errors).toEqual([])
+    expect(applied.intent.adjacency).toContainEqual({ a: 'storage-1', b: 'ldk-1' })
+  })
+
+  test('rejects add_room when an explicit host cannot be resolved', () => {
+    const applied = applyModifyOps(两居, {
+      ops: [{
+        op: 'add_room',
+        room: { name: '衣帽间', type: 'storage', targetAreaSqm: 3 },
+        near: '不存在的主卧',
+      }],
+    }, profile)
+    expect(applied.errors).toHaveLength(1)
+    expect(applied.errors[0]).toContain('不存在的主卧')
+    expect(applied.intent.rooms.some(room => room.name === '衣帽间')).toBe(false)
+  })
+
+  test('binds structural room references before applying rename and resize operations', () => {
+    const rename = { op: 'rename_room', room: '主卧', name: '卧室' } as const
+    const resize = { op: 'resize_room', room: '主卧', targetAreaSqm: 10 } as const
+    const renameFirst = applyModifyOps(两居, { ops: [rename, resize] }, profile)
+    const resizeFirst = applyModifyOps(两居, { ops: [resize, rename] }, profile)
+    expect(renameFirst.errors).toEqual([])
+    expect(resizeFirst.errors).toEqual([])
+    expect(renameFirst.intent.rooms).toEqual(resizeFirst.intent.rooms)
+    expect(renameFirst.intent.rooms.find(room => room.id === 'bedroom-1')).toMatchObject({
+      name: '卧室',
+      targetAreaSqm: 10,
+    })
   })
 
   test('remove_room drops the room, its adjacency, and shrinks the total (§8-2)', () => {

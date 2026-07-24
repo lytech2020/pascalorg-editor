@@ -185,7 +185,10 @@ export function resolveRoomRef<T extends ResolvableRoom>(
   if (byName.length > 1) return { error: `「${ref}」匹配到多个同名房间，请用更具体的说法` }
   const type = classifyRoomTypeByName(ref)
   if (type !== 'other') {
-    const byType = rooms.filter(room => room.type === type)
+    const byType = rooms.filter(room =>
+      room.type === type
+      || (type === 'living' && room.type === 'living_kitchen')
+      || (type === 'kitchen' && room.type === 'living_kitchen'))
     if (byType.length === 1) return { room: byType[0]! }
     if (byType.length > 1) {
       return { error: `「${ref}」匹配到多个${ref}类房间（${byType.map(r => r.name).join('、')}），请指明是哪一间` }
@@ -276,6 +279,18 @@ export function applyModifyOps(
   let adjacency = intent.adjacency ? [...intent.adjacency] : undefined
   let totalArea = intent.targetTotalAreaSqm
   let structural = false
+  const boundStructuralRoomIds = new Map<StructuralModifyOp, string>()
+
+  // Resolve every existing-room reference against the PRE-EDIT intent before
+  // mutating names or geometry. Otherwise a mixed rename+resize plan can work
+  // or fail solely because of the order emitted by the model.
+  for (const op of plan.ops) {
+    if (op.op !== 'remove_room' && op.op !== 'resize_room' && op.op !== 'rename_room') continue
+    const structuralOp: StructuralModifyOp = op
+    const resolved = resolveRoomRef(structuralOp.room, intent.rooms)
+    if ('error' in resolved) errors.push(resolved.error)
+    else boundStructuralRoomIds.set(structuralOp, resolved.room.id)
+  }
 
   // Structural ops apply first, furniture ops resolve afterwards against the
   // final room set — the outcome of a mixed plan must not depend on the order
@@ -291,6 +306,11 @@ export function applyModifyOps(
       const check = checkAreaBounds(sop.room.type, area, sop.room.name, { ...intent, rooms, targetTotalAreaSqm: totalArea }, profile)
       if (check.error) { errors.push(check.error); continue }
       if (check.warning) notes.push(check.warning)
+      const near = sop.near ? resolveRoomRef(sop.near, rooms) : null
+      if (near && 'error' in near) {
+        errors.push(near.error)
+        continue
+      }
       const id = uniqueRoomId(sop.room.type, rooms)
       rooms = [...rooms, {
         id,
@@ -298,19 +318,17 @@ export function applyModifyOps(
         type: sop.room.type,
         ...(sop.room.targetAreaSqm !== undefined ? { targetAreaSqm: sop.room.targetAreaSqm } : {}),
       }]
-      if (sop.near) {
-        const near = resolveRoomRef(sop.near, rooms)
-        if ('error' in near) {
-          notes.push(`邻接意愿「${sop.near}」未能解析（${near.error}），忽略`)
-        } else {
-          adjacency = [...(adjacency ?? []), { a: id, b: near.room.id }]
-        }
+      if (near && 'room' in near) {
+        adjacency = [...(adjacency ?? []), { a: id, b: near.room.id }]
       }
-      totalArea = round1(totalArea + area)
-      notes.push(`新增「${sop.room.name}」（${area}㎡），总面积调整为 ${totalArea}㎡`)
+      // §6.1：新增房间默认从既有 footprint 内切出，不扩大整套户型面积——
+      // 总面积保持不变，由分区器/局部引擎从宿主房间划出空间。
+      notes.push(`新增「${sop.room.name}」（${area}㎡），从既有 footprint 内切出，总面积 ${totalArea}㎡ 不变`)
       structural = true
     } else if (sop.op === 'remove_room') {
-      const resolved = resolveRoomRef(sop.room, rooms)
+      const boundId = boundStructuralRoomIds.get(sop)
+      if (!boundId) continue
+      const resolved = resolveRoomRef(boundId, rooms)
       if ('error' in resolved) { errors.push(resolved.error); continue }
       if (rooms.length <= 1) { errors.push('不能删除最后一个房间'); continue }
       const target = resolved.room
@@ -326,7 +344,9 @@ export function applyModifyOps(
       notes.push(`删除「${target.name}」（${area}㎡），总面积调整为 ${totalArea}㎡`)
       structural = true
     } else if (sop.op === 'resize_room') {
-      const resolved = resolveRoomRef(sop.room, rooms)
+      const boundId = boundStructuralRoomIds.get(sop)
+      if (!boundId) continue
+      const resolved = resolveRoomRef(boundId, rooms)
       if ('error' in resolved) { errors.push(resolved.error); continue }
       const target = resolved.room
       const check = checkAreaBounds(target.type, sop.targetAreaSqm, target.name, { ...intent, rooms, targetTotalAreaSqm: totalArea }, profile)
@@ -339,7 +359,9 @@ export function applyModifyOps(
       structural = true
     } else {
       // rename_room：纯元数据，不触发重分区（§3）。
-      const resolved = resolveRoomRef(sop.room, rooms)
+      const boundId = boundStructuralRoomIds.get(sop)
+      if (!boundId) continue
+      const resolved = resolveRoomRef(boundId, rooms)
       if ('error' in resolved) { errors.push(resolved.error); continue }
       const target = resolved.room
       rooms = rooms.map(room => room.id === target.id ? { ...room, name: sop.name } : room)

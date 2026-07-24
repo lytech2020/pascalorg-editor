@@ -1,7 +1,7 @@
 import type { LayoutPlan } from '../layout-plan'
 import { polygonArea } from '../layout-plan'
 import type { FurnitureModifyReport } from '../furniture-modify'
-import type { ModifyPlan } from '../modify-ops'
+import { resolveRoomRef, type ModifyPlan } from '../modify-ops'
 import { removalRoomIdsForRef } from './modification-preservation'
 
 export const MODIFICATION_POSTCONDITION_CODES = [
@@ -43,7 +43,7 @@ export type ModificationPostconditionFinding = {
 // 19.2㎡) fails instead of silently passing (P2-7). The upper tolerance is
 // max(0.5, 10%): enough to absorb the partitioner's grid/corridor overhead, not
 // enough to call a materially larger room "exact".
-function areaSatisfiesTarget(actual: number, target: number, mode: 'exact' | 'at_least'): boolean {
+export function areaSatisfiesTarget(actual: number, target: number, mode: 'exact' | 'at_least'): boolean {
   if (actual < target - 0.05) return false
   if (mode === 'at_least') return true
   return actual <= target + Math.max(0.5, target * 0.1)
@@ -57,6 +57,14 @@ export function validateModificationPostconditions(options: {
 }): ModificationPostconditionFinding[] {
   const { before, after, plan, furnitureReport } = options
   const findings: ModificationPostconditionFinding[] = []
+  const finalRenameIndexByRoomId = new Map<string, number>()
+  if (before) {
+    for (const [operationIndex, op] of plan.ops.entries()) {
+      if (op.op !== 'rename_room') continue
+      const resolved = resolveRoomRef(op.room, before.rooms)
+      if ('room' in resolved) finalRenameIndexByRoomId.set(resolved.room.id, operationIndex)
+    }
+  }
   // R2.4 / P2-5: furniture results are matched to their op by stable
   // operationId, never by array position. Deliberately skipped operations also
   // have explicit results; a missing result is therefore an execution/accounting
@@ -78,14 +86,20 @@ export function validateModificationPostconditions(options: {
       const added = addedRoom !== undefined
       if (!added) findings.push({ code: 'room_not_added', operationIndex })
       else {
-        const nearRoom = op.near
-          ? after.rooms.find(room => room.id === op.near || room.name === op.near)
+        const beforeNear = op.near
+          ? resolveRoomRef(op.near, before.rooms)
           : undefined
+        const afterNear = op.near && (!beforeNear || !('room' in beforeNear))
+          ? resolveRoomRef(op.near, after.rooms)
+          : undefined
+        const nearRoomId = beforeNear && 'room' in beforeNear
+          ? beforeNear.room.id
+          : afterNear && 'room' in afterNear ? afterNear.room.id : undefined
         const connected = after.connections.some(connection => {
           const other = connection.from === addedRoom.id
             ? connection.to
             : connection.to === addedRoom.id ? connection.from : undefined
-          return other !== undefined && (!op.near || other === nearRoom?.id)
+          return other !== undefined && (!op.near || other === nearRoomId)
         })
         if (!connected) findings.push({ code: 'room_connection_missing', operationIndex })
       }
@@ -112,7 +126,8 @@ export function validateModificationPostconditions(options: {
         findings.push({ code: 'room_area_target_not_met', operationIndex })
         continue
       }
-      const target = before.rooms.find(room => room.id === op.room || room.name === op.room)
+      const resolved = resolveRoomRef(op.room, before.rooms)
+      const target = 'room' in resolved ? resolved.room : undefined
       const current = target && after.rooms.find(room => room.id === target.id)
       // resize defaults to `exact` — "调整到 N㎡" is the common phrasing, and it
       // must be judged two-sided (R6.2 / P2-7).
@@ -124,7 +139,9 @@ export function validateModificationPostconditions(options: {
         findings.push({ code: 'room_not_renamed', operationIndex })
         continue
       }
-      const target = before.rooms.find(room => room.id === op.room || room.name === op.room)
+      const resolved = resolveRoomRef(op.room, before.rooms)
+      const target = 'room' in resolved ? resolved.room : undefined
+      if (target && finalRenameIndexByRoomId.get(target.id) !== operationIndex) continue
       const current = target && after.rooms.find(room => room.id === target.id)
       if (!current || current.name !== op.name) {
         findings.push({ code: 'room_not_renamed', operationIndex })

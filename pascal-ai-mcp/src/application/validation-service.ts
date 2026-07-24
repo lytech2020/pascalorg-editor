@@ -18,6 +18,8 @@ import type { FurniturePlacementIssue } from '../types'
 import type { LocalPatchScopeFinding } from '../domain/local-patch-scope'
 import type { PreservationFinding } from '../domain/modification-preservation'
 import type { ModificationPostconditionFinding } from '../domain/modification-postconditions'
+import type { LocalEditOutcome } from '../domain/local-structural-edit'
+import type { ModifyValidationResult } from '../domain/local-structural-validation'
 import type { DiagnosticsSummary } from './generate-service'
 
 export const VALIDATOR_IDS = {
@@ -31,6 +33,8 @@ export const VALIDATOR_IDS = {
   localPatchScope: 'local-patch-scope',
   modificationPreservation: 'modification-preservation',
   modificationPostconditions: 'modification-postconditions',
+  localStructuralEdit: 'local-structural-edit',
+  localStructuralValidation: 'local-structural-validation',
   sceneDiagnostics: 'scene-diagnostics',
 } as const
 
@@ -41,6 +45,8 @@ export type DirectValidatorId =
   | typeof VALIDATOR_IDS.localPatchScope
   | typeof VALIDATOR_IDS.modificationPreservation
   | typeof VALIDATOR_IDS.modificationPostconditions
+  | typeof VALIDATOR_IDS.localStructuralEdit
+  | typeof VALIDATOR_IDS.localStructuralValidation
 
 export type ValidationUnavailableReason = 'cancelled' | 'timeout' | 'tool_error'
 
@@ -69,6 +75,8 @@ export type ValidationContext = {
   localPatchScope?: { findings: LocalPatchScopeFinding[] }
   modificationPreservation?: { findings: PreservationFinding[] }
   modificationPostconditions?: { findings: ModificationPostconditionFinding[] }
+  localStructuralEdit?: { outcome: LocalEditOutcome }
+  localStructuralValidation?: { result: ModifyValidationResult }
   sceneDiagnostics?: DiagnosticsSummary
   unavailable?: {
     validatorId: DirectValidatorId
@@ -304,6 +312,58 @@ export function createValidationRegistry(): ValidationRegistry<ValidationContext
         },
         disposition: findings.length === 0 ? 'continue' as const : 'stop' as const,
         value: findings,
+      }
+    },
+  })
+
+  registry.register({
+    id: VALIDATOR_IDS.localStructuralEdit,
+    stages: ['modify'],
+    scope: 'local-structural-edit',
+    severity: 'error',
+    inputRequirements: ['local structural operation outcomes'],
+    auditMode: 'direct',
+    canRun: context => context.localStructuralEdit !== undefined,
+    evaluate: context => {
+      const outcome = context.localStructuralEdit!.outcome
+      const operationOutcomes = outcome.results.map(result =>
+        `${result.operationId}:${result.op}:${result.status}:${result.reasonCode}`)
+      return {
+        status: outcome.ok ? 'passed' as const : 'failed' as const,
+        issueCount: outcome.ok ? 0 : 1,
+        summary: {
+          operationOutcomes,
+          operationCount: outcome.results.length,
+          affectedRoomCount: outcome.ok ? outcome.affectedRoomIds.length : 0,
+        },
+        disposition: outcome.ok ? 'continue' as const : 'confirm' as const,
+        value: outcome,
+      }
+    },
+  })
+
+  registry.register({
+    id: VALIDATOR_IDS.localStructuralValidation,
+    stages: ['modify'],
+    scope: 'local-structural-validation',
+    severity: 'error',
+    inputRequirements: ['before/after local structural plans'],
+    auditMode: 'direct',
+    canRun: context => context.localStructuralValidation !== undefined,
+    evaluate: context => {
+      const result = context.localStructuralValidation!.result
+      return {
+        status: result.fatal.length === 0 ? 'passed' as const : 'failed' as const,
+        issueCount: result.fatal.length + result.warnings.length,
+        summary: {
+          fatalCount: result.fatal.length,
+          warningCount: result.warnings.length,
+          fatalKinds: [...new Set(result.fatal.map(finding => finding.code))].sort(),
+          warningKinds: [...new Set(result.warnings.map(finding => finding.code))].sort(),
+          warningReasons: [...new Set(result.warnings.map(finding => finding.reason))].sort(),
+        },
+        disposition: result.fatal.length === 0 ? 'continue' as const : 'stop' as const,
+        value: result,
       }
     },
   })

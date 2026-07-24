@@ -141,13 +141,154 @@ describe('modify application service', () => {
         next: 'modify',
       }, dependencies)
       if (!result.session) throw new Error('expected a session result')
-      expect(result.session.phase).toBe('failed')
+      expect(result.session.phase).toBe('completed_with_issues')
       expect(result.reply).toContain('room_not_renamed')
       expect(result.reply).toContain('禁止自动重试')
       expect(result.session.pendingModification).toBeUndefined()
       expect(result.session.pendingModifyPlan).toBeUndefined()
       expect(result.session.modificationWriteEffect).toBeUndefined()
       expect(clearCalls).toBe(1)
+    } finally {
+      if (previousLegacyFlag === undefined) delete process.env.PASCAL_MODIFY_LEGACY
+      else process.env.PASCAL_MODIFY_LEGACY = previousLegacyFlag
+    }
+  })
+
+  // §7 write-effect isolation: a leftover uncertain write from a PREVIOUS
+  // attempt must NOT run a fresh edit as if the scene were clean, and must NOT
+  // be misattributed to this attempt. Surface it and ask the user to check.
+  test('surfaces a leftover uncertain write instead of polluting the new attempt', async () => {
+    const previousLegacyFlag = process.env.PASCAL_MODIFY_LEGACY
+    delete process.env.PASCAL_MODIFY_LEGACY
+    let planFirstCalls = 0
+    const session = {
+      ...baseSession(),
+      language: 'en' as const,
+      sceneId: 'scene-9',
+      pendingOperation: 'update' as const,
+      // Leftover from a prior modification that never resolved its write.
+      modificationWriteEffect: 'write_attempted' as const,
+    }
+    const dependencies: ModifyWorkflowDependencies = {
+      persistSession: () => {},
+      loadScene: async () => ({ version: 1 }),
+      runPlanFirst: async current => {
+        planFirstCalls++
+        return { session: current, reply: '', next: 'finish' as const }
+      },
+      snapshotScene: async () => ({}),
+      runLegacyPhase: async () => ({ messages: [], toolNamesUsed: new Set(), furnitureIssues: [] }),
+      dedupeSharedWalls: async () => {},
+      checkProtection: async () => [],
+      refine: async () => { throw new Error('refine must not run') },
+      persistScene: async () => null,
+      evaluateGates: async () => ({ report: { passed: true, failures: [] }, layoutQuality: 1 }),
+      clearDestructiveWrite: () => false,
+      isCancellationError: () => false,
+      errorMessage: error => error instanceof Error ? error.message : String(error),
+      planSnapshot: () => '',
+    }
+    try {
+      const result = await runModifyWorkflow({
+        input: { sessionId: session.sessionId }, session, reply: '', next: 'modify',
+      }, dependencies)
+      if (!result.session) throw new Error('expected a session result')
+      // The new edit never ran, and the persistent guard remains until the
+      // user explicitly acknowledges the inspected scene.
+      expect(planFirstCalls).toBe(0)
+      expect(result.session.phase).toBe('completed_with_issues')
+      expect(result.session.modificationWriteEffect).toBe('write_attempted')
+      expect(result.session.destructiveSceneWriteStarted).toBeUndefined()
+      expect(result.reply).toContain('unconfirmed')
+      expect(result.reply).toContain('confirm')
+    } finally {
+      if (previousLegacyFlag === undefined) delete process.env.PASCAL_MODIFY_LEGACY
+      else process.env.PASCAL_MODIFY_LEGACY = previousLegacyFlag
+    }
+  })
+
+  test('explicit confirmation clears an uncertain-write guard and invalidates structural snapshots', async () => {
+    const previousLegacyFlag = process.env.PASCAL_MODIFY_LEGACY
+    delete process.env.PASCAL_MODIFY_LEGACY
+    let planFirstCalls = 0
+    const session = {
+      ...baseSession(),
+      language: 'en' as const,
+      sceneId: 'scene-9',
+      pendingOperation: 'update' as const,
+      modificationWriteEffect: 'write_attempted' as const,
+    }
+    const dependencies: ModifyWorkflowDependencies = {
+      persistSession: () => {},
+      loadScene: async () => ({ version: 1 }),
+      runPlanFirst: async current => {
+        planFirstCalls++
+        return { session: current, reply: '', next: 'finish' as const }
+      },
+      snapshotScene: async () => ({}),
+      runLegacyPhase: async () => ({ messages: [], toolNamesUsed: new Set(), furnitureIssues: [] }),
+      dedupeSharedWalls: async () => {},
+      checkProtection: async () => [],
+      refine: async () => { throw new Error('refine must not run') },
+      persistScene: async () => null,
+      evaluateGates: async () => ({ report: { passed: true, failures: [] }, layoutQuality: 1 }),
+      clearDestructiveWrite: () => false,
+      isCancellationError: () => false,
+      errorMessage: error => error instanceof Error ? error.message : String(error),
+      planSnapshot: () => '',
+    }
+    try {
+      const result = await runModifyWorkflow({
+        input: { sessionId: session.sessionId, message: 'confirm' },
+        session,
+        reply: '',
+        next: 'modify',
+      }, dependencies)
+      if (!result.session) throw new Error('expected a session result')
+      expect(planFirstCalls).toBe(0)
+      expect(result.session.modificationWriteEffect).toBeUndefined()
+      expect(result.session.layoutIntent).toBeUndefined()
+      expect(result.session.layoutPlan).toBeUndefined()
+      expect(result.session.strategy).toBeUndefined()
+      expect(result.session.phase).toBe('completed_with_issues')
+      expect(result.reply).toContain('acknowledged')
+      expect(result.reply).toContain('invalidated')
+    } finally {
+      if (previousLegacyFlag === undefined) delete process.env.PASCAL_MODIFY_LEGACY
+      else process.env.PASCAL_MODIFY_LEGACY = previousLegacyFlag
+    }
+  })
+
+  // A clean session (no leftover) proceeds into the plan-first attempt normally.
+  test('does not trip the isolation guard when there is no leftover write', async () => {
+    const previousLegacyFlag = process.env.PASCAL_MODIFY_LEGACY
+    delete process.env.PASCAL_MODIFY_LEGACY
+    let planFirstCalls = 0
+    const session = { ...baseSession(), sceneId: 'scene-1', pendingOperation: 'update' as const }
+    const dependencies: ModifyWorkflowDependencies = {
+      persistSession: () => {},
+      loadScene: async () => ({ version: 1 }),
+      runPlanFirst: async current => {
+        planFirstCalls++
+        return { session: current, reply: 'ok', next: 'finish' as const }
+      },
+      snapshotScene: async () => ({}),
+      runLegacyPhase: async () => ({ messages: [], toolNamesUsed: new Set(), furnitureIssues: [] }),
+      dedupeSharedWalls: async () => {},
+      checkProtection: async () => [],
+      refine: async () => { throw new Error('refine must not run') },
+      persistScene: async () => null,
+      evaluateGates: async () => ({ report: { passed: true, failures: [] }, layoutQuality: 1 }),
+      clearDestructiveWrite: () => false,
+      isCancellationError: () => false,
+      errorMessage: error => String(error),
+      planSnapshot: () => '',
+    }
+    try {
+      await runModifyWorkflow({
+        input: { sessionId: session.sessionId }, session, reply: '', next: 'modify',
+      }, dependencies)
+      expect(planFirstCalls).toBe(1)
     } finally {
       if (previousLegacyFlag === undefined) delete process.env.PASCAL_MODIFY_LEGACY
       else process.env.PASCAL_MODIFY_LEGACY = previousLegacyFlag
@@ -198,7 +339,7 @@ describe('modify application service', () => {
       expect(result.reply).toContain('不会自动重试')
       // No scene was saved on an uncertain write.
       expect(persistSceneCalls).toBe(0)
-      expect(result.session.modificationWriteEffect).toBeUndefined()
+      expect(result.session.modificationWriteEffect).toBe('write_attempted')
       expect(result.session.pendingModifyPlan).toBeUndefined()
     } finally {
       if (previousLegacyFlag === undefined) delete process.env.PASCAL_MODIFY_LEGACY

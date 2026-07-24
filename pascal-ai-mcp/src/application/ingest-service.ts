@@ -69,6 +69,12 @@ export function planIngestAction(input: ChatInput, session: WorkflowSession): In
   if (!message && !input.imageDataUrl) {
     return { kind: 'reply', reply: t(session.language, 'emptyInput', {}) }
   }
+  if (hasUncertainModificationWrite(session) && isWriteAcknowledgement(message)) {
+    session.pendingModification = message
+    session.pendingOperation = 'update'
+    session.phase = 'modifying'
+    return { kind: 'route', reply: t(session.language, 'modifyConfirmed', {}), next: 'modify' }
+  }
   if (shouldRouteAsExistingSceneRequest(session.phase, message)) {
     delete session.pendingModification
     delete session.pendingOperation
@@ -96,6 +102,16 @@ export function planIngestAction(input: ChatInput, session: WorkflowSession): In
     return { kind: 'reply', reply: t(session.language, 'unsupportedImage', {}) }
   }
   return { kind: 'intake', message }
+}
+
+function hasUncertainModificationWrite(session: WorkflowSession): boolean {
+  return session.destructiveSceneWriteStarted === true
+    || session.modificationWriteEffect === 'write_attempted'
+    || session.modificationWriteEffect === 'partial_write_confirmed'
+}
+
+function isWriteAcknowledgement(message: string): boolean {
+  return /^(?:确认|我已确认|已检查并确认|確認|確認しました|confirm|confirmed)$/iu.test(message)
 }
 
 function confirmBrief(brief: DesignBrief): DesignBrief {
