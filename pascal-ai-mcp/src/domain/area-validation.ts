@@ -118,6 +118,22 @@ export function round1(value: number): number {
   return Math.round(value * 10) / 10
 }
 
+export function numericFactValue(value: unknown): number | undefined {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined
+  if (typeof value !== 'string') return undefined
+  const normalized = value.normalize('NFKC')
+  const areaMatch = normalized.match(
+    /(-?\d+(?:\.\d+)?)\s*(?:m2|m²|㎡|平方米|平米|平方公尺)/iu,
+  )
+  const numericMatches = [...normalized.matchAll(/-?\d+(?:\.\d+)?/g)]
+  const selected = areaMatch?.[1] ?? (
+    numericMatches.length === 1 ? numericMatches[0]?.[0] : undefined
+  )
+  if (!selected) return undefined
+  const parsed = Number.parseFloat(selected)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
 function numericFact(brief: DesignBrief, keys: string[]): number | undefined {
   const facts: RequirementFact[] = [
     ...brief.existingCondition,
@@ -126,8 +142,5 @@ function numericFact(brief: DesignBrief, keys: string[]): number | undefined {
     ...brief.assumptions,
   ]
   const value = facts.find(fact => keys.includes(fact.key.toLowerCase()))?.value
-  if (typeof value === 'number') return value
-  if (typeof value !== 'string') return undefined
-  const parsed = Number.parseInt(value, 10)
-  return Number.isFinite(parsed) ? parsed : undefined
+  return numericFactValue(value)
 }

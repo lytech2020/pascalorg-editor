@@ -6,6 +6,7 @@
 import { classifyRoomTypeByName, ROOM_NAME_PATTERNS } from '../src/lang/room-vocab'
 import type { RoomType } from '../src/layout-plan'
 import type { SceneResult, WorkflowPhase } from '../src/types'
+import type { AssertionResult, QualityTolerance } from './assertions'
 
 // Case configs address room types by their Chinese labels; the patterns that
 // recognize actual zone names come from the shared trilingual vocabulary, so
@@ -129,6 +130,10 @@ export type FailureCode =
   // Plan-first flow: the intent→partition→validation loop exhausted its
   // correction rounds before any scene was created.
   | 'plan_rejected'
+  | 'awaiting_additional_confirmation'
+  | 'modification_safe_rejection'
+  | 'modification_target_not_met'
+  | 'modification_scope_violation'
   | 'unknown'
 
 export type FailureClassification = {
@@ -172,6 +177,84 @@ export function classifyFailure(
   else if (phase === 'clarifying' || phase === 'awaiting_confirmation') code = 'clarification_incomplete'
 
   return { stage, code, message: text }
+}
+
+const SAFE_REJECTION_PATTERN =
+  /无法把这项请求安全地归类|没有更改场景|缺少结构重建所需|没有执行结构修改|缺少执行这项局部修改所需|找不到可证明安全的局部方案|写入场景前已停止|could not be safely classified|no provably safe local plan|stopped before writing to the scene|scene was not changed|no structural change was made|シーンは変更していません|構造修正は実行していません|安全と証明できる局所案|シーンへ書き込む前に停止/i
+
+const SCOPE_ASSERTION_NAMES = new Set([
+  'modification:preserveRoomCounts',
+  'modification:preserveFurniture',
+  'modification:deletedOriginalWalls',
+  'modification:modifiedOriginalWalls',
+  'modification:preserveOpenings',
+  'modification:modifiedOriginalOpenings',
+  'modification:preserveExteriorBounds',
+  'modification:preserveExteriorWidth',
+  'modification:preserveRoomPolygons',
+  'modification:structureUntouched',
+])
+
+export function classifyEvalFailure(
+  phase: WorkflowPhase | undefined,
+  reply: string | undefined,
+  assertions: AssertionResult[] = [],
+): FailureClassification | undefined {
+  const text = (reply ?? '').trim()
+  if (phase === 'awaiting_modification_confirmation') {
+    return {
+      stage: 'modification',
+      code: 'awaiting_additional_confirmation',
+      message: text || '修改流程仍在等待额外确认',
+    }
+  }
+  if (SAFE_REJECTION_PATTERN.test(text)) {
+    return {
+      stage: 'modification',
+      code: 'modification_safe_rejection',
+      message: text,
+    }
+  }
+
+  const base = classifyFailure(phase, reply)
+  if (base && base.code !== 'unknown') return base
+
+  const failedModificationAssertions = assertions.filter(
+    assertion => assertion.status !== 'pass' && assertion.name.startsWith('modification:'),
+  )
+  const scopeFailure = failedModificationAssertions.find(assertion => SCOPE_ASSERTION_NAMES.has(assertion.name))
+  if (scopeFailure) {
+    return {
+      stage: 'modification',
+      code: 'modification_scope_violation',
+      message: scopeFailure.reason ?? scopeFailure.name,
+    }
+  }
+  const targetFailure = failedModificationAssertions[0]
+  if (targetFailure) {
+    return {
+      stage: 'modification',
+      code: 'modification_target_not_met',
+      message: targetFailure.reason ?? targetFailure.name,
+    }
+  }
+  return base
+}
+
+export function modelCallsAfterBaseline(total: number | undefined, baseline: number): number | undefined {
+  if (typeof total !== 'number') return undefined
+  return Math.max(0, total - baseline)
+}
+
+export function modelCallsForBudget(options: {
+  modification: boolean
+  cumulativeCalls: number | undefined
+  baselineCalls: number
+  sceneReportedCalls: number | undefined
+}): number | undefined {
+  return options.modification
+    ? modelCallsAfterBaseline(options.cumulativeCalls, options.baselineCalls)
+    : options.sceneReportedCalls
 }
 
 export type FurnitureIssueBreakdown = {
@@ -361,12 +444,20 @@ export type EvalCase = {
   requireAllRoomsReachable?: boolean
   /** 批次 D: fail the case when the turn used more model calls than this (§9 budgets). */
   maxModelCalls?: number
+  /** Exact distinct logical calls by stable telemetry operation, excluding setupFrom. */
+  expectedModelCallsByOperation?: Record<string, number>
   /**
    * Gate-failure substrings that are the INTENDED outcome of this case's
    * request (e.g. 删床用例豁免「缺少必备家具：床」) — matching failures don't
    * fail the gatesPassed assertion; everything else still does.
    */
   allowedGateFailures?: string[]
+  /**
+   * Explicitly reviewed allowances for new quality regressions. Omitted
+   * fields default to zero; inherited baseline issues are reported but do
+   * not consume the allowance.
+   */
+  qualityTolerance?: QualityTolerance
   /** Required adjacency relationships between room types (e.g. ensuite). */
   requiredAdjacency?: Array<{ a: string; b: string; relation: AdjacencyRelation }>
   /** Overall footprint width×depth with tolerance, e.g. {width:5,depth:18,tolerance:0.12}. */
@@ -403,6 +494,16 @@ export type EvalCase = {
     requireZoneNames?: string[]
   }
   notes?: string
+}
+
+export function modelOperationCallDelta(
+  current: Record<string, number>,
+  baseline: Record<string, number>,
+): Record<string, number> {
+  return Object.fromEntries(Object.entries(current).map(([operation, count]) => [
+    operation,
+    Math.max(0, count - (baseline[operation] ?? 0)),
+  ]))
 }
 
 // A generation-type case (no `basedOn`) whose message never mentions an
@@ -502,6 +603,23 @@ function validateAssertionConfig(testCase: EvalCase): string[] {
       problems.push('expectedBounds 的 width/depth 必须为正数')
     }
     checkTolerance('expectedBounds', testCase.expectedBounds.tolerance)
+  }
+  if (testCase.qualityTolerance) {
+    for (const [key, value] of Object.entries(testCase.qualityTolerance)) {
+      if (!Number.isInteger(value) || value < 0) {
+        problems.push(`qualityTolerance.${key} 必须是非负整数`)
+      }
+    }
+  }
+  if (testCase.expectedModelCallsByOperation) {
+    for (const [operation, count] of Object.entries(testCase.expectedModelCallsByOperation)) {
+      if (!/^[a-z][a-z0-9:-]{0,63}$/.test(operation)) {
+        problems.push(`expectedModelCallsByOperation 包含非法 operation "${operation}"`)
+      }
+      if (!Number.isInteger(count) || count < 0) {
+        problems.push(`expectedModelCallsByOperation.${operation} 必须是非负整数`)
+      }
+    }
   }
   if (testCase.modificationChecks) {
     const hasFixedBase = Boolean((testCase.baseSceneId ?? '').trim())

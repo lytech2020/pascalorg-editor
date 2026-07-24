@@ -20,7 +20,7 @@
 //   bun run eval/run-eval.ts --only=case-12-scope-boundary,case-03-two-bed-standard
 //   bun run eval/run-eval.ts --dry-run            # validate case files only, no model/MCP calls, no tokens spent
 
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { PascalAiAgent, toolPayload } from '../src/agent'
 import { loadConfig } from '../src/config'
@@ -43,26 +43,32 @@ import {
   checkBedroomCount,
   checkForbiddenRoomTypes,
   checkRequiredRoomTypes,
-  classifyFailure,
+  classifyEvalFailure,
   classifyFurnitureIssues,
   dependencySceneKey,
   determineSuccess,
   findCorpusLevelProblems,
+  modelCallsForBudget,
+  modelOperationCallDelta,
   resolveDependencySceneId,
   validateCaseStructure,
   type EvalCase,
   type FailureClassification,
   type FurnitureIssueBreakdown,
 } from './evaluate-run'
+import { loadEvalCorpus, type EvalCorpus } from './corpus'
 import { scaffoldReviews } from './review'
 import {
+  assertDefaultQuality,
   assertModification,
   assertPlanFirstResult,
+  qualityBaseline,
   rollupAssertions,
   runSceneAssertions,
   type AssertionConfig,
   type AssertionResult,
   type AssertionRollup,
+  type QualityBaseline,
   type SceneInputs,
   type SceneSnapshot,
   type WallInfo,
@@ -82,6 +88,8 @@ type CaseRunResult = {
   ok: boolean
   workflowCompleted: boolean
   assertionsPassed: boolean
+  goalAssertionsPassed?: boolean
+  qualityPassed?: boolean
   error?: string
   // Structured failure classification (undefined for successful runs) so the
   // raw report shows the real underlying cause — rate limit / HTTP error /
@@ -92,6 +100,9 @@ type CaseRunResult = {
   // Model API attempts this session made (from session.modelCallsTotal),
   // so a run that burned its retries is visible in the report.
   modelAttempts?: number
+  // Calls judged against this case's budget. For setupFrom modifications this
+  // excludes the model calls spent creating the baseline scene.
+  evaluatedModelAttempts?: number
   // Per-phase model/tool call trace from the agent (structure, openings,
   // repair rounds). Makes non-convergence diagnosable: model calls per phase,
   // exact tool sequence, per-tool counts, and — via ok create_room entries —
@@ -127,7 +138,6 @@ type CaseRunResult = {
   }
 }
 
-const CASES_DIR = join(import.meta.dir, 'cases')
 const REPORT_ROOT = join(import.meta.dir, 'report')
 
 function parseArgs(): {
@@ -153,25 +163,13 @@ function parseArgs(): {
   return { repeat, only, dryRun, allowProviderCost }
 }
 
-function loadCases(): EvalCase[] {
-  const files = readdirSync(CASES_DIR).filter(f => f.endsWith('.json')).sort()
-  const cases = files.map(f => JSON.parse(readFileSync(join(CASES_DIR, f), 'utf8')) as EvalCase)
-  // Cheap dependency ordering: run every case with no `basedOn` first, then
-  // the ones that chain off another case. Good enough for the current
-  // corpus (two one-hop-deep "modify" cases); revisit if it ever grows a
-  // deeper dependency chain.
-  const independent = cases.filter(c => !c.basedOn)
-  const dependent = cases.filter(c => c.basedOn)
-  return [...independent, ...dependent]
-}
-
-function runDryRun(cases: EvalCase[], allCases: EvalCase[]): void {
+function runDryRun(cases: EvalCase[], corpus: EvalCorpus): void {
   // basedOn existence must be checked against the FULL corpus, not the
   // (possibly `--only`-filtered) `cases` being run — otherwise
   // `--dry-run --only=case-13-modify-add-room` reports its very real
   // `basedOn: "case-03-two-bed-standard"` as "nonexistent" just because
   // case-03 wasn't in the filtered set.
-  const allIds = new Set(allCases.map(c => c.id))
+  const allIds = new Set(corpus.caseIds)
   let problemCount = 0
   for (const testCase of cases) {
     const problems = validateCaseStructure(testCase, allIds)
@@ -188,14 +186,22 @@ function runDryRun(cases: EvalCase[], allCases: EvalCase[]): void {
   // cycles) only make sense checked against the full corpus regardless of
   // `--only` — running them on a filtered slice would miss a duplicate or
   // cycle that spans a case outside the filter.
-  const corpusProblems = findCorpusLevelProblems(allCases)
+  const corpusProblems = findCorpusLevelProblems(corpus.cases)
   if (corpusProblems.length > 0) {
     problemCount += corpusProblems.length
     console.log('[WARN] 语料库级别问题（跨用例）')
     for (const problem of corpusProblems) console.log(`         - ${problem}`)
   }
 
-  console.log(`\ndry-run 完成：${cases.length} 个用例，${problemCount} 个结构性问题。没有调用模型或 MCP，不消耗 token。`)
+  const range = corpus.numericRange
+    ? `编号范围 case-${String(corpus.numericRange.first).padStart(2, '0')}…case-${String(corpus.numericRange.last).padStart(2, '0')}`
+    : '无数字编号范围'
+  const missing = corpus.missingNumericCaseIds.length > 0
+    ? `；范围内缺号：${corpus.missingNumericCaseIds.join(', ')}`
+    : ''
+  console.log(
+    `\ndry-run 完成：本次检查 ${cases.length} 个用例；语料库权威数量 ${corpus.caseCount}（${range}${missing}），${problemCount} 个结构性问题。没有调用模型或 MCP，不消耗 token。`,
+  )
   process.exit(problemCount > 0 ? 1 : 0)
 }
 
@@ -312,9 +318,11 @@ function hasConfigAssertions(testCase: EvalCase): boolean {
 async function runCase(
   agent: PascalAiAgent,
   mcp: PascalMcpClient,
+  modelCallRepository: ModelCallRepository,
   testCase: EvalCase,
   repeatIndex: number,
   sceneIdByCaseRepeat: Map<string, string>,
+  qualityByCaseRepeat: Map<string, QualityBaseline>,
   casesById: Map<string, EvalCase>,
 ): Promise<CaseRunResult> {
   const sessionId = `eval-${testCase.id}-r${repeatIndex}-${Date.now()}`
@@ -342,6 +350,12 @@ async function runCase(
   }
 
   try {
+    const isModificationCase = Boolean(baseSceneId || testCase.setupFrom)
+    let modelCallBaseline = 0
+    let modelOperationBaseline: Record<string, number> = {}
+    let baselineQuality = testCase.basedOn
+      ? qualityByCaseRepeat.get(dependencySceneKey(testCase.basedOn, repeatIndex))
+      : undefined
     // When there's a baseline (fixed or basedOn), work on a fresh disposable
     // COPY of it — never modify the baseline itself. Each repeat gets its own
     // copy, so repeats and dependent cases (13/14) never contaminate each other
@@ -424,6 +438,9 @@ async function runCase(
           checks: {},
         }
       }
+      modelCallBaseline = lastResult?.session.modelCallsTotal ?? 0
+      modelOperationBaseline = modelCallRepository.countDistinctCallsBySession(sessionId)
+      baselineQuality = qualityBaseline(lastResult?.session.sceneResult)
       await mcp.callTool('load_scene', { id: setupSceneId })
       beforeSnapshot = parseSceneSnapshot(toolPayload(await mcp.callTool('get_scene', {})))
     }
@@ -445,7 +462,7 @@ async function runCase(
       }
       if ('action' in turn && turn.action === 'confirm' && !canConfirmFromPhase(currentPhase)) {
         const elapsedMs = Date.now() - started
-        const failure = classifyFailure(currentPhase, lastResult?.reply)
+        const failure = classifyEvalFailure(currentPhase, lastResult?.reply)
         // Distinguish "the previous turn actually errored out" from "the brief
         // was underspecified so it's still clarifying" — the old code called
         // both "大概率卡在澄清阶段", which was wrong for the former.
@@ -577,6 +594,21 @@ async function runCase(
       assertionsPassed = false
     }
 
+    const goalAssertionsPassed = assertionsPassed
+    let qualityPassed: boolean | undefined
+    if (workflow.ok && sceneResult) {
+      const qualityResults = assertDefaultQuality(sceneResult, {
+        baseline: baselineQuality,
+        modification: isModificationCase,
+        tolerance: testCase.qualityTolerance,
+        allowedGateFailures: testCase.allowedGateFailures,
+      })
+      assertions = [...(assertions ?? []), ...qualityResults]
+      const qualityRollup = rollupAssertions(qualityResults)
+      qualityPassed = qualityRollup.allPassed
+      if (!qualityPassed) assertionsPassed = false
+    }
+
     // 批次 D plan-first assertions (意见⑦: they judge fail like every other
     // one): hard gates, model-call budget, furniture placement rate. Judged
     // from the agent's SceneResult — no scene reload needed. Modification
@@ -584,9 +616,26 @@ async function runCase(
     // executor only runs on fresh builds, so modify sessions legitimately
     // have no placement tally.
     if (workflow.ok && sceneResult) {
+      const evaluatedModelAttempts = modelCallsForBudget({
+        modification: isModificationCase,
+        cumulativeCalls: session.modelCallsTotal,
+        baselineCalls: modelCallBaseline,
+        sceneReportedCalls: sceneResult.modelCallsUsed,
+      })
       const planFirstResults = assertPlanFirstResult(sceneResult, {
         ...(testCase.maxModelCalls !== undefined ? { maxModelCalls: testCase.maxModelCalls } : {}),
         ...(testCase.allowedGateFailures ? { allowedGateFailures: testCase.allowedGateFailures } : {}),
+        ...(baselineQuality ? { baselineGateFailures: baselineQuality.gateFailures } : {}),
+        ...(evaluatedModelAttempts !== undefined ? { modelCallsUsed: evaluatedModelAttempts } : {}),
+        ...(testCase.expectedModelCallsByOperation
+          ? {
+              expectedModelCallsByOperation: testCase.expectedModelCallsByOperation,
+              modelCallsByOperation: modelOperationCallDelta(
+                modelCallRepository.countDistinctCallsBySession(sessionId),
+                modelOperationBaseline,
+              ),
+            }
+          : {}),
       }).filter(result => !((testCase.basedOn || testCase.setupFrom) && result.name === 'furniturePlacementRate'))
       assertions = [...(assertions ?? []), ...planFirstResults]
       assertionRollup = rollupAssertions(assertions)
@@ -613,18 +662,27 @@ async function runCase(
       }
     }
 
-    const failure = classifyFailure(session.phase, lastResult!.reply)
+    const failure = classifyEvalFailure(session.phase, lastResult!.reply, assertions)
+    const evaluatedModelAttempts = modelCallsForBudget({
+      modification: isModificationCase,
+      cumulativeCalls: session.modelCallsTotal,
+      baselineCalls: modelCallBaseline,
+      sceneReportedCalls: sceneResult?.modelCallsUsed,
+    }) ?? session.modelCallsTotal
     return {
       caseId: testCase.id,
       repeatIndex,
       ok: workflow.ok && assertionsPassed,
       workflowCompleted: workflow.ok,
       assertionsPassed,
+      goalAssertionsPassed,
+      qualityPassed,
       error: errorParts.length > 0 ? errorParts.join('；') : undefined,
       failureStage: failure?.stage,
       failureCode: failure?.code,
       failureMessage: failure?.message,
       modelAttempts: session.modelCallsTotal,
+      evaluatedModelAttempts,
       toolTrace: session.toolTrace,
       furniture: classifyFurnitureIssues(sceneResult?.furnitureIssues ?? [], sceneResult?.furniturePlacement ?? []),
       assertions,
@@ -670,7 +728,7 @@ function logResult(result: CaseRunResult): void {
         `collisions=${result.sceneResult.collisions.length}`,
         `gates=${result.sceneResult.gateFailures ? (result.sceneResult.gateFailures.length === 0 ? 'pass' : `${result.sceneResult.gateFailures.length}fail`) : 'n/a'}`,
         `quality=${result.sceneResult.layoutQuality ?? 'n/a'}`,
-        `modelCalls=${result.sceneResult.modelCallsUsed ?? result.modelAttempts ?? 'n/a'}`,
+        `modelCalls=${result.evaluatedModelAttempts ?? result.sceneResult.modelCallsUsed ?? result.modelAttempts ?? 'n/a'}`,
       ].join(' ')
     : (result.error ?? '')
   const checkFlags = [
@@ -685,7 +743,9 @@ function logResult(result: CaseRunResult): void {
   console.log(`[${status}] ${result.caseId} run${result.repeatIndex} (${result.elapsedMs}ms) ${detail} ${checkFlags}`)
   if (!result.ok && result.error) console.log(`         原因：${result.error}`)
   if (!result.ok && result.failureCode) {
-    console.log(`         失败分类：stage=${result.failureStage} code=${result.failureCode} 模型请求数=${result.modelAttempts ?? '未知'}`)
+    console.log(
+      `         失败分类：stage=${result.failureStage} code=${result.failureCode} 模型请求数=${result.modelAttempts ?? '未知'}（本用例计费=${result.evaluatedModelAttempts ?? '未知'}）`,
+    )
   }
 }
 
@@ -695,6 +755,8 @@ function buildSummary(results: CaseRunResult[]) {
   const errorCount = results.filter(r => !r.ok).length
   const workflowCompletedCount = results.filter(r => r.workflowCompleted).length
   const assertionsPassedCount = results.filter(r => r.assertionsPassed).length
+  const goalAssertionsPassedCount = results.filter(r => r.goalAssertionsPassed).length
+  const qualityPassedCount = results.filter(r => r.qualityPassed).length
   const sum = (pick: (r: CaseRunResult) => number) => results.reduce((acc, r) => acc + pick(r), 0)
   const withScene = results.filter(r => r.sceneResult)
   const nonEmptyRate = (pick: (s: SceneResult) => unknown[]) =>
@@ -731,6 +793,8 @@ function buildSummary(results: CaseRunResult[]) {
     // of that also passed" — these two rates can and will diverge.
     workflowCompletedRate: total === 0 ? 0 : workflowCompletedCount / total,
     assertionsPassedRate: total === 0 ? 0 : assertionsPassedCount / total,
+    goalAssertionsPassedRate: total === 0 ? 0 : goalAssertionsPassedCount / total,
+    qualityPassedRate: total === 0 ? 0 : qualityPassedCount / total,
     avgElapsedMs: total === 0 ? 0 : Math.round(sum(r => r.elapsedMs) / total),
     requirementMismatchRate: nonEmptyRate(s => s.requirementMismatches),
     doorlessRoomRate: nonEmptyRate(s => s.doorlessRooms),
@@ -752,7 +816,9 @@ function renderSummaryMarkdown(summary: ReturnType<typeof buildSummary>, results
     `- 总运行次数：${summary.total}`,
     `- 成功率：${(summary.successRate * 100).toFixed(1)}% (${summary.successCount}/${summary.total})——要求工作流完成状态成立，且用例声明的所有断言（卧室数量/必须/禁止房间类型）全部通过`,
     `  - 其中工作流完成率：${(summary.workflowCompletedRate * 100).toFixed(1)}%（phase 到达 completed/completed_with_issues 且有 sceneResult.sceneId，不代表质量断言也通过）`,
-    `  - 断言通过率：${(summary.assertionsPassedRate * 100).toFixed(1)}%（卧室数量/必须房间/禁止房间类型全部满足，且未出现 zone 读取失败）`,
+    `  - 用户目标断言通过率：${(summary.goalAssertionsPassedRate * 100).toFixed(1)}%（Case 显式声明的房间、面积、邻接和修改目标）`,
+    `  - 默认质量断言通过率：${(summary.qualityPassedRate * 100).toFixed(1)}%（无新增碰撞、需求遗漏、必备设备缺失或挡门）`,
+    `  - 全部断言通过率：${(summary.assertionsPassedRate * 100).toFixed(1)}%（目标、默认质量、门槛和预算均通过）`,
     `- 平均耗时：${summary.avgElapsedMs}ms`,
     `- 需求遗漏率（requirementMismatches 非空）：${(summary.requirementMismatchRate * 100).toFixed(1)}%`,
     `- 封闭房间率（doorlessRooms 非空）：${(summary.doorlessRoomRate * 100).toFixed(1)}%`,
@@ -786,7 +852,7 @@ function renderSummaryMarkdown(summary: ReturnType<typeof buildSummary>, results
   for (const result of results) {
     lines.push(`### ${result.caseId} · run ${result.repeatIndex}`)
     lines.push(
-      `- 状态：${result.ok ? '成功' : '失败'}（工作流完成=${result.workflowCompleted ? '是' : '否'}，断言通过=${result.assertionsPassed ? '是' : '否'}）${result.error ? `（${result.error}）` : ''}`,
+      `- 状态：${result.ok ? '成功' : '失败'}（工作流完成=${result.workflowCompleted ? '是' : '否'}，目标断言=${result.goalAssertionsPassed === undefined ? '未判定' : result.goalAssertionsPassed ? '通过' : '失败'}，质量断言=${result.qualityPassed === undefined ? '未判定' : result.qualityPassed ? '通过' : '失败'}，全部断言=${result.assertionsPassed ? '通过' : '失败'}）${result.error ? `（${result.error}）` : ''}`,
     )
     lines.push(`- 耗时：${result.elapsedMs}ms`)
     if (result.baseSceneId) lines.push(`- 基准场景：${result.baseSceneId}（工作副本：${result.workingSceneId ?? '—'}；原基准未被修改）`)
@@ -794,7 +860,7 @@ function renderSummaryMarkdown(summary: ReturnType<typeof buildSummary>, results
     if (result.sceneResult) {
       lines.push(
         `- 诊断：doorlessRooms=${result.sceneResult.doorlessRooms.length}, strayWindows=${result.sceneResult.strayWindows.length}, requirementMismatches=${result.sceneResult.requirementMismatches.length}, isolatedBedrooms=${result.sceneResult.isolatedBedrooms.length}, collisions=${result.sceneResult.collisions.length}`,
-        `- 门槛/质量：gates=${result.sceneResult.gateFailures ? (result.sceneResult.gateFailures.length === 0 ? '全过' : result.sceneResult.gateFailures.join('；')) : '无数据'}，layoutQuality=${result.sceneResult.layoutQuality ?? '无数据'}，模型调用=${result.sceneResult.modelCallsUsed ?? '无数据'}${result.sceneResult.furniture ? `，家具放置 ${result.sceneResult.furniture.placed}/${result.sceneResult.furniture.required}` : ''}`,
+        `- 门槛/质量：gates=${result.sceneResult.gateFailures ? (result.sceneResult.gateFailures.length === 0 ? '全过' : result.sceneResult.gateFailures.join('；')) : '无数据'}，layoutQuality=${result.sceneResult.layoutQuality ?? '无数据'}，模型调用总数=${result.modelAttempts ?? '无数据'}，本用例预算口径=${result.evaluatedModelAttempts ?? '无数据'}${result.sceneResult.furniture ? `，家具放置 ${result.sceneResult.furniture.placed}/${result.sceneResult.furniture.required}` : ''}`,
       )
       // P2（2026-07-14 复盘）：碰撞只报数量没法诊断——保留冲突对（节点 id +
       // 类型），raw JSON 里有完整 sceneResult 可再深挖。
@@ -825,7 +891,7 @@ function renderSummaryMarkdown(summary: ReturnType<typeof buildSummary>, results
       }
     }
     if (!result.ok && result.failureCode) {
-      lines.push(`- 失败：stage=${result.failureStage}，code=${result.failureCode}，模型请求数=${result.modelAttempts ?? '未知'}`)
+      lines.push(`- 失败：stage=${result.failureStage}，code=${result.failureCode}，模型请求总数=${result.modelAttempts ?? '未知'}，本用例预算口径=${result.evaluatedModelAttempts ?? '未知'}`)
       if (result.failureMessage) lines.push(`- 失败详情：${result.failureMessage}`)
     }
     lines.push('')
@@ -835,7 +901,8 @@ function renderSummaryMarkdown(summary: ReturnType<typeof buildSummary>, results
 
 async function main(): Promise<void> {
   const { repeat, only, dryRun, allowProviderCost } = parseArgs()
-  const allCases = loadCases()
+  const corpus = loadEvalCorpus()
+  const allCases = corpus.cases
   const cases = only ? allCases.filter(c => only.has(c.id)) : allCases
   if (cases.length === 0) {
     console.error('没有匹配到任何用例，检查 --only 参数或 eval/cases/ 目录。')
@@ -843,7 +910,7 @@ async function main(): Promise<void> {
   }
 
   if (dryRun) {
-    runDryRun(cases, allCases)
+    runDryRun(cases, corpus)
     return
   }
   if (!allowProviderCost) {
@@ -853,7 +920,8 @@ async function main(): Promise<void> {
 
   const config = loadConfig()
   const database = new AppDatabase(config.databaseFile)
-  const modelAttempts = new SqliteModelAttemptRecorder(new ModelCallRepository(database))
+  const modelCallRepository = new ModelCallRepository(database)
+  const modelAttempts = new SqliteModelAttemptRecorder(modelCallRepository)
   const sessions = new SqliteSessionPersistence(database)
   sessions.importLegacyFile(config.sessionFile)
   const requests = new ChatRequestRepository(database)
@@ -888,6 +956,7 @@ async function main(): Promise<void> {
   mkdirSync(rawDir, { recursive: true })
 
   const sceneIdByCaseRepeat = new Map<string, string>()
+  const qualityByCaseRepeat = new Map<string, QualityBaseline>()
   const results: CaseRunResult[] = []
   // setupFrom lookups resolve against the FULL corpus, not the --only subset —
   // a filtered run of case-13 must still find case-03's turns.
@@ -895,10 +964,23 @@ async function main(): Promise<void> {
 
   for (const testCase of cases) {
     for (let repeatIndex = 1; repeatIndex <= repeat; repeatIndex++) {
-      const result = await runCase(agent, mcp, testCase, repeatIndex, sceneIdByCaseRepeat, casesById)
+      const result = await runCase(
+        agent,
+        mcp,
+        modelCallRepository,
+        testCase,
+        repeatIndex,
+        sceneIdByCaseRepeat,
+        qualityByCaseRepeat,
+        casesById,
+      )
       results.push(result)
       if (result.ok && result.sceneId) {
         sceneIdByCaseRepeat.set(dependencySceneKey(testCase.id, repeatIndex), result.sceneId)
+        qualityByCaseRepeat.set(
+          dependencySceneKey(testCase.id, repeatIndex),
+          qualityBaseline(result.sceneResult),
+        )
       }
       writeFileSync(join(rawDir, `${testCase.id}-run${repeatIndex}.json`), JSON.stringify(result, null, 2))
       logResult(result)
@@ -911,6 +993,12 @@ async function main(): Promise<void> {
     mode: 'provider',
     generatedAt: new Date().toISOString(),
     repeat,
+    corpus: {
+      caseCount: corpus.caseCount,
+      caseIds: corpus.caseIds,
+      numericRange: corpus.numericRange,
+      missingNumericCaseIds: corpus.missingNumericCaseIds,
+    },
     caseIds: cases.map(testCase => testCase.id),
     metrics: summary,
   }, null, 2))

@@ -19,11 +19,18 @@ export type FurnitureOption = {
 export type FurnitureRequirement = {
   key: string
   label: string
+  placementPriority: number
   options: FurnitureOption[]
 }
 
-function single(key: string, label: string, searchTerms: string[], match: RegExp): FurnitureRequirement {
-  return { key, label, options: [{ label, searchTerms, match }] }
+function single(
+  key: string,
+  label: string,
+  searchTerms: string[],
+  match: RegExp,
+  placementPriority = 10,
+): FurnitureRequirement {
+  return { key, label, placementPriority, options: [{ label, searchTerms, match }] }
 }
 
 // searchTerms are English-first: the built-in MCP catalog names and tags are
@@ -36,8 +43,8 @@ const WARDROBE_MATCH = /衣柜|衣橱|wardrobe|closet|タンス|箪笥|ワード
 
 const BEDROOM: FurnitureRequirement[] = [
   // 床头柜/床垫 must not satisfy the bed requirement.
-  single('bed', '床', ['bed', '双人床', '床'], /\bbed\b|ベッド|(?<![头铺沙发]|床头)床(?!头|垫|品)/iu),
-  single('wardrobe', '衣柜', ['wardrobe', '衣柜'], WARDROBE_MATCH),
+  single('bed', '床', ['bed', '双人床', '床'], /\bbed\b|ベッド|(?<![头铺沙发]|床头)床(?!头|垫|品)/iu, 100),
+  single('wardrobe', '衣柜', ['wardrobe', '衣柜'], WARDROBE_MATCH, 90),
 ]
 
 export function isWardrobeStorageName(name: string): boolean {
@@ -50,9 +57,9 @@ const LIVING: FurnitureRequirement[] = [
 ]
 
 const KITCHEN: FurnitureRequirement[] = [
-  single('sink_counter', '水槽柜', ['kitchen sink', '水槽柜', '水槽'], /水槽|洗菜|\bsink\b|シンク|流し台/i),
-  single('stove', '灶台', ['stove', 'cooktop', '灶台', '燃气灶'], /灶|炉(?!具架)|stove|cooktop|\brange\b|コンロ/i),
-  single('fridge', '冰箱', ['fridge', '冰箱'], /冰箱|fridge|refrigerator|冷蔵庫/i),
+  single('sink_counter', '水槽柜', ['kitchen sink', '水槽柜', '水槽'], /水槽|洗菜|\bsink\b|シンク|流し台/i, 90),
+  single('stove', '灶台', ['stove', 'cooktop', '灶台', '燃气灶'], /灶|炉(?!具架)|stove|cooktop|\brange\b|コンロ/i, 100),
+  single('fridge', '冰箱', ['fridge', '冰箱'], /冰箱|fridge|refrigerator|冷蔵庫/i, 80),
 ]
 
 // 洁具主体 matcher 必须挡住同名配件（2026-07-16 线上事故：search_assets
@@ -65,11 +72,12 @@ const SHOWER_MATCH =
   /淋浴(?!垫|帘|头|喷)|shower(?![-_ ]?(?:rug|mat|curtain|caddy|head|hose|shelf|holder))|シャワー(?!マット|カーテン|ヘッド|ホース|ラック)/i
 
 const BATHROOM: FurnitureRequirement[] = [
-  single('toilet', '马桶', ['toilet', '马桶'], TOILET_MATCH),
-  single('washbasin', '洗手台', ['bathroom vanity', 'basin', '洗手台', '浴室柜'], /洗手台|洗手盆|台盆|浴室柜|basin|vanity|洗面台/i),
+  single('toilet', '马桶', ['toilet', '马桶'], TOILET_MATCH, 90),
+  single('washbasin', '洗手台', ['bathroom vanity', 'basin', '洗手台', '浴室柜'], /洗手台|洗手盆|台盆|浴室柜|basin|vanity|洗面台/i, 100),
   {
     key: 'shower_or_bathtub',
     label: '淋浴或浴缸',
+    placementPriority: 80,
     options: [
       { label: '淋浴', searchTerms: ['shower', '淋浴房', '淋浴'], match: SHOWER_MATCH },
       { label: '浴缸', searchTerms: ['bathtub', '浴缸'], match: /浴缸|bathtub(?![-_ ]?(?:mat|tray))|\btub\b|浴槽|バスタブ/i },

@@ -1047,6 +1047,127 @@ export type AssertionRollup = {
   allPassed: boolean
 }
 
+export type QualityDiagnostics = {
+  collisions?: Array<{ aId: string; bId: string; kind: string }>
+  requirementMismatches?: string[]
+  gateFailures?: string[]
+  furniturePlacement?: Array<{ kind: string; itemId?: string; room?: string }>
+}
+
+export type QualityTolerance = {
+  maxNewCollisions?: number
+  maxNewRequirementMismatches?: number
+  maxNewRequiredFixtureFailures?: number
+  maxNewDoorClearanceIssues?: number
+}
+
+export type QualityBaseline = {
+  collisions: string[]
+  requirementMismatches: string[]
+  gateFailures: string[]
+  requiredFixtureFailures: string[]
+  doorClearanceIssues: string[]
+}
+
+function collisionKey(entry: { aId: string; bId: string; kind: string }): string {
+  const [aId, bId] = [entry.aId, entry.bId].sort()
+  return `${entry.kind}:${aId}:${bId}`
+}
+
+function requiredFixtureFailure(message: string): boolean {
+  return /缺少.*(?:必备|马桶|洗手台|洗面|浴缸|淋浴|床|灶|冰箱|sink|toilet|bed)/i.test(message)
+}
+
+export function qualityBaseline(diagnostics: QualityDiagnostics | undefined): QualityBaseline {
+  return {
+    collisions: (diagnostics?.collisions ?? []).map(collisionKey),
+    requirementMismatches: [...(diagnostics?.requirementMismatches ?? [])],
+    gateFailures: [...(diagnostics?.gateFailures ?? [])],
+    requiredFixtureFailures: (diagnostics?.gateFailures ?? []).filter(requiredFixtureFailure),
+    doorClearanceIssues: (diagnostics?.furniturePlacement ?? [])
+      .filter(issue => issue.kind === 'door_clearance')
+      .map(issue => `${issue.itemId ?? 'unknown'}:${issue.room ?? 'unknown'}`),
+  }
+}
+
+export function assertDefaultQuality(
+  diagnostics: QualityDiagnostics,
+  options: {
+    baseline?: QualityBaseline
+    modification: boolean
+    tolerance?: QualityTolerance
+    allowedGateFailures?: string[]
+  },
+): AssertionResult[] {
+  if (options.modification && !options.baseline) {
+    return [{
+      name: 'quality:baselineAvailable',
+      status: 'unsupported',
+      reason: '修改用例缺少基准质量快照，无法区分继承问题与本次新增问题',
+    }]
+  }
+
+  const baseline = options.baseline ?? qualityBaseline(undefined)
+  const allowedGateFailures = options.allowedGateFailures ?? []
+  const current = qualityBaseline({
+    ...diagnostics,
+    gateFailures: diagnostics.gateFailures?.filter(
+      failure => !allowedGateFailures.some(pattern => failure.includes(pattern)),
+    ),
+  })
+  const tolerance = options.tolerance ?? {}
+  const check = (
+    name: string,
+    currentValues: string[],
+    baselineValues: string[],
+    allowed: number,
+  ): AssertionResult => {
+    const inherited = new Set(baselineValues)
+    const added = currentValues.filter(value => !inherited.has(value))
+    const retained = currentValues.filter(value => inherited.has(value))
+    const ok = added.length <= allowed
+    return {
+      name,
+      status: ok ? 'pass' : 'fail',
+      expected: `新增 ≤ ${allowed}`,
+      actual: {
+        addedCount: added.length,
+        inheritedCount: retained.length,
+        added,
+        inherited: retained,
+      },
+      reason: ok ? undefined : `本次新增 ${added.length} 项，超过经评审容忍值 ${allowed}`,
+    }
+  }
+
+  return [
+    check(
+      'quality:newCollisions',
+      current.collisions,
+      baseline.collisions,
+      tolerance.maxNewCollisions ?? 0,
+    ),
+    check(
+      'quality:newRequirementMismatches',
+      current.requirementMismatches,
+      baseline.requirementMismatches,
+      tolerance.maxNewRequirementMismatches ?? 0,
+    ),
+    check(
+      'quality:newRequiredFixtureFailures',
+      current.requiredFixtureFailures,
+      baseline.requiredFixtureFailures,
+      tolerance.maxNewRequiredFixtureFailures ?? 0,
+    ),
+    check(
+      'quality:newDoorClearanceIssues',
+      current.doorClearanceIssues,
+      baseline.doorClearanceIssues,
+      tolerance.maxNewDoorClearanceIssues ?? 0,
+    ),
+  ]
+}
+
 export function rollupAssertions(results: AssertionResult[]): AssertionRollup {
   // Only the informational diff-count row is non-gating; every other
   // assertion (including the wall/opening protection checks) counts.
@@ -1081,7 +1202,14 @@ export const FURNITURE_PLACEMENT_RATE_MIN = 0.9
 
 export function assertPlanFirstResult(
   sceneResult: PlanFirstSceneResult | undefined,
-  options: { maxModelCalls?: number; allowedGateFailures?: string[] } = {},
+  options: {
+    maxModelCalls?: number
+    allowedGateFailures?: string[]
+    baselineGateFailures?: string[]
+    modelCallsUsed?: number
+    expectedModelCallsByOperation?: Record<string, number>
+    modelCallsByOperation?: Record<string, number>
+  } = {},
 ): AssertionResult[] {
   const results: AssertionResult[] = []
 
@@ -1093,8 +1221,9 @@ export function assertPlanFirstResult(
     // failures matching an allowed pattern are waived for THIS case only;
     // anything else still fails.
     const allowed = options.allowedGateFailures ?? []
+    const inherited = new Set(options.baselineGateFailures ?? [])
     const blocking = sceneResult.gateFailures.filter(
-      failure => !allowed.some(pattern => failure.includes(pattern)),
+      failure => !inherited.has(failure) && !allowed.some(pattern => failure.includes(pattern)),
     )
     const waived = sceneResult.gateFailures.length - blocking.length
     results.push({
@@ -1109,14 +1238,34 @@ export function assertPlanFirstResult(
   }
 
   if (options.maxModelCalls !== undefined) {
-    if (typeof sceneResult?.modelCallsUsed !== 'number') {
+    const modelCallsUsed = options.modelCallsUsed ?? sceneResult?.modelCallsUsed
+    if (typeof modelCallsUsed !== 'number') {
       results.push({ name: 'modelCallBudget', status: 'unsupported', reason: 'sceneResult.modelCallsUsed 缺失' })
     } else {
       results.push({
         name: 'modelCallBudget',
-        status: sceneResult.modelCallsUsed <= options.maxModelCalls ? 'pass' : 'fail',
+        status: modelCallsUsed <= options.maxModelCalls ? 'pass' : 'fail',
         expected: `≤${options.maxModelCalls} 次模型调用`,
-        actual: sceneResult.modelCallsUsed,
+        actual: modelCallsUsed,
+      })
+    }
+  }
+
+  if (options.expectedModelCallsByOperation) {
+    for (const [operation, expected] of Object.entries(options.expectedModelCallsByOperation)) {
+      const actual = options.modelCallsByOperation
+        ? options.modelCallsByOperation[operation] ?? 0
+        : undefined
+      results.push({
+        name: `modelOperationCalls:${operation}`,
+        status: typeof actual === 'number'
+          ? actual === expected ? 'pass' : 'fail'
+          : 'unsupported',
+        expected,
+        actual,
+        reason: typeof actual === 'number'
+          ? undefined
+          : `缺少 operation=${operation} 的调用计数`,
       })
     }
   }

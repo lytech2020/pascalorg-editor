@@ -154,6 +154,47 @@ describe('validation application service', () => {
     expect(JSON.stringify(recorded)).not.toContain('private-user-node-name')
   })
 
+  test('records modification preservation and postconditions with stable code-only summaries', async () => {
+    const results = await createValidationRegistry().runStage('modify', {
+      modificationPreservation: {
+        findings: [
+          { code: 'unrelated_room_changed', roomId: 'private-room-name' },
+          { code: 'footprint_changed' },
+        ],
+      },
+      modificationPostconditions: {
+        findings: [
+          { code: 'room_area_target_not_met', operationIndex: 3 },
+        ],
+      },
+    })
+    expect(directValidationResults(results)).toEqual([
+      expect.objectContaining({
+        validatorId: 'modification-preservation',
+        status: 'failed',
+        disposition: 'stop',
+        issueCount: 2,
+        summary: {
+          findingCount: 2,
+          findingKinds: ['footprint_changed', 'unrelated_room_changed'],
+        },
+      }),
+      expect.objectContaining({
+        validatorId: 'modification-postconditions',
+        status: 'failed',
+        disposition: 'stop',
+        issueCount: 1,
+        summary: {
+          findingCount: 1,
+          findingKinds: ['room_area_target_not_met'],
+        },
+      }),
+    ])
+    const recorded: unknown[] = []
+    recordDirectValidationResults(results, result => recorded.push(result.summary))
+    expect(JSON.stringify(recorded)).not.toContain('private-room-name')
+  })
+
   test('keeps furniture placement failures repairable and aggregate', async () => {
     const expected = checkFurniturePlacement([], [], [])
     const equivalent = await createValidationRegistry().runStage('furniture', {

@@ -33,6 +33,7 @@ describe('deriveBriefFacts', () => {
     expect(deriveBriefFacts('70㎡ 两室，要独立厨房')).toEqual({ kitchenPreference: 'closed' })
     expect(deriveBriefFacts('独立キッチンの2部屋')).toEqual({ kitchenPreference: 'closed' })
     expect(deriveBriefFacts('two bedrooms with a separate kitchen')).toEqual({ kitchenPreference: 'closed' })
+    expect(deriveBriefFacts('客厅、餐厅和厨房一体式开放连通')).toEqual({ kitchenPreference: 'open' })
     expect(deriveBriefFacts('三室一厅')).toEqual({})
   })
 

@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import matrix from '../eval/crud-matrix.json'
+import { loadEvalCorpus } from '../eval/corpus'
 
 describe('AI CRUD acceptance matrix', () => {
   test('covers every verb and required target without claiming unsupported writes succeed', () => {
@@ -28,13 +29,7 @@ describe('AI CRUD acceptance matrix', () => {
   })
 
   test('keeps paid provider coverage explicit and bounded to existing cases', async () => {
-    const caseIds = new Set(
-      Array.from(
-        new Bun.Glob('case-*.json').scanSync({
-          cwd: new URL('../eval/cases', import.meta.url).pathname,
-        }),
-      ).map(file => file.replace(/\.json$/, '')),
-    )
+    const caseIds = new Set(loadEvalCorpus().caseIds)
     const providerCases = new Set(
       matrix.operations.flatMap(operation => operation.providerCases),
     )

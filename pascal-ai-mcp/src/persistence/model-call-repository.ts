@@ -71,6 +71,7 @@ export interface ModelCallWriter {
 export class ModelCallRepository implements ModelCallWriter {
   private readonly insertStatement
   private readonly byRequestStatement
+  private readonly countsBySessionStatement
 
   constructor(private readonly database: AppDatabase) {
     this.insertStatement = database.connection.prepare(`
@@ -94,6 +95,12 @@ export class ModelCallRepository implements ModelCallWriter {
       SELECT * FROM ai_model_calls
       WHERE request_id = ?
       ORDER BY started_at, call_id, attempt_no
+    `)
+    this.countsBySessionStatement = database.connection.prepare(`
+      SELECT operation, COUNT(DISTINCT call_id) AS call_count
+      FROM ai_model_calls
+      WHERE session_id = ?
+      GROUP BY operation
     `)
   }
 
@@ -135,5 +142,13 @@ export class ModelCallRepository implements ModelCallWriter {
 
   findByRequestId(requestId: string): ModelCallRow[] {
     return this.byRequestStatement.all(requestId) as ModelCallRow[]
+  }
+
+  countDistinctCallsBySession(sessionId: string): Record<string, number> {
+    const rows = this.countsBySessionStatement.all(sessionId) as Array<{
+      operation: string
+      call_count: number
+    }>
+    return Object.fromEntries(rows.map(row => [row.operation, row.call_count]))
   }
 }

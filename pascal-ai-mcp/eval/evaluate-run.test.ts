@@ -4,11 +4,15 @@ import {
   checkBedroomCount,
   checkForbiddenRoomTypes,
   checkRequiredRoomTypes,
+  classifyEvalFailure,
   classifyFailure,
   classifyFurnitureIssues,
   dependencySceneKey,
   determineSuccess,
   findCorpusLevelProblems,
+  modelCallsAfterBaseline,
+  modelCallsForBudget,
+  modelOperationCallDelta,
   resolveDependencySceneId,
   countZonesOfType,
   validateCaseStructure,
@@ -106,6 +110,21 @@ describe('dry-run validation of assertion config', () => {
     )
     expect(problems.some(p => p.includes('targetRoomArea'))).toBe(true)
   })
+
+  test('flags negative or fractional quality tolerances', () => {
+    const problems = validateCaseStructure(
+      {
+        ...base,
+        qualityTolerance: {
+          maxNewCollisions: -1,
+          maxNewDoorClearanceIssues: 0.5,
+        },
+      },
+      ids,
+    )
+    expect(problems.some(problem => problem.includes('maxNewCollisions'))).toBe(true)
+    expect(problems.some(problem => problem.includes('maxNewDoorClearanceIssues'))).toBe(true)
+  })
 })
 
 describe('classifyFailure', () => {
@@ -153,6 +172,89 @@ describe('classifyFailure', () => {
   test('still clarifying is clarification_incomplete', () => {
     const result = classifyFailure('clarifying', '还需要确认以下关键条件：1. 面积是多少？')
     expect(result).toMatchObject({ stage: 'confirmation', code: 'clarification_incomplete' })
+  })
+})
+
+describe('modification failure classification', () => {
+  test('an unresolved second confirmation has a stable modification code', () => {
+    expect(classifyEvalFailure(
+      'awaiting_modification_confirmation',
+      '这项修改需要再次确认。',
+    )).toMatchObject({
+      stage: 'modification',
+      code: 'awaiting_additional_confirmation',
+    })
+  })
+
+  test('safe rejection is not reported as unknown even when the workflow completed', () => {
+    expect(classifyEvalFailure(
+      'completed',
+      '无法把这项请求安全地归类为已支持的局部修改，因此没有更改场景。',
+    )).toMatchObject({
+      stage: 'modification',
+      code: 'modification_safe_rejection',
+    })
+  })
+
+  test('current strict-local rejection wording is classified without relying on assertions', () => {
+    expect(classifyEvalFailure(
+      'completed',
+      '这项请求要求保持无关房间不变，但当前布局找不到可证明安全的局部方案（strict_local_no_safe_plan），因此在写入场景前已停止。没有自动改成整体重排。',
+    )).toMatchObject({
+      stage: 'modification',
+      code: 'modification_safe_rejection',
+    })
+  })
+
+  test('scope protection failures are distinguished from an unmet target', () => {
+    expect(classifyEvalFailure('completed', '完成', [{
+      name: 'modification:preserveExteriorBounds',
+      status: 'fail',
+      reason: '外轮廓变化',
+    }])?.code).toBe('modification_scope_violation')
+    expect(classifyEvalFailure('completed', '完成', [{
+      name: 'modification:targetRoomArea:卧室',
+      status: 'fail',
+      reason: '面积不足',
+    }])?.code).toBe('modification_target_not_met')
+  })
+})
+
+describe('modelCallsAfterBaseline', () => {
+  test('modification budget excludes setupFrom calls', () => {
+    expect(modelCallsAfterBaseline(17, 11)).toBe(6)
+  })
+
+  test('generation baseline zero preserves the total', () => {
+    expect(modelCallsAfterBaseline(8, 0)).toBe(8)
+  })
+
+  test('a stale lower total never produces a negative budget', () => {
+    expect(modelCallsAfterBaseline(3, 5)).toBe(0)
+  })
+
+  test('generation preserves the existing scene-reported budget while modification uses the delta', () => {
+    expect(modelCallsForBudget({
+      modification: false,
+      cumulativeCalls: 12,
+      baselineCalls: 0,
+      sceneReportedCalls: 7,
+    })).toBe(7)
+    expect(modelCallsForBudget({
+      modification: true,
+      cumulativeCalls: 17,
+      baselineCalls: 11,
+      sceneReportedCalls: 4,
+    })).toBe(6)
+  })
+})
+
+describe('modelOperationCallDelta', () => {
+  test('subtracts setup calls per stable operation', () => {
+    expect(modelOperationCallDelta(
+      { 'scene-intent': 3, 'modify-ops': 2 },
+      { 'scene-intent': 3 },
+    )).toEqual({ 'scene-intent': 0, 'modify-ops': 2 })
   })
 })
 

@@ -8,6 +8,7 @@
 
 import { expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
+import { t } from './i18n'
 
 const CJK = /[぀-ヿ一-鿿]/
 const REPLY_ASSIGNMENT = /\breply\s*[:=](?!=)/
@@ -23,4 +24,14 @@ test('agent.ts reply assignments contain no hardcoded CJK literals', () => {
     }
   })
   expect(offenders).toEqual([])
+})
+
+test('safe local rejection explains the risk without exposing an internal reason code', () => {
+  const reply = t('zh', 'modifyStrictLocalUnavailable', {
+    reason: 'strict_local_no_safe_plan',
+  })
+
+  expect(reply).toContain('当前场景没有被修改')
+  expect(reply).toContain('建议在编辑器中手动调整')
+  expect(reply).not.toContain('strict_local_no_safe_plan')
 })

@@ -3,12 +3,14 @@ import {
   assertAdjacency,
   assertAllRoomsReachable,
   assertBounds,
+  assertDefaultQuality,
   assertModification,
   assertPlanFirstResult,
   assertRoomCounts,
   assertTotalArea,
   assertWindowsRequiredFor,
   diffSnapshots,
+  qualityBaseline,
   rollupAssertions,
   type SceneSnapshot,
   type WallInfo,
@@ -548,5 +550,108 @@ describe('批次 D: assertPlanFirstResult', () => {
   test('budget assertion only appears when the case declares a limit', () => {
     const results = assertPlanFirstResult({ gateFailures: [], furniture: { placed: 1, required: 1 } })
     expect(results.some(r => r.name === 'modelCallBudget')).toBe(false)
+  })
+
+  test('an explicit per-case call count overrides the cumulative scene result', () => {
+    const results = assertPlanFirstResult(
+      { gateFailures: [], modelCallsUsed: 17, furniture: { placed: 1, required: 1 } },
+      { maxModelCalls: 8, modelCallsUsed: 6 },
+    )
+    expect(results.find(r => r.name === 'modelCallBudget')).toMatchObject({
+      status: 'pass',
+      actual: 6,
+    })
+  })
+
+  test('per-operation call counts distinguish translation from confirmation replay', () => {
+    const results = assertPlanFirstResult(
+      { gateFailures: [], furniture: { placed: 1, required: 1 } },
+      {
+        expectedModelCallsByOperation: { 'modify-ops': 2 },
+        modelCallsByOperation: { 'modify-ops': 2, 'scene-intent': 2 },
+      },
+    )
+    expect(results.find(r => r.name === 'modelOperationCalls:modify-ops')).toMatchObject({
+      status: 'pass',
+      actual: 2,
+    })
+  })
+
+  test('a gate failure inherited unchanged from the setup scene is waived', () => {
+    const inherited = 'トイレ「トイレ」缺少必备家具：马桶'
+    const results = assertPlanFirstResult(
+      { gateFailures: [inherited], furniture: { placed: 1, required: 1 } },
+      { baselineGateFailures: [inherited] },
+    )
+    expect(results.find(r => r.name === 'gatesPassed')).toMatchObject({
+      status: 'pass',
+    })
+  })
+
+  test('a new gate failure remains blocking when a different setup failure was inherited', () => {
+    const results = assertPlanFirstResult(
+      { gateFailures: ['卧室缺少床'], furniture: { placed: 1, required: 1 } },
+      { baselineGateFailures: ['卫生间缺少马桶'] },
+    )
+    expect(results.find(r => r.name === 'gatesPassed')).toMatchObject({
+      status: 'fail',
+    })
+  })
+})
+
+describe('default quality assertions', () => {
+  test('generation fails on collisions, requirement drift, missing fixtures and blocked doors by default', () => {
+    const results = assertDefaultQuality({
+      collisions: [{ aId: 'item-b', bId: 'item-a', kind: 'overlap' }],
+      requirementMismatches: ['缺少独立厨房'],
+      gateFailures: ['卫生间「客卫」缺少必备家具：洗手台'],
+      furniturePlacement: [{ kind: 'door_clearance', itemId: 'sofa', room: '客厅' }],
+    }, { modification: false })
+    expect(results.every(result => result.status === 'fail')).toBe(true)
+    expect(rollupAssertions(results).allPassed).toBe(false)
+  })
+
+  test('modification reports inherited issues without blaming them on the current change', () => {
+    const baseline = qualityBaseline({
+      collisions: [{ aId: 'a', bId: 'b', kind: 'overlap' }],
+      requirementMismatches: ['旧问题'],
+      gateFailures: ['卫生间缺少必备家具：马桶'],
+      furniturePlacement: [{ kind: 'door_clearance', itemId: 'chair', room: '餐厅' }],
+    })
+    const results = assertDefaultQuality({
+      collisions: [{ aId: 'b', bId: 'a', kind: 'overlap' }],
+      requirementMismatches: ['旧问题'],
+      gateFailures: ['卫生间缺少必备家具：马桶'],
+      furniturePlacement: [{ kind: 'door_clearance', itemId: 'chair', room: '餐厅' }],
+    }, { modification: true, baseline })
+    expect(results.every(result => result.status === 'pass')).toBe(true)
+    expect(results.every(result =>
+      (result.actual as { inheritedCount: number }).inheritedCount === 1,
+    )).toBe(true)
+  })
+
+  test('a modification needs a baseline and reviewed tolerances are explicit', () => {
+    expect(assertDefaultQuality({}, { modification: true })).toEqual([{
+      name: 'quality:baselineAvailable',
+      status: 'unsupported',
+      reason: '修改用例缺少基准质量快照，无法区分继承问题与本次新增问题',
+    }])
+    const tolerated = assertDefaultQuality({
+      collisions: [{ aId: 'a', bId: 'b', kind: 'overlap' }],
+    }, {
+      modification: false,
+      tolerance: { maxNewCollisions: 1 },
+    })
+    expect(tolerated.find(result => result.name === 'quality:newCollisions')?.status).toBe('pass')
+  })
+
+  test('an intentionally removed required fixture reuses the reviewed gate waiver', () => {
+    const results = assertDefaultQuality({
+      gateFailures: ['卧室「次卧」缺少必备家具：床'],
+    }, {
+      modification: false,
+      allowedGateFailures: ['缺少必备家具：床'],
+    })
+    expect(results.find(result => result.name === 'quality:newRequiredFixtureFailures')?.status).toBe('pass')
   })
 })

@@ -16,6 +16,8 @@ import type { NormProfile } from '../norms/profile'
 import { validateLayoutPlan, type PlanTargets, type PlanValidation } from '../plan-validator'
 import type { FurniturePlacementIssue } from '../types'
 import type { LocalPatchScopeFinding } from '../domain/local-patch-scope'
+import type { PreservationFinding } from '../domain/modification-preservation'
+import type { ModificationPostconditionFinding } from '../domain/modification-postconditions'
 import type { DiagnosticsSummary } from './generate-service'
 
 export const VALIDATOR_IDS = {
@@ -27,6 +29,8 @@ export const VALIDATOR_IDS = {
   furniturePlacement: 'furniture-placement',
   modificationProtection: 'modification-protection',
   localPatchScope: 'local-patch-scope',
+  modificationPreservation: 'modification-preservation',
+  modificationPostconditions: 'modification-postconditions',
   sceneDiagnostics: 'scene-diagnostics',
 } as const
 
@@ -35,6 +39,8 @@ export type DirectValidatorId =
   | typeof VALIDATOR_IDS.completionGates
   | typeof VALIDATOR_IDS.sceneDiagnostics
   | typeof VALIDATOR_IDS.localPatchScope
+  | typeof VALIDATOR_IDS.modificationPreservation
+  | typeof VALIDATOR_IDS.modificationPostconditions
 
 export type ValidationUnavailableReason = 'cancelled' | 'timeout' | 'tool_error'
 
@@ -61,6 +67,8 @@ export type ValidationContext = {
   furniturePlacementIssues?: FurniturePlacementIssue[]
   modificationProtection?: { evaluate: () => string[] | Promise<string[]> }
   localPatchScope?: { findings: LocalPatchScopeFinding[] }
+  modificationPreservation?: { findings: PreservationFinding[] }
+  modificationPostconditions?: { findings: ModificationPostconditionFinding[] }
   sceneDiagnostics?: DiagnosticsSummary
   unavailable?: {
     validatorId: DirectValidatorId
@@ -241,6 +249,52 @@ export function createValidationRegistry(): ValidationRegistry<ValidationContext
         return unavailableOutput(context.unavailable.reason)
       }
       const findings = context.localPatchScope!.findings
+      return {
+        status: findings.length === 0 ? 'passed' as const : 'failed' as const,
+        issueCount: findings.length,
+        summary: {
+          findingCount: findings.length,
+          findingKinds: [...new Set(findings.map(finding => finding.code))].sort(),
+        },
+        disposition: findings.length === 0 ? 'continue' as const : 'stop' as const,
+        value: findings,
+      }
+    },
+  })
+
+  registry.register({
+    id: VALIDATOR_IDS.modificationPreservation,
+    stages: ['modify'],
+    scope: 'modification-preservation',
+    severity: 'error',
+    inputRequirements: ['before plan', 'candidate or executed plan', 'preservation policy'],
+    auditMode: 'direct',
+    canRun: context => context.modificationPreservation !== undefined,
+    evaluate: context => {
+      const findings = context.modificationPreservation!.findings
+      return {
+        status: findings.length === 0 ? 'passed' as const : 'failed' as const,
+        issueCount: findings.length,
+        summary: {
+          findingCount: findings.length,
+          findingKinds: [...new Set(findings.map(finding => finding.code))].sort(),
+        },
+        disposition: findings.length === 0 ? 'continue' as const : 'stop' as const,
+        value: findings,
+      }
+    },
+  })
+
+  registry.register({
+    id: VALIDATOR_IDS.modificationPostconditions,
+    stages: ['modify'],
+    scope: 'modification-postconditions',
+    severity: 'error',
+    inputRequirements: ['before plan', 'after plan', 'canonical modification plan'],
+    auditMode: 'direct',
+    canRun: context => context.modificationPostconditions !== undefined,
+    evaluate: context => {
+      const findings = context.modificationPostconditions!.findings
       return {
         status: findings.length === 0 ? 'passed' as const : 'failed' as const,
         issueCount: findings.length,

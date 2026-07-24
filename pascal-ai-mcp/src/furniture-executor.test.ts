@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { checkFurniturePlacement, type ItemSummary, type WallWithOpenings, type ZoneSummary } from './agent'
 import {
+  doorClearanceDepths,
   doorClearances,
   executeFurniturePlan,
   findWallPlacement,
@@ -214,6 +215,27 @@ describe('executeFurniturePlan', () => {
     expect(report.placed[0]!.label).toBe('灶台')
   })
 
+  test('places the washbasin and toilet before lower-priority wet fixtures', async () => {
+    const bathroom: FurnitureRoom = {
+      id: 'bath-1',
+      name: '卫生间',
+      type: 'bathroom',
+      polygon: [[0, 0], [3.2, 0], [3.2, 2.6], [0, 2.6]],
+      zoneId: 'zone-bath',
+    }
+    const { callMcp } = makeMockMcp({
+      walls: [] as never,
+      catalog: {
+        'bathroom vanity': [{ id: 'basin', name: 'Bathroom Vanity Basin', dimensions: [0.6, 0.8, 0.45] }],
+        toilet: [{ id: 'toilet', name: 'Compact Toilet', dimensions: [0.65, 0.8, 0.75] }],
+        shower: [{ id: 'shower', name: 'Compact Shower Cabin', dimensions: [0.8, 2, 0.8] }],
+      },
+    })
+    const report = await executeFurniturePlan({ rooms: [bathroom], levelId: 'level-1', callMcp })
+    expect(report.missing).toEqual([])
+    expect(report.placed.map(entry => entry.label)).toEqual(['洗手台', '马桶', '淋浴或浴缸'])
+  })
+
   // Replica of eval case-05's 小厨房 (1.89×2.27): every stove spec is wider
   // than the longest wall — the report must name the catalog gap, not the
   // generic "crowded room" reason.
@@ -246,6 +268,40 @@ describe('executeFurniturePlan', () => {
     expect(report.placed).toEqual([])
     expect(report.missing.every(m => m.reason.includes('检索不到'))).toBe(true)
   })
+
+  test('a 1.13m Japanese toilet room can place the compact toilet beside its outward-opening door', async () => {
+    const toiletRoom: FurnitureRoom = {
+      id: 'wc',
+      name: 'トイレ',
+      type: 'bathroom',
+      polygon: [[0, 0], [1.13, 0], [1.13, 1.94], [0, 1.94]],
+      zoneId: 'zone-wc',
+    }
+    const { callMcp } = makeMockMcp({
+      walls: [{
+        id: 'wc-door',
+        start: [0, 0],
+        end: [0, 1.94],
+        openings: [{ type: 'door', position: [0.97, 1.05, 0], width: 0.9 }],
+      }] as never,
+      catalog: {
+        toilet: [{
+          id: 'toilet-compact',
+          name: 'Compact Toilet',
+          dimensions: [0.4221, 0.5126, 0.6681],
+          tags: ['compact'],
+        }],
+      },
+    })
+    const report = await executeFurniturePlan({
+      rooms: [toiletRoom],
+      levelId: 'level-1',
+      callMcp,
+      market: 'jp',
+    })
+    expect(report.missing).toEqual([])
+    expect(report.placed.map(item => item.catalogItemId)).toEqual(['toilet-compact'])
+  })
 })
 
 describe('placement geometry', () => {
@@ -264,6 +320,61 @@ describe('placement geometry', () => {
     const [x, , z] = spot!.position
     const insideClearance = x + 0.5 > 1.45 && x - 0.5 < 2.55 && z - 0.95 < 0.75
     expect(insideClearance).toBe(false)
+  })
+
+  test('findWallPlacement also respects the MCP unrotated collision envelope', () => {
+    expect(findWallPlacement({
+      polygon: bedroom.polygon,
+      itemDims: [1, 0.5, 1.9],
+      occupied: [],
+      collisionOccupied: [{ minX: -10, maxX: 10, minZ: -10, maxZ: 10 }],
+      keepClear: [],
+    })).toBeNull()
+  })
+
+  test('compact wet rooms keep a shallow threshold clearance on their side of the door', () => {
+    const toiletRoom: FurnitureRoom = {
+      id: 'wc',
+      name: 'トイレ',
+      type: 'bathroom',
+      polygon: [[0, 0], [1.13, 0], [1.13, 1.94], [0, 1.94]],
+      zoneId: 'zone-wc',
+    }
+    const clearances = doorClearances([{
+      start: [0, 0],
+      end: [0, 1.94],
+      openings: [{ type: 'door', position: [0.97, 1.05, 0], width: 0.9 }],
+    }], [toiletRoom])
+    expect(clearances[0]?.minX).toBeCloseTo(-0.75)
+    expect(clearances[0]?.maxX).toBeCloseTo(0.35)
+    expect(clearances[0]?.minZ).toBeCloseTo(0.47)
+    expect(clearances[0]?.maxZ).toBeCloseTo(1.47)
+    expect(findWallPlacement({
+      polygon: toiletRoom.polygon,
+      itemDims: [0.4221, 0.5126, 0.6681],
+      occupied: [],
+      keepClear: clearances,
+    })).not.toBeNull()
+  })
+
+  test('wet-side detection samples the door position instead of a long wall midpoint', () => {
+    const rooms: FurnitureRoom[] = [{
+      id: 'wc-at-end',
+      name: 'トイレ',
+      type: 'bathroom',
+      polygon: [[8, 0], [10, 0], [10, 2], [8, 2]],
+      zoneId: 'zone-wc',
+    }, {
+      id: 'corridor',
+      name: '走廊',
+      type: 'hallway',
+      polygon: [[0, -2], [10, -2], [10, 0], [0, 0]],
+      zoneId: 'zone-corridor',
+    }]
+    expect(doorClearanceDepths([0, 0], [10, 0], rooms, 9)).toEqual({
+      negative: 0.75,
+      positive: 0.35,
+    })
   })
 
   test('rankCandidates sorts by footprint ascending with compact tiebreak', () => {

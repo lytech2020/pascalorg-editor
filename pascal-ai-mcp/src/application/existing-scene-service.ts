@@ -35,14 +35,9 @@ export function planExistingSceneRequest(
   delete session.pendingModificationMode
   delete session.pendingModificationReasonCode
   delete session.pendingModificationPlanHash
+  delete session.pendingModifyPlan
   delete session.modifyModeConfirmed
   delete session.modifyDriftConfirmed
-  if (intent === 'delete') {
-    session.phase = 'awaiting_modification_confirmation'
-    const reply = t(session.language, 'deleteConfirm', { message })
-    session.messages.push({ role: 'assistant', content: reply })
-    return { session, reply, next: 'finish' }
-  }
   session.phase = 'modifying'
   const reply = intent === 'create'
     ? t(session.language, 'sceneCreateStarting', { message })

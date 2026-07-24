@@ -18,11 +18,23 @@ export function planIngestAction(input: ChatInput, session: WorkflowSession): In
   if (input.action === 'cancel') {
     session.phase = 'cancelled'
     session.questions = []
+    delete session.pendingModification
+    delete session.pendingOperation
+    delete session.pendingModificationMode
+    delete session.pendingModificationReasonCode
+    delete session.pendingModificationPlanHash
+    delete session.pendingModifyPlan
+    delete session.modifyModeConfirmed
+    delete session.modifyDriftConfirmed
     return { kind: 'reply', reply: t(session.language, 'taskCancelled', {}) }
   }
 
   if (input.action === 'confirm') {
-    if (session.phase === 'awaiting_modification_confirmation' && session.pendingModification) {
+    if (
+      session.phase === 'awaiting_modification_confirmation'
+      && session.pendingModification
+      && session.pendingModifyPlan
+    ) {
       if (session.pendingModificationMode === 'plan_rebuild') {
         session.modifyModeConfirmed = true
       }
@@ -55,6 +67,7 @@ export function planIngestAction(input: ChatInput, session: WorkflowSession): In
     delete session.pendingModificationMode
     delete session.pendingModificationReasonCode
     delete session.pendingModificationPlanHash
+    delete session.pendingModifyPlan
     delete session.modifyModeConfirmed
     delete session.modifyDriftConfirmed
     return { kind: 'route-existing', message }

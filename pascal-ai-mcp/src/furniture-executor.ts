@@ -79,6 +79,11 @@ const MAX_CANDIDATES = 4
 
 export type Footprint2D = { minX: number; maxX: number; minZ: number; maxZ: number }
 
+type ClearanceRoom = {
+  type: RoomType
+  polygon: Array<[number, number]>
+}
+
 export type CatalogCandidate = {
   id: string
   name: string
@@ -135,7 +140,35 @@ function footprintInsidePolygon(fp: Footprint2D, polygon: Array<[number, number]
 
 // Door keep-clear rectangles, same construction as checkFurniturePlacement:
 // door width (+slack) along the wall × DOOR_CLEARANCE_DEPTH_M on both sides.
-export function doorClearances(walls: DoorWall[]): Footprint2D[] {
+export function doorClearanceDepths(
+  start: [number, number],
+  end: [number, number],
+  rooms: readonly ClearanceRoom[],
+  doorAlong?: number,
+): { negative: number; positive: number } {
+  const horizontal = Math.abs(start[1] - end[1]) <= 0.05
+  const constant = horizontal ? (start[1] + end[1]) / 2 : (start[0] + end[0]) / 2
+  const along = doorAlong ?? (
+    horizontal ? (start[0] + end[0]) / 2 : (start[1] + end[1]) / 2
+  )
+  const wetAt = (normal: number): boolean => [0.05, 0.1, 0.2].some(offset =>
+    rooms.some(room =>
+      room.type === 'bathroom'
+      && pointInPolygon(
+        horizontal ? along : constant + Math.sign(normal) * offset,
+        horizontal ? constant + Math.sign(normal) * offset : along,
+        room.polygon,
+      )))
+  return {
+    negative: wetAt(-0.1) ? 0.35 : DOOR_CLEARANCE_DEPTH_M,
+    positive: wetAt(0.1) ? 0.35 : DOOR_CLEARANCE_DEPTH_M,
+  }
+}
+
+export function doorClearances(
+  walls: DoorWall[],
+  rooms: readonly ClearanceRoom[] = [],
+): Footprint2D[] {
   const clearances: Footprint2D[] = []
   for (const wall of walls) {
     const [sx, sz] = wall.start
@@ -154,9 +187,10 @@ export function doorClearances(walls: DoorWall[]): Footprint2D[] {
       const alongLo = along - width / 2 - BOUNDS_SLACK_M
       const alongHi = along + width / 2 + BOUNDS_SLACK_M
       const constant = axisX ? (sz + ez) / 2 : (sx + ex) / 2
+      const depths = doorClearanceDepths(wall.start, wall.end, rooms, along)
       clearances.push(axisX
-        ? { minX: alongLo, maxX: alongHi, minZ: constant - DOOR_CLEARANCE_DEPTH_M, maxZ: constant + DOOR_CLEARANCE_DEPTH_M }
-        : { minX: constant - DOOR_CLEARANCE_DEPTH_M, maxX: constant + DOOR_CLEARANCE_DEPTH_M, minZ: alongLo, maxZ: alongHi })
+        ? { minX: alongLo, maxX: alongHi, minZ: constant - depths.negative, maxZ: constant + depths.positive }
+        : { minX: constant - depths.negative, maxX: constant + depths.positive, minZ: alongLo, maxZ: alongHi })
     }
   }
   return clearances
@@ -170,9 +204,10 @@ export function findWallPlacement(options: {
   polygon: Array<[number, number]>
   itemDims: [number, number, number]
   occupied: Footprint2D[]
+  collisionOccupied?: Footprint2D[]
   keepClear: Footprint2D[]
 }): { position: [number, number, number]; rotationY: number } | null {
-  const { polygon, itemDims, occupied, keepClear } = options
+  const { polygon, itemDims, occupied, collisionOccupied = occupied, keepClear } = options
   const [w, , d] = itemDims
   for (let i = 0; i < polygon.length; i++) {
     const [sx, sz] = polygon[i]!
@@ -202,8 +237,11 @@ export function findWallPlacement(options: {
       const cx = sx + ux * t + nx * centerOffset
       const cz = sz + uz * t + nz * centerOffset
       const fp = footprintAt(cx, cz, w, d, rotationY)
+      const collisionFp = footprintAt(cx, cz, w, d, 0)
       if (!footprintInsidePolygon(fp, polygon)) continue
       if (occupied.some(other => footprintsIntersect(fp, other, -SCAN_CLEARANCE_M))) continue
+      if (collisionOccupied.some(other =>
+        footprintsIntersect(collisionFp, other, -SCAN_CLEARANCE_M))) continue
       if (keepClear.some(zone => footprintsIntersect(fp, zone, -SCAN_CLEARANCE_M))) continue
       return { position: [cx, 0, cz], rotationY }
     }
@@ -299,13 +337,14 @@ export async function executeFurniturePlan(options: {
         return Boolean(value) && isNumberPair(value.start) && isNumberPair(value.end) && Array.isArray(value.openings)
       })
     : []
-  const keepClear = doorClearances(walls)
+  const keepClear = doorClearances(walls, rooms)
 
   // Existing items (modify path / idempotent re-runs): they both satisfy
   // checklist requirements and occupy floor space.
   const summaryPayload = await callWithRetry(callMcp, 'get_level_summary', {}, issues, '读取已放置家具', beforeCall)
   const existingItems = Array.isArray(summaryPayload?.items) ? summaryPayload.items : []
   const occupied: Footprint2D[] = []
+  const collisionOccupied: Footprint2D[] = []
   const existingByRoom = new Map<string, string[]>()
   for (const entry of existingItems) {
     const item = entry as {
@@ -320,6 +359,7 @@ export async function executeFurniturePlan(options: {
     const dims = isNumberTriple(item.asset?.dimensions) ? item.asset.dimensions : [1, 1, 1] as [number, number, number]
     const rotationY = isNumberTriple(item.rotation) ? item.rotation[1] : 0
     occupied.push(footprintAt(position[0], position[2], dims[0], dims[2], rotationY))
+    collisionOccupied.push(footprintAt(position[0], position[2], dims[0], dims[2], 0))
     const home = rooms.find(room => pointInPolygon(position[0], position[2], room.polygon))
     if (home && typeof item.name === 'string') {
       existingByRoom.set(home.id, [...(existingByRoom.get(home.id) ?? []), item.name])
@@ -366,7 +406,9 @@ export async function executeFurniturePlan(options: {
     }
     const minFootprint = (candidates: Array<{ candidate: CatalogCandidate }>) =>
       Math.min(...candidates.slice(0, MAX_CANDIDATES).map(({ candidate }) => candidate.dimensions[0] * candidate.dimensions[2]))
-    resolved.sort((a, b) => minFootprint(b.candidates) - minFootprint(a.candidates))
+    resolved.sort((a, b) =>
+      b.requirement.placementPriority - a.requirement.placementPriority
+      || minFootprint(b.candidates) - minFootprint(a.candidates))
     for (const { requirement, candidates } of resolved) {
       let done = false
       for (const { candidate } of candidates.slice(0, MAX_CANDIDATES)) {
@@ -374,20 +416,9 @@ export async function executeFurniturePlan(options: {
           polygon: room.polygon,
           itemDims: candidate.dimensions,
           occupied,
+          collisionOccupied,
           keepClear,
         })
-          // UB 现实（2026-07-16）：1216/1616 浴室里门净空盒会挡死每一个贴墙
-          // 位，而日本 UB 的门本就是折戸/外开、浴缸贴着门摆是市场常态。
-          // 豁免收得很窄：仅 jp 市场 + bathroom + 淋浴/浴缸这一项重扫——
-          // 马桶/洗手台和非 jp 市场照常尊重门净空，与已放家具的碰撞照查。
-          ?? (market === 'jp' && room.type === 'bathroom' && requirement.key === 'shower_or_bathtub'
-            ? findWallPlacement({
-                polygon: room.polygon,
-                itemDims: candidate.dimensions,
-                occupied,
-                keepClear: [],
-              })
-            : null)
         if (!spot) continue
         const payload = await callWithRetry(
           callMcp,
@@ -410,6 +441,13 @@ export async function executeFurniturePlan(options: {
           candidate.dimensions[0],
           candidate.dimensions[2],
           spot.rotationY,
+        ))
+        collisionOccupied.push(footprintAt(
+          spot.position[0],
+          spot.position[2],
+          candidate.dimensions[0],
+          candidate.dimensions[2],
+          0,
         ))
         placed.push({
           room: room.name,

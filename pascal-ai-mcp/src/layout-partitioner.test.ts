@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { absorbRoomInPlan, partitionLayout, planDeviation, planRoomAreas } from './layout-partitioner'
+import { absorbRoomInPlan, absorbRoomsInPlan, partitionLayout, planDeviation, planRoomAreas } from './layout-partitioner'
 import { validateLayoutPlan, type PlanTargets } from './plan-validator'
 import { polygonArea, polygonBounds, type LayoutIntent } from './layout-plan'
 
@@ -134,6 +134,78 @@ describe('partitionLayout: typical intents produce validator-clean plans', () =>
         { type: 'living', count: 1 },
         { type: 'kitchen', count: 1 },
         { type: 'bedroom', count: 2 },
+      ],
+    })
+  })
+})
+
+describe('large provider-eval layouts (G6)', () => {
+  test('case-11 open LDK, three bedrooms and three walk-in closets stays valid', () => {
+    const intent: LayoutIntent = {
+      targetTotalAreaSqm: 140,
+      rooms: [
+        { id: 'ldk', name: '客餐厨', type: 'living_kitchen', targetAreaSqm: 45 },
+        ...[1, 2, 3].map(index => ({
+          id: `bed-${index}`,
+          name: `卧室${index}`,
+          type: 'bedroom' as const,
+          targetAreaSqm: 16,
+        })),
+        ...[1, 2].map(index => ({
+          id: `bath-${index}`,
+          name: `卫生间${index}`,
+          type: 'bathroom' as const,
+          targetAreaSqm: 5,
+        })),
+        ...[1, 2, 3].map(index => ({
+          id: `closet-${index}`,
+          name: `步入式衣帽间${index}`,
+          type: 'storage' as const,
+          targetAreaSqm: 4,
+        })),
+      ],
+    }
+    expectValidPlan(intent, {
+      requiredRooms: [
+        { type: 'bedroom', count: 3 },
+        { type: 'bathroom', count: 2 },
+      ],
+    })
+  })
+
+  test('case-15 five bedrooms, three bathrooms and a windowless laundry room stays valid', () => {
+    const intent: LayoutIntent = {
+      targetTotalAreaSqm: 180,
+      rooms: [
+        ...Array.from({ length: 5 }, (_, index) => ({
+          id: `bed-${index}`,
+          name: `卧室${index + 1}`,
+          type: 'bedroom' as const,
+          targetAreaSqm: 15,
+        })),
+        { id: 'living', name: '客厅', type: 'living', targetAreaSqm: 28 },
+        { id: 'dining', name: '餐厅', type: 'dining', targetAreaSqm: 14 },
+        { id: 'kitchen', name: '厨房', type: 'kitchen', targetAreaSqm: 10 },
+        ...Array.from({ length: 3 }, (_, index) => ({
+          id: `bath-${index}`,
+          name: `卫生间${index + 1}`,
+          type: 'bathroom' as const,
+          targetAreaSqm: 5,
+        })),
+        {
+          id: 'laundry',
+          name: '家政间',
+          type: 'other',
+          targetAreaSqm: 6,
+          requiresExteriorWindow: false,
+        },
+        { id: 'storage', name: '储物间', type: 'storage', targetAreaSqm: 5 },
+      ],
+    }
+    expectValidPlan(intent, {
+      requiredRooms: [
+        { type: 'bedroom', count: 5 },
+        { type: 'bathroom', count: 3 },
       ],
     })
   })
@@ -583,6 +655,27 @@ describe('absorbRoomInPlan: local removal by absorption (MODIFY_REDESIGN §6 修
     // Footprint untouched, connections to the bathroom pruned.
     expect(result.plan.footprint).toEqual(plan.footprint)
     expect(result.plan.connections.some(c => c.from === 'bath-1' || c.to === 'bath-1')).toBe(false)
+  })
+
+  test('a semantic bathroom removal absorbs a split toilet/bath/wash group', () => {
+    const plan = {
+      footprint: { width: 4, depth: 5 },
+      entry: { roomId: 'entry' },
+      rooms: [
+        { id: 'entry', name: '玄関', type: 'entry' as const, polygon: [[0, 0], [3, 0], [3, 3], [0, 3]] as Array<[number, number]>, requiresExteriorWindow: false },
+        { id: 'wc', name: 'トイレ', type: 'bathroom' as const, polygon: [[3, 0], [4, 0], [4, 1], [3, 1]] as Array<[number, number]>, requiresExteriorWindow: false },
+        { id: 'bath', name: '浴室', type: 'bathroom' as const, polygon: [[3, 1], [4, 1], [4, 2], [3, 2]] as Array<[number, number]>, requiresExteriorWindow: false },
+        { id: 'wash', name: '洗面室', type: 'bathroom' as const, polygon: [[3, 2], [4, 2], [4, 3], [3, 3]] as Array<[number, number]>, requiresExteriorWindow: false },
+        { id: 'living', name: 'LDK', type: 'living_kitchen' as const, polygon: [[0, 3], [4, 3], [4, 5], [0, 5]] as Array<[number, number]>, requiresExteriorWindow: true },
+      ],
+      connections: [],
+    }
+    const result = absorbRoomsInPlan(plan, ['wc', 'bath', 'wash'], 3)
+    if (!result) throw new Error('expected split bathroom absorption')
+    expect(result.plan.rooms.filter(room => room.type === 'bathroom')).toEqual([])
+    expect(new Set(result.absorbedInto.map(room => room.id)).size).toBe(1)
+    expect(result.plan.rooms.find(room => room.id === 'entry')?.polygon)
+      .toEqual([[0, 0], [4, 0], [4, 3], [0, 3]])
   })
 
   test('band column (bedroom) absorbs into its adjacent room', () => {

@@ -11,7 +11,7 @@
 // as an open-kitchen demand for a 1K target (Codex 复审 #2). The spelled-out
 // リビングダイニングキッチン stays: writing the full phrase is a real ask.
 const OPEN_KITCHEN_PATTERN =
-  /开放式?厨房|开敞厨房|オープンキッチン|対面キッチン|\bopen(?:-| )?(?:plan )?kitchen\b|リビングダイニングキッチン/i
+  /开放式?厨房|开敞厨房|(?:客厅|起居室|餐厅).{0,16}厨房.{0,12}(?:一体|开放|连通)|オープンキッチン|対面キッチン|\bopen(?:-| )?(?:plan )?kitchen\b|リビングダイニングキッチン/i
 
 // Explicit closed/independent-kitchen wording.
 const CLOSED_KITCHEN_PATTERN =

@@ -34,6 +34,7 @@ import { validateLayoutPlan, type PlanTargets, type PlanValidation } from './pla
 import { applyStrategy, strategyPromptLines, type StrategyDecision } from './strategy'
 import type { ChatMessage } from './types'
 import { renderPrompt, type PromptAuditMetadata } from './prompts/registry'
+import { checkWetRoomFurnitureFeasibility } from './domain/furniture-feasibility'
 
 // One plain-text completion (no tools). The agent wires this to its model
 // client with fallback + call budgeting; tests inject a stub.
@@ -204,17 +205,26 @@ export async function buildLayoutPlan(
     )
     directTemplateTrace = direct.matchTrace
     if (direct.seed && direct.intent) {
-      const extraNotes = [...direct.seed.notes, ...options.strategy.notes]
-      return {
-        ok: true,
-        intent: direct.intent,
-        plan: {
-          ...direct.seed.plan,
-          notes: [...(direct.seed.plan.notes ?? []), ...extraNotes],
-        },
-        validation: direct.seed.validation,
-        modelCalls: 0,
-        templateTrace: direct.matchTrace,
+      const furnitureFeasibility = checkWetRoomFurnitureFeasibility(direct.seed.plan, profile.id)
+      if (furnitureFeasibility.length > 0) {
+        directTemplateTrace.rejections.push({
+          templateId: direct.seed.templateId,
+          reasonCodes: furnitureFeasibility.map(finding =>
+            `${finding.roomId}:${finding.requirementKey}:required_wet_fixture_set_unplaceable`),
+        })
+      } else {
+        const extraNotes = [...direct.seed.notes, ...options.strategy.notes]
+        return {
+          ok: true,
+          intent: direct.intent,
+          plan: {
+            ...direct.seed.plan,
+            notes: [...(direct.seed.plan.notes ?? []), ...extraNotes],
+          },
+          validation: direct.seed.validation,
+          modelCalls: 0,
+          templateTrace: direct.matchTrace,
+        }
       }
     }
   }
@@ -314,7 +324,7 @@ function evaluateIntentReply(
   // deterministic corrections instead of a model correction round. The
   // applied intent is what gets partitioned AND what the caller persists.
   const applied = strategy ? applyStrategy(parsed.intent, strategy, profile) : { intent: parsed.intent, notes: [] }
-  const intent = applied.intent
+  const intent = inputsAreaOverride(applied.intent, targets)
   // Template seeding (docs/TEMPLATES.md): a good reference with the same
   // core program beats the solver — real listed plans carry idioms the
   // partitioner hasn't learned. No hit (or a post-scale fatal) falls through
@@ -336,18 +346,24 @@ function evaluateIntentReply(
   })
   const seedTraceField = seedTrace.length > 0 ? { seedTrace } : {}
   if (seed) {
-    const extraNotes = [...seed.notes, ...(strategy?.notes ?? []), ...applied.notes]
-    const plan = { ...seed.plan, notes: [...(seed.plan.notes ?? []), ...extraNotes] }
-    return {
-      ok: true,
-      result: {
+    const furnitureFeasibility = checkWetRoomFurnitureFeasibility(seed.plan, profile.id)
+    if (furnitureFeasibility.length > 0) {
+      seedTrace.push(...furnitureFeasibility.map(finding =>
+        `${finding.roomId}:${finding.requirementKey}:required_wet_fixture_set_unplaceable`))
+    } else {
+      const extraNotes = [...seed.notes, ...(strategy?.notes ?? []), ...applied.notes]
+      const plan = { ...seed.plan, notes: [...(seed.plan.notes ?? []), ...extraNotes] }
+      return {
         ok: true,
-        intent,
-        plan,
-        validation: seed.validation,
-        templateTrace,
-        ...seedTraceField,
-      },
+        result: {
+          ok: true,
+          intent,
+          plan,
+          validation: seed.validation,
+          templateTrace,
+          ...seedTraceField,
+        },
+      }
     }
   }
   templateTrace.mode = 'fallback'
@@ -373,11 +389,14 @@ function evaluateIntentReply(
     }
   }
   const validation = validateLayoutPlan(partition.plan, targets, profile)
-  if (validation.fatal.length > 0) {
+  const furnitureFeasibility = checkWetRoomFurnitureFeasibility(partition.plan, profile.id)
+  if (validation.fatal.length > 0 || furnitureFeasibility.length > 0) {
+    const furnitureFailures = furnitureFeasibility.map(finding =>
+      `湿区 ${finding.roomId} 无法放置必备设备组合（${finding.requirementKey}）`)
     return {
       ok: false,
-      failures: [...errors, ...validation.fatal],
-      failuresL10n: [...noL10n(errors), ...validation.fatalL10n],
+      failures: [...errors, ...validation.fatal, ...furnitureFailures],
+      failuresL10n: [...noL10n(errors), ...validation.fatalL10n, ...noL10n(furnitureFailures)],
       templateTrace,
       ...seedTraceField,
     }
@@ -394,12 +413,25 @@ function evaluateIntentReply(
   }
 }
 
+function inputsAreaOverride(intent: LayoutIntent, targets: PlanTargets): LayoutIntent {
+  return targets.totalAreaSqm !== undefined && targets.totalAreaSqm > 0
+    ? { ...intent, targetTotalAreaSqm: targets.totalAreaSqm }
+    : intent
+}
+
 function evaluateGeometryReply(reply: string, targets: PlanTargets, profile: NormProfile): Attempt {
   const { plan, errors } = parseLayoutPlanJson(reply)
   if (!plan) return { ok: false, failures: errors, failuresL10n: noL10n(errors) }
   const validation = validateLayoutPlan(plan, targets, profile)
-  if (validation.fatal.length > 0) {
-    return { ok: false, failures: validation.fatal, failuresL10n: validation.fatalL10n }
+  const furnitureFeasibility = checkWetRoomFurnitureFeasibility(plan, profile.id)
+  if (validation.fatal.length > 0 || furnitureFeasibility.length > 0) {
+    const furnitureFailures = furnitureFeasibility.map(finding =>
+      `湿区 ${finding.roomId} 无法放置必备设备组合（${finding.requirementKey}）`)
+    return {
+      ok: false,
+      failures: [...validation.fatal, ...furnitureFailures],
+      failuresL10n: [...validation.fatalL10n, ...noL10n(furnitureFailures)],
+    }
   }
   return { ok: true, result: { ok: true, intent: null, plan, validation } }
 }

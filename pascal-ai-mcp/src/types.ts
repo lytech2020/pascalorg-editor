@@ -1,4 +1,5 @@
 import type { LayoutIntent, LayoutPlan, RoomType } from './layout-plan'
+import type { ModifyPlan } from './modify-ops'
 import type { StrategyDecision } from './strategy'
 import type { ModificationMode, ModificationModeReason } from './domain/modification-mode'
 
@@ -204,6 +205,13 @@ export type WorkflowSession = {
   pendingModificationMode?: ModificationMode
   pendingModificationReasonCode?: ModificationModeReason
   pendingModificationPlanHash?: string
+  // Canonical, parsed operations that the user was shown before confirming.
+  // Confirmation executes this exact plan; it never asks the model to
+  // translate the same request a second time.
+  pendingModifyPlan?: ModifyPlan
+  // A local or structural scene write has occurred and its post-write scope
+  // or goal verification has not completed. Such a turn must not be replayed.
+  modificationWriteStarted?: boolean
   modifyModeConfirmed?: boolean
   // Set by the plan-first structural rebuild: the user has EDITED the room
   // program via modify ops, so the completion gates must judge against the

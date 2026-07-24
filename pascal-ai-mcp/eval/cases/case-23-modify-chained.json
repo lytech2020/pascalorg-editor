@@ -28,6 +28,9 @@
   },
   "forbiddenRoomTypes": ["卫生间"],
   "requireAllRoomsReachable": true,
-  "maxModelCalls": 2,
-  "notes": "验证连续修改的快照一致性：第一轮删卫生间走局部吸收（layoutIntent/layoutPlan 快照随之刷新），第二轮 add_room 必须基于删卫后的快照重分区——若第二轮仍看到旧快照（卫生间还在 intent 里），最终会多出卫生间或书房定位失败。第一轮吸收产生的 L 形并集房间也顺带验证重分区对非矩形 previousPlan 的兼容。maxModelCalls 只统计最后一轮 modify（每轮 modify 开头重置 toolTrace），预算 2 = 翻译 1 + 修正重试 ≤1。footprint 先缩（§8-2 删房）后扩（加房），不断言轮廓。"
+  "maxModelCalls": 4,
+  "expectedModelCallsByOperation": {
+    "modify-ops": 2
+  },
+  "notes": "验证连续修改的快照一致性：第一轮删卫生间走局部吸收（layoutIntent/layoutPlan 快照随之刷新），第二轮 add_room 必须基于删卫后的快照重分区——若第二轮仍看到旧快照（卫生间还在 intent 里），最终会多出卫生间或书房定位失败。第一轮吸收产生的 L 形并集房间也顺带验证重分区对非矩形 previousPlan 的兼容。maxModelCalls 统计 setup 完成后的整个修改部分；两轮修改各允许翻译 1 次 + 修正重试 ≤1，因此总预算为 4；另以 expectedModelCallsByOperation 锁住 modify-ops 恰好 2 次，确认请求不得重新翻译。footprint 先缩（§8-2 删房）后扩（加房），不断言轮廓。"
 }

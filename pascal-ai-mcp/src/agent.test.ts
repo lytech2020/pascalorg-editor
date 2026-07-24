@@ -34,6 +34,8 @@ import { planIngestAction, shouldRouteAsExistingSceneRequest } from './applicati
 import { effectiveGateFailures, modifyFailureRecovery } from './application/modify-service'
 import { describeRemainingIssues } from './application/generate-service'
 import { requirementLabelsSatisfiedBy } from './furniture-checklist'
+import { JP_NORM_PROFILE } from './norms/profile'
+import { deriveStrategy } from './strategy'
 import type { ChatInput, DesignBrief, RequirementFact, WorkflowSession } from './types'
 
 const thresholds = { usableConfidence: 0.8, partialConfidence: 0.5 }
@@ -422,6 +424,19 @@ describe('current-state furniture placement check', () => {
     expect(checkFurniturePlacement([room], [doorWall], clear).some(i => i.kind === 'door_clearance')).toBe(false)
   })
 
+  test('a compact toilet at the far wall clears an outward-opening wet-room threshold', () => {
+    const toiletRoom = zone('wc', 'トイレ', [[0, 0], [1.13, 0], [1.13, 1.94], [0, 1.94]])
+    const doorWall: WallWithOpenings = {
+      id: 'wc-door',
+      start: [0, 0],
+      end: [0, 1.94],
+      openings: [{ type: 'door', position: [0.97, 1.05, 0], width: 0.9 } as unknown as { type: string }],
+    }
+    const compactToilet = [item('Compact Toilet', 0.88, 1.5, 0.4221, 0.6681)]
+    expect(checkFurniturePlacement([toiletRoom], [doorWall], compactToilet))
+      .toEqual([])
+  })
+
   test('wall-mounted items are exempt from floor checks', () => {
     const wallArt: ItemSummary = {
       id: 'art',
@@ -557,7 +572,11 @@ describe('ingest state machine: planIngestAction', () => {
   })
 
   test('confirm with a pending modification routes to modify', () => {
-    const s = session({ phase: 'awaiting_modification_confirmation', pendingModification: '换个方向开门' })
+    const s = session({
+      phase: 'awaiting_modification_confirmation',
+      pendingModification: '换个方向开门',
+      pendingModifyPlan: { ops: [{ op: 'rename_room', room: '卧室', name: '主卧' }] },
+    })
     const plan = planIngestAction(input({ action: 'confirm' }), s)
     expect(plan).toMatchObject({ kind: 'route', next: 'modify' })
     expect(s.phase).toBe('modifying')
@@ -570,6 +589,7 @@ describe('ingest state machine: planIngestAction', () => {
       pendingModification: '把卧室扩大',
       pendingModificationMode: 'plan_rebuild',
       pendingModificationReasonCode: 'resize_room',
+      pendingModifyPlan: { ops: [{ op: 'resize_room', room: '卧室', targetAreaSqm: 16 }] },
     })
     const plan = planIngestAction(input({ action: 'confirm' }), s)
     expect(plan).toMatchObject({ kind: 'route', next: 'modify' })
@@ -581,6 +601,18 @@ describe('ingest state machine: planIngestAction', () => {
     const plan = planIngestAction(input({ action: 'confirm' }), s)
     expect(plan.kind).toBe('reply')
     expect(s.phase).toBe('intake')
+  })
+
+  test('confirm rejects a legacy pending modification without a persisted canonical plan', () => {
+    const s = session({
+      phase: 'awaiting_modification_confirmation',
+      pendingModification: '把卧室扩大',
+      pendingModificationMode: 'plan_rebuild',
+    })
+    const plan = planIngestAction(input({ action: 'confirm' }), s)
+    expect(plan.kind).toBe('reply')
+    expect(s.phase).toBe('awaiting_modification_confirmation')
+    expect(s.modifyModeConfirmed).toBeUndefined()
   })
 
   test('empty input asks for something to work with', () => {
@@ -641,6 +673,7 @@ describe('modify-failure recovery', () => {
       pendingModificationMode: 'plan_rebuild',
       pendingModificationReasonCode: 'resize_room',
       pendingModificationPlanHash: 'hash-a',
+      pendingModifyPlan: { ops: [{ op: 'resize_room', room: '卧室', targetAreaSqm: 16 }] },
       modifyModeConfirmed: true,
       modifyDriftConfirmed: true,
     })
@@ -653,8 +686,28 @@ describe('modify-failure recovery', () => {
     expect(s).not.toHaveProperty('pendingModificationMode')
     expect(s).not.toHaveProperty('pendingModificationReasonCode')
     expect(s).not.toHaveProperty('pendingModificationPlanHash')
+    expect(s).not.toHaveProperty('pendingModifyPlan')
     expect(s).not.toHaveProperty('modifyModeConfirmed')
     expect(s).not.toHaveProperty('modifyDriftConfirmed')
+  })
+
+  test('cancel clears a pending canonical modification plan and its consent', () => {
+    const s = session({
+      phase: 'awaiting_modification_confirmation',
+      pendingModification: '删除卧室',
+      pendingOperation: 'delete',
+      pendingModificationMode: 'plan_rebuild',
+      pendingModificationReasonCode: 'remove_room',
+      pendingModificationPlanHash: 'hash-a',
+      pendingModifyPlan: { ops: [{ op: 'remove_room', room: '卧室' }] },
+      modifyModeConfirmed: true,
+      modifyDriftConfirmed: true,
+    })
+    expect(planIngestAction(input({ action: 'cancel' }), s).kind).toBe('reply')
+    expect(s.phase).toBe('cancelled')
+    expect(s).not.toHaveProperty('pendingModification')
+    expect(s).not.toHaveProperty('pendingModifyPlan')
+    expect(s).not.toHaveProperty('modifyModeConfirmed')
   })
 })
 
@@ -677,13 +730,14 @@ describe('plan-first: buildPlanTargets', () => {
     expect(targets.requiredRooms).toContainEqual({ type: 'living', count: 1 })
   })
 
-  test('an entry embedding its own quantity suppresses that exact-count requirement', () => {
+  test('an entry embedding a Chinese quantity becomes an exact bathroom requirement', () => {
     const targets = buildPlanTargets(brief({
       designGoals: [fact('rooms', '功能空间', ['两个卫生间', '厨房'])],
     }))
-    const types = (targets.requiredRooms ?? []).map(entry => entry.type)
-    expect(types).not.toContain('bathroom')
-    expect(types).toContain('kitchen')
+    expect(targets.requiredRooms).toEqual([
+      { type: 'bathroom', count: 2 },
+      { type: 'kitchen', count: 1 },
+    ])
   })
 
   test('empty brief produces empty targets', () => {
@@ -1108,6 +1162,57 @@ describe('bedroomCountFromBriefText（case-04：无数字 bedroom_count 时的�
     const input = goal('房间构成', '2LDK') as DesignBrief
     input.designGoals.push(fact('total_area', '总面积', 55))
     expect(buildPlanTargets(input).totalAreaSqm).toBe(55)
+  })
+
+  test('buildPlanTargets parses approximate area strings and compact Chinese room programs', () => {
+    const extracted = brief({
+      designGoals: [
+        fact('total_area', '总面积', '约180平方米'),
+        fact('room_program', '房间构成', ['五室', '一客厅', '一餐厅', '一厨', '三卫']),
+        fact('bedroom_count', '卧室数', 5),
+      ],
+    })
+    expect(buildPlanTargets(extracted)).toEqual({
+      totalAreaSqm: 180,
+      requiredRooms: [
+        { type: 'bedroom', count: 5 },
+        { type: 'bathroom', count: 3 },
+        { type: 'kitchen', count: 1 },
+        { type: 'living', count: 1 },
+      ],
+    })
+  })
+
+  test('western-style compact program drives a large open-kitchen strategy', () => {
+    const extracted = brief({
+      designGoals: [
+        fact('total_area', '总面积', '约140平方米（按建筑面积理解）'),
+        fact('room_program', '房间构成', '三室两厅两卫一厨'),
+        fact('bedroom_count', '卧室数', 3),
+        fact('open_living_dining_kitchen', '客厅、餐厅和厨房一体式开放连通', '客厅、餐厅、厨房采用一体式开放连通布局'),
+      ],
+    })
+    const targets = buildPlanTargets(extracted)
+    const strategy = deriveStrategy(
+      briefFactsFor(extracted, formatSummary(extracted)),
+      targets,
+      JP_NORM_PROFILE,
+    )
+    expect(targets).toEqual({
+      totalAreaSqm: 140,
+      requiredRooms: [
+        { type: 'bedroom', count: 3 },
+        { type: 'bathroom', count: 2 },
+        { type: 'kitchen', count: 1 },
+        { type: 'living', count: 1 },
+      ],
+    })
+    expect(strategy).toMatchObject({
+      areaBand: 'large',
+      kitchenMode: 'open',
+      kitchenModeSource: 'user',
+      kitchenInScope: true,
+    })
   })
 })
 

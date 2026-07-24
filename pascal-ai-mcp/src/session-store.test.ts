@@ -83,6 +83,40 @@ describe('SQLite session persistence (T1.5)', () => {
     }
   })
 
+  test('persists the canonical pending modification plan across a process restart', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'session-pending-modify-'))
+    const filePath = join(dir, 'ai.db')
+    try {
+      const database = new AppDatabase(filePath)
+      const session = sessionFixture('pending-1')
+      session.phase = 'awaiting_modification_confirmation'
+      session.pendingModification = '把主卧扩大到16平方米'
+      session.pendingModificationMode = 'plan_rebuild'
+      session.pendingModificationReasonCode = 'resize_room'
+      session.pendingModificationPlanHash = 'canonical-hash'
+      session.pendingModifyPlan = {
+        ops: [{ op: 'resize_room', room: '主卧', targetAreaSqm: 16 }],
+        preservation: {
+          mode: 'allow_rebuild',
+          allowedRoomRefs: ['主卧'],
+          preserveFootprint: false,
+        },
+      }
+      new SqliteSessionPersistence(database).save(session, 0)
+      database.close()
+
+      const reopened = new AppDatabase(filePath)
+      expect(new SqliteSessionPersistence(reopened).load('pending-1')?.session)
+        .toMatchObject({
+          pendingModificationPlanHash: 'canonical-hash',
+          pendingModifyPlan: session.pendingModifyPlan,
+        })
+      reopened.close()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   test('legacy sessions.json imports once, never overwrites SQLite, and remains unchanged', () => {
     const dir = mkdtempSync(join(tmpdir(), 'session-legacy-'))
     const legacyPath = join(dir, 'sessions.json')

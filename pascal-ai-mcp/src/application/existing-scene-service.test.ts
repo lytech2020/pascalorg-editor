@@ -3,12 +3,31 @@ import { inspectExistingScene, planExistingSceneRequest } from './existing-scene
 import type { WorkflowSession } from '../types'
 
 describe('existing scene application service', () => {
-  test('routes destructive changes through confirmation', () => {
+  test('routes destructive changes through plan translation before the single confirmation', () => {
     const session = baseSession()
     const result = planExistingSceneRequest(session, 'remove that wall', 'delete')
-    expect(result.next).toBe('finish')
-    expect(result.session.phase).toBe('awaiting_modification_confirmation')
+    expect(result.next).toBe('modify')
+    expect(result.session.phase).toBe('modifying')
     expect(result.session.pendingOperation).toBe('delete')
+    expect(result.session.pendingModifyPlan).toBeUndefined()
+  })
+
+  test('all structural request kinds enter translation before any confirmation', () => {
+    for (const [message, operation] of [
+      ['add a study', 'create'],
+      ['remove the bathroom', 'delete'],
+      ['resize the bedroom', 'update'],
+    ] as const) {
+      const result = planExistingSceneRequest(baseSession(), message, operation)
+      expect(result).toMatchObject({
+        next: 'modify',
+        session: {
+          phase: 'modifying',
+          pendingModification: message,
+          pendingOperation: operation,
+        },
+      })
+    }
   })
 
   test('a new modification clears stale mode consent from the previous request', () => {
@@ -16,12 +35,14 @@ describe('existing scene application service', () => {
     session.pendingModificationMode = 'plan_rebuild'
     session.pendingModificationReasonCode = 'remove_room'
     session.pendingModificationPlanHash = 'hash-a'
+    session.pendingModifyPlan = { ops: [{ op: 'remove_room', room: 'bedroom-1' }] }
     session.modifyModeConfirmed = true
     session.modifyDriftConfirmed = true
     const result = planExistingSceneRequest(session, 'rename the bedroom', 'update')
     expect(result.session.pendingModificationMode).toBeUndefined()
     expect(result.session.pendingModificationReasonCode).toBeUndefined()
     expect(result.session.pendingModificationPlanHash).toBeUndefined()
+    expect(result.session.pendingModifyPlan).toBeUndefined()
     expect(result.session.modifyModeConfirmed).toBeUndefined()
     expect(result.session.modifyDriftConfirmed).toBeUndefined()
   })

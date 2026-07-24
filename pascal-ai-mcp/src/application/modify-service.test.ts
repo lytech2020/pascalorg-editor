@@ -91,6 +91,66 @@ describe('modify application service', () => {
       else process.env.PASCAL_MODIFY_LEGACY = previousLegacyFlag
     }
   })
+
+  test('treats a verifier failure after a local write as failed-recoverable without retrying', async () => {
+    const previousLegacyFlag = process.env.PASCAL_MODIFY_LEGACY
+    delete process.env.PASCAL_MODIFY_LEGACY
+    let clearCalls = 0
+    const session = {
+      ...baseSession(),
+      sceneId: 'scene-1',
+      pendingOperation: 'update' as const,
+      pendingModifyPlan: {
+        ops: [{ op: 'rename_room' as const, room: '卧室', name: '书房' }],
+      },
+    }
+    const dependencies: ModifyWorkflowDependencies = {
+      persistSession: () => {},
+      loadScene: async () => ({ version: 4 }),
+      runPlanFirst: async current => {
+        current.modificationWriteStarted = true
+        throw new Error('room_not_renamed')
+      },
+      snapshotScene: async () => ({}),
+      runLegacyPhase: async () => ({ messages: [], toolNamesUsed: new Set(), furnitureIssues: [] }),
+      dedupeSharedWalls: async () => {},
+      checkProtection: async () => [],
+      refine: async () => {
+        throw new Error('refine must not run')
+      },
+      persistScene: async () => null,
+      evaluateGates: async () => ({
+        report: { passed: true, failures: [] },
+        layoutQuality: 1,
+      }),
+      clearDestructiveWrite: () => {
+        clearCalls++
+        return false
+      },
+      isCancellationError: () => false,
+      errorMessage: error => error instanceof Error ? error.message : String(error),
+      planSnapshot: () => '',
+    }
+    try {
+      const result = await runModifyWorkflow({
+        input: { sessionId: session.sessionId },
+        session,
+        reply: '',
+        next: 'modify',
+      }, dependencies)
+      if (!result.session) throw new Error('expected a session result')
+      expect(result.session.phase).toBe('failed')
+      expect(result.reply).toContain('room_not_renamed')
+      expect(result.reply).toContain('禁止自动重试')
+      expect(result.session.pendingModification).toBeUndefined()
+      expect(result.session.pendingModifyPlan).toBeUndefined()
+      expect(result.session.modificationWriteStarted).toBeUndefined()
+      expect(clearCalls).toBe(1)
+    } finally {
+      if (previousLegacyFlag === undefined) delete process.env.PASCAL_MODIFY_LEGACY
+      else process.env.PASCAL_MODIFY_LEGACY = previousLegacyFlag
+    }
+  })
 })
 
 function baseSession(): WorkflowSession {

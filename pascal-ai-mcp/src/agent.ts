@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto'
 import type { GateFailure, GateReport, GateWall } from './completion-gates'
 import type { AppConfig } from './config'
 import { detectLanguage, issueText, t, type Lang } from './lang/i18n'
@@ -12,7 +11,11 @@ import {
   roomNamePattern,
   WINDOW_PATTERN,
 } from './lang/room-vocab'
-import { executeFurniturePlan, type FurnitureRoom } from './furniture-executor'
+import {
+  doorClearanceDepths,
+  executeFurniturePlan,
+  type FurnitureRoom,
+} from './furniture-executor'
 import {
   executeFurnitureModifyOps,
   isChecklistItem,
@@ -20,8 +23,14 @@ import {
   type FurnitureModifyReport,
   type ManualItem,
 } from './furniture-modify'
-import { absorbRoomInPlan, partitionLayout } from './layout-partitioner'
-import { applyModifyOps, parseModifyOps, resolveRoomRef, type FurnitureModifyOp } from './modify-ops'
+import { absorbRoomsInPlan, partitionLayout } from './layout-partitioner'
+import {
+  applyModifyOps,
+  parseModifyOps,
+  resolveRoomRef,
+  type FurnitureModifyOp,
+  type ModifyPlan,
+} from './modify-ops'
 import { computeLayoutQuality } from './layout-metrics'
 import { kitchenIsCirculation } from './layout-plan'
 import type { IssueL10n, LayoutIntent, LayoutPlan, RoomType } from './layout-plan'
@@ -43,6 +52,19 @@ import {
   type LocalPatchScopeFinding,
 } from './domain/local-patch-scope'
 import {
+  normalizeSemanticRemovalPlan,
+  removalIntentRoomIdsForRef,
+  removalRoomIdsForRef,
+  validateExecutedPlan,
+  validatePreservedPlan,
+  withPreservationPolicy,
+  type PreservationFinding,
+} from './domain/modification-preservation'
+import {
+  validateModificationPostconditions,
+  type ModificationPostconditionFinding,
+} from './domain/modification-postconditions'
+import {
   findDoorlessRooms,
   findIsolatedBedrooms,
   findStrayWindows,
@@ -53,6 +75,7 @@ import {
   checkAreaRequirements,
   computeZoneAreaStats,
   FLOOR_AREA_FACT_KEYS,
+  numericFactValue,
   pointInPolygon,
   polygonArea,
   round1,
@@ -70,6 +93,10 @@ import type { ModelClient, ModelClients, RequestHooks } from './ports/model-clie
 import { planIngestAction } from './application/ingest-service'
 import { SceneSpaceService } from './application/scene-space-service'
 import { inspectExistingScene, planExistingSceneRequest } from './application/existing-scene-service'
+import {
+  canonicalModifyPlanHash,
+  resolveModifyPlanForExecution,
+} from './application/modification-plan-service'
 import {
   effectiveGateFailures,
   modifyFailureRecovery,
@@ -212,6 +239,13 @@ class LocalPatchScopeViolationError extends Error {
   constructor(readonly findings: LocalPatchScopeFinding[]) {
     super(`local patch changed nodes outside its allowed scope (${findings.length})`)
     this.name = 'LocalPatchScopeViolationError'
+  }
+}
+
+class ModificationVerificationError extends Error {
+  constructor(readonly codes: string[]) {
+    super(`modification verification failed (${codes.join(',')})`)
+    this.name = 'ModificationVerificationError'
   }
 }
 
@@ -501,6 +535,7 @@ export class PascalAiAgent {
       delete updated.pendingModificationMode
       delete updated.pendingModificationReasonCode
       delete updated.pendingModificationPlanHash
+      delete updated.pendingModifyPlan
       delete updated.modifyModeConfirmed
       delete updated.destructiveSceneWriteStarted
     }
@@ -636,6 +671,35 @@ export class PascalAiAgent {
       VALIDATOR_IDS.localPatchScope,
     )
     if (recorded.length > 0) throw new LocalPatchScopeViolationError(recorded)
+  }
+
+  private async recordPreservationFindings(
+    session: WorkflowSession,
+    findings: PreservationFinding[],
+  ): Promise<PreservationFinding[]> {
+    const results = await this.runValidationStage(session, 'modify', {
+      modificationPreservation: { findings },
+    })
+    return validationValue<PreservationFinding[]>(
+      results,
+      VALIDATOR_IDS.modificationPreservation,
+    )
+  }
+
+  private async verifyModificationPostconditions(
+    session: WorkflowSession,
+    findings: ModificationPostconditionFinding[],
+  ): Promise<void> {
+    const results = await this.runValidationStage(session, 'modify', {
+      modificationPostconditions: { findings },
+    })
+    const recorded = validationValue<ModificationPostconditionFinding[]>(
+      results,
+      VALIDATOR_IDS.modificationPostconditions,
+    )
+    if (recorded.length > 0) {
+      throw new ModificationVerificationError(recorded.map(finding => finding.code))
+    }
   }
 
   private async runChat(input: ChatInput): Promise<ChatResult> {
@@ -1393,33 +1457,40 @@ export class PascalAiAgent {
     // legacy on a transient formatting slip would silently downgrade a clean
     // furniture request to the free-edit path.
     const roomList = rooms.map(room => room.name).join('、')
-    let parsed: ReturnType<typeof parseModifyOps> | null = null
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const prompt = renderPrompt('modify-ops', {
-        roomList,
-        request: feedback,
-        errors: parsed?.errors.join('；') ?? '',
-      })
-      trace.modelCalls++
-      const raw = await this.withModelFallback(session.sessionId, (model, hooks) =>
-        model.complete([
-          { role: 'system', content: prompt.parts.system },
-          {
-            role: 'user',
-            content: attempt === 0 || !parsed ? prompt.parts.user : prompt.parts.retryUser,
-          },
-        ], `${session.sessionId}:modify:ops`, {
-          ...hooks,
-          operation: 'modify-ops',
-          ...promptAudit(prompt),
-          temperature: this.config.aiTemperatureGeometry,
-        }).then(result => result.output),
-      )
-      parsed = parseModifyOps(raw)
-      // Only parse DEFECTS warrant a retry; an empty-ops answer with no
-      // errors is the translator deliberately saying "out of scope".
-      if (parsed.errors.length === 0) break
-    }
+    const parsed = await resolveModifyPlanForExecution({
+      confirmed: session.modifyModeConfirmed === true,
+      pendingPlan: session.pendingModifyPlan,
+      translate: async () => {
+        let translated: ReturnType<typeof parseModifyOps> | null = null
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const prompt = renderPrompt('modify-ops', {
+            roomList,
+            request: feedback,
+            errors: translated?.errors.join('；') ?? '',
+          })
+          trace.modelCalls++
+          const raw = await this.withModelFallback(session.sessionId, (model, hooks) =>
+            model.complete([
+              { role: 'system', content: prompt.parts.system },
+              {
+                role: 'user',
+                content: attempt === 0 || !translated ? prompt.parts.user : prompt.parts.retryUser,
+              },
+            ], `${session.sessionId}:modify:ops`, {
+              ...hooks,
+              operation: 'modify-ops',
+              ...promptAudit(prompt),
+              temperature: this.config.aiTemperatureGeometry,
+            }).then(result => result.output),
+          )
+          translated = parseModifyOps(raw)
+          // Only parse DEFECTS warrant a retry; an empty-ops answer with no
+          // errors is the translator deliberately saying "out of scope".
+          if (translated.errors.length === 0) break
+        }
+        return translated ?? { plan: null, errors: ['未生成修改计划'] }
+      },
+    })
     // Empty ops is the translator's "out of vocabulary / not sure" signal.
     // Do not silently downgrade it to the unconstrained legacy editor.
     if (!parsed?.plan || parsed.errors.length > 0) {
@@ -1430,11 +1501,13 @@ export class PascalAiAgent {
         t(session.language, 'modifyUnsupportedSafe', {}),
       )
     }
+    parsed.plan = withPreservationPolicy(
+      feedback,
+      normalizeSemanticRemovalPlan(feedback, parsed.plan),
+    )
     const modificationDecision = classifyModificationMode(parsed.plan.ops)
     this.recordModificationDecision(session.sessionId, modificationDecision)
-    const modificationPlanHash = createHash('sha256')
-      .update(JSON.stringify(parsed.plan.ops))
-      .digest('hex')
+    const modificationPlanHash = canonicalModifyPlanHash(parsed.plan)
     const confirmedCurrentPlan = confirmedModificationMatches(
       modificationDecision,
       modificationPlanHash,
@@ -1448,6 +1521,7 @@ export class PascalAiAgent {
     session.pendingModificationMode = modificationDecision.mode
     session.pendingModificationReasonCode = modificationDecision.reasonCode
     session.pendingModificationPlanHash = modificationPlanHash
+    session.pendingModifyPlan = structuredClone(parsed.plan)
     if (!confirmedCurrentPlan) delete session.modifyModeConfirmed
 
     // §6 三修 gates 归责基线：修改前场景已有的 gate 失败（用户此前手动
@@ -1470,6 +1544,8 @@ export class PascalAiAgent {
       const beforeSnapshot = snapshotSceneNodes(
         toolPayload(await this.callMcp(session.sessionId, 'get_scene', {})),
       )
+      session.modificationWriteStarted = true
+      this.persistSession(session)
       const report = await executeFurnitureModifyOps({
         ops: parsed.plan.ops as FurnitureModifyOp[],
         rooms,
@@ -1482,6 +1558,12 @@ export class PascalAiAgent {
         beforeSnapshot,
         localPatchAllowances([], report, rooms, parsed.plan.ops as FurnitureModifyOp[], levelId),
       )
+      await this.verifyModificationPostconditions(session, validateModificationPostconditions({
+        before: session.layoutPlan,
+        after: session.layoutPlan,
+        plan: parsed.plan,
+        furnitureReport: report,
+      }))
       trace.converged = true
       return this.finishPlanFirstModify(session, sceneId, loadedVersion, trace, {
         okDetails: report.results.filter(r => r.ok).map(r => r.detail),
@@ -1504,6 +1586,7 @@ export class PascalAiAgent {
         ),
       )
     }
+    const beforePlan = structuredClone(session.layoutPlan)
     if (needsModificationConfirmation(modificationDecision, confirmedCurrentPlan)) {
       const manualDrift = sceneDriftedFromPlan(zones, session.layoutPlan)
       if (manualDrift) session.modifyDriftConfirmed = true
@@ -1523,21 +1606,40 @@ export class PascalAiAgent {
     // fatal 时，才落回下面的稳定性重分区（此时布局变化不可避免，notes 如实告知）。
     if (parsed.plan.ops.length === 1 && parsed.plan.ops[0]!.op === 'remove_room') {
       const removeOp = parsed.plan.ops[0] as { op: 'remove_room'; room: string }
-      const resolved = resolveRoomRef(removeOp.room, session.layoutIntent.rooms)
-      if ('room' in resolved) {
-        const absorbed = absorbRoomInPlan(session.layoutPlan, resolved.room.id, profile.partition.maxRoomAspect)
+      const planRoomIds = removalRoomIdsForRef(session.layoutPlan, removeOp.room)
+      const intentRoomIds = removalIntentRoomIdsForRef(session.layoutIntent, removeOp.room)
+      if (planRoomIds.length > 0 && intentRoomIds.length > 0) {
+        const absorbed = absorbRoomsInPlan(
+          session.layoutPlan,
+          planRoomIds,
+          profile.partition.maxRoomAspect,
+        )
         if (absorbed) {
+          const absorberIds = new Set(absorbed.absorbedInto.map(room => room.id))
+          if (absorberIds.size !== 1) {
+            await this.recordPreservationFindings(session, [{ code: 'strict_local_no_safe_plan' }])
+            return this.finishSafeModificationRejection(
+              session,
+              t(session.language, 'modifyStrictLocalUnavailable', {
+                reason: 'strict_local_no_safe_plan',
+              }),
+            )
+          }
+          const removedIntentIds = new Set(intentRoomIds)
           const localRooms = session.layoutIntent.rooms
-            .filter(room => room.id !== resolved.room.id)
-            .map(room => room.id === absorbed.absorbedInto.id
-              ? { ...room, targetAreaSqm: Math.round(polygonArea(absorbed.absorbedInto.polygon) * 10) / 10 }
-              : room)
+            .filter(room => !removedIntentIds.has(room.id))
+            .map(room => {
+              const planned = absorbed.plan.rooms.find(candidate => candidate.id === room.id)
+              return planned
+                ? { ...room, targetAreaSqm: Math.round(polygonArea(planned.polygon) * 10) / 10 }
+                : room
+            })
           const localIntent: LayoutIntent = {
             targetTotalAreaSqm: session.layoutIntent.targetTotalAreaSqm,
             rooms: localRooms,
           }
           const localAdjacency = session.layoutIntent.adjacency
-            ?.filter(pair => pair.a !== resolved.room.id && pair.b !== resolved.room.id)
+            ?.filter(pair => !removedIntentIds.has(pair.a) && !removedIntentIds.has(pair.b))
           if (localAdjacency && localAdjacency.length > 0) localIntent.adjacency = localAdjacency
           const localValidationResults = await this.runValidationStage(session, 'modify', {
             layoutPlan: {
@@ -1555,6 +1657,18 @@ export class PascalAiAgent {
             VALIDATOR_IDS.layoutPlan,
           )
           if (localValidation.fatal.length === 0) {
+            const preservationFindings = await this.recordPreservationFindings(
+              session,
+              validatePreservedPlan(beforePlan, absorbed.plan, parsed.plan),
+            )
+            if (preservationFindings.length > 0) {
+              return this.finishSafeModificationRejection(
+                session,
+                t(session.language, 'modifyStrictLocalUnavailable', {
+                  reason: preservationFindings[0]!.code,
+                }),
+              )
+            }
             await this.runValidationStage(session, 'modify', {
               layoutPlan: {
                 plan: absorbed.plan,
@@ -1576,7 +1690,9 @@ export class PascalAiAgent {
               zones,
               intent: localIntent,
               plan: absorbed.plan,
-              planNotes: [`重建方案：「${resolved.room.name}」并入「${absorbed.absorbedInto.name}」，其余房间规划位置保持不变`],
+              planNotes: [
+                `重建方案：目标对应的 ${planRoomIds.length} 个空间已局部吸收，其余房间规划位置保持不变`,
+              ],
               // Re-derived from the post-removal intent — the absorbed plan
               // keeps its geometry either way, but the snapshot must not
               // carry a strategy (e.g. tanoji) the new room count no longer
@@ -1591,9 +1707,20 @@ export class PascalAiAgent {
               furnitureOps: [],
               appliedNotes: [],
               baselineGateFailures,
+              beforePlan,
+              modifyPlan: parsed.plan,
             })
           }
         }
+      }
+      if (parsed.plan.preservation?.mode === 'strict_local') {
+        await this.recordPreservationFindings(session, [{ code: 'strict_local_no_safe_plan' }])
+        return this.finishSafeModificationRejection(
+          session,
+          t(session.language, 'modifyStrictLocalUnavailable', {
+            reason: 'strict_local_no_safe_plan',
+          }),
+        )
       }
     }
 
@@ -1626,17 +1753,32 @@ export class PascalAiAgent {
       const beforeSnapshot = snapshotSceneNodes(
         toolPayload(await this.callMcp(session.sessionId, 'get_scene', {})),
       )
-      if (patches.length > 0) await traceMcp('apply_patch', { patches })
-      session.layoutIntent = applied.intent
-      // Keep the plan snapshot's names in step, or the rename would read as
-      // drift on the next structural modify.
-      session.layoutPlan = {
+      const renamedPlan: LayoutPlan = {
         ...session.layoutPlan,
         rooms: session.layoutPlan.rooms.map(room => {
           const entry = renames.find(rename => rename.oldName === room.name)
           return entry ? { ...room, name: entry.newName } : room
         }),
       }
+      const preservationFindings = await this.recordPreservationFindings(
+        session,
+        validatePreservedPlan(beforePlan, renamedPlan, parsed.plan),
+      )
+      if (preservationFindings.length > 0) {
+        return this.finishSafeModificationRejection(
+          session,
+          t(session.language, 'modifyStrictLocalUnavailable', {
+            reason: preservationFindings[0]!.code,
+          }),
+        )
+      }
+      session.modificationWriteStarted = true
+      this.persistSession(session)
+      if (patches.length > 0) await traceMcp('apply_patch', { patches })
+      session.layoutIntent = applied.intent
+      // Keep the plan snapshot's names in step, or the rename would read as
+      // drift on the next structural modify.
+      session.layoutPlan = renamedPlan
       let furnReport: FurnitureModifyReport | null = null
       if (applied.furnitureOps.length > 0) {
         furnReport = await executeFurnitureModifyOps({
@@ -1658,6 +1800,23 @@ export class PascalAiAgent {
           localLevelId,
         ),
       )
+      const actualZonesPayload = toolPayload(await this.callMcp(session.sessionId, 'get_zones', {}))
+      const actualZones = Array.isArray(actualZonesPayload.zones)
+        ? actualZonesPayload.zones.filter(isZoneSummary)
+        : []
+      const executedFindings = await this.recordPreservationFindings(
+        session,
+        validateExecutedPlan(renamedPlan, actualZones),
+      )
+      if (executedFindings.length > 0) {
+        throw new ModificationVerificationError(executedFindings.map(finding => finding.code))
+      }
+      await this.verifyModificationPostconditions(session, validateModificationPostconditions({
+        before: beforePlan,
+        after: renamedPlan,
+        plan: parsed.plan,
+        furnitureReport: furnReport,
+      }))
       trace.converged = true
       return this.finishPlanFirstModify(session, sceneId, loadedVersion, trace, {
         okDetails: [...applied.notes, ...(furnReport?.results.filter(r => r.ok).map(r => r.detail) ?? [])],
@@ -1731,6 +1890,18 @@ export class PascalAiAgent {
         ]
       }
     }
+    const preservationFindings = await this.recordPreservationFindings(
+      session,
+      validatePreservedPlan(beforePlan, plan, parsed.plan),
+    )
+    if (preservationFindings.length > 0) {
+      return this.finishSafeModificationRejection(
+        session,
+        t(session.language, 'modifyStrictLocalUnavailable', {
+          reason: preservationFindings[0]!.code,
+        }),
+      )
+    }
     const validationResults = await this.runValidationStage(session, 'modify', {
       layoutPlan: { plan, targets, profile },
     })
@@ -1752,6 +1923,8 @@ export class PascalAiAgent {
       furnitureOps: applied.furnitureOps,
       appliedNotes: applied.notes,
       baselineGateFailures,
+      beforePlan,
+      modifyPlan: parsed.plan,
     })
   }
 
@@ -1774,11 +1947,15 @@ export class PascalAiAgent {
     furnitureOps: FurnitureModifyOp[]
     appliedNotes: string[]
     baselineGateFailures: GateFailure[]
+    beforePlan: LayoutPlan
+    modifyPlan: ModifyPlan
   }): Promise<Partial<WorkflowGraphState>> {
     const {
       session, sceneId, loadedVersion, trace, traceMcp, beforeCall,
       zones, intent, plan, planNotes, strategy, furnitureOps, appliedNotes,
       baselineGateFailures,
+      beforePlan,
+      modifyPlan,
     } = options
     const nodes = snapshotSceneNodes(toolPayload(await this.callMcp(session.sessionId, 'get_scene', {})))
     const levelId = Object.entries(nodes).find(([, node]) => node.type === 'level')?.[0] ?? null
@@ -1883,6 +2060,23 @@ export class PascalAiAgent {
       callMcp: traceMcp,
       beforeCall,
     })
+    const actualZonesPayload = toolPayload(await this.callMcp(session.sessionId, 'get_zones', {}))
+    const actualZones = Array.isArray(actualZonesPayload.zones)
+      ? actualZonesPayload.zones.filter(isZoneSummary)
+      : []
+    const executedFindings = await this.recordPreservationFindings(
+      session,
+      validateExecutedPlan(plan, actualZones),
+    )
+    if (executedFindings.length > 0) {
+      throw new ModificationVerificationError(executedFindings.map(finding => finding.code))
+    }
+    await this.verifyModificationPostconditions(session, validateModificationPostconditions({
+      before: beforePlan,
+      after: plan,
+      plan: modifyPlan,
+      furnitureReport: furnReport,
+    }))
     // Snapshot refresh (§2 病灶④): the next modify must see THIS state. It is
     // written only after every execution stage succeeded — an exception above
     // propagates to modify()'s catch with the OLD snapshots intact, so a
@@ -1920,6 +2114,7 @@ export class PascalAiAgent {
       })
       this.destructiveWrites.delete(session.sessionId)
       delete session.destructiveSceneWriteStarted
+      delete session.modificationWriteStarted
       return result
     } catch (error) {
       if (error instanceof DestructiveSceneWriteError) throw error
@@ -1945,8 +2140,10 @@ export class PascalAiAgent {
     delete session.pendingModificationMode
     delete session.pendingModificationReasonCode
     delete session.pendingModificationPlanHash
+    delete session.pendingModifyPlan
     delete session.modifyModeConfirmed
     delete session.modifyDriftConfirmed
+    delete session.modificationWriteStarted
     session.phase = modifyFailureRecovery(false, Boolean(session.sceneResult)).phase
     const reply = t(session.language, 'modifyFailedNoRetry', { error: errors.join('；') })
     session.messages.push({ role: 'assistant', content: reply })
@@ -1962,8 +2159,10 @@ export class PascalAiAgent {
     delete session.pendingModificationMode
     delete session.pendingModificationReasonCode
     delete session.pendingModificationPlanHash
+    delete session.pendingModifyPlan
     delete session.modifyModeConfirmed
     delete session.modifyDriftConfirmed
+    delete session.modificationWriteStarted
     session.phase = session.sceneResult?.remainingIssueCount ? 'completed_with_issues' : 'completed'
     session.messages.push({ role: 'assistant', content: reply })
     return { session, reply, next: 'finish' }
@@ -2029,8 +2228,10 @@ export class PascalAiAgent {
     delete session.pendingModificationMode
     delete session.pendingModificationReasonCode
     delete session.pendingModificationPlanHash
+    delete session.pendingModifyPlan
     delete session.modifyModeConfirmed
     delete session.modifyDriftConfirmed
+    delete session.modificationWriteStarted
     const base = buildCompletionReply({
       lang: session.language ?? 'en',
       successText: t(session.language, 'modifySuccess', {}),
@@ -3766,7 +3967,6 @@ function isItemSummary(value: unknown): value is ItemSummary {
 type Footprint2D = { minX: number; maxX: number; minZ: number; maxZ: number }
 
 const FURNITURE_GAP_M = 0.08
-const DOOR_CLEARANCE_DEPTH_M = 0.75
 const FOOTPRINT_BOUNDS_SLACK_M = 0.05
 
 function itemFootprint2D(item: ItemSummary): Footprint2D {
@@ -3843,9 +4043,8 @@ export function checkFurniturePlacement(
     }
   }
 
-  // Door clearance: a rectangle centered on each door, extending
-  // DOOR_CLEARANCE_DEPTH_M to both sides of its (axis-aligned) wall, must
-  // stay free of furniture so the door can open and people can pass.
+  // Door clearance: a rectangle centered on each door must stay free of
+  // furniture so the door can open and people can pass.
   for (const wall of walls) {
     const orientation = segmentOrientation(wall)
     if (!orientation) continue // diagonal wall — skip, best-effort
@@ -3863,9 +4062,18 @@ export function checkFurniturePlacement(
       const doorCenterAlong = startCoord <= endCoord ? startCoord + localX : startCoord - localX
       const alongLo = doorCenterAlong - width / 2 - FOOTPRINT_BOUNDS_SLACK_M
       const alongHi = doorCenterAlong + width / 2 + FOOTPRINT_BOUNDS_SLACK_M
+      const depths = doorClearanceDepths(
+        wall.start,
+        wall.end,
+        zones.map(zone => ({
+          type: classifyRoomTypeByName(zone.name),
+          polygon: zone.polygon,
+        })),
+        doorCenterAlong,
+      )
       const clearance: Footprint2D = orientation.axis === 'x'
-        ? { minX: alongLo, maxX: alongHi, minZ: orientation.constant - DOOR_CLEARANCE_DEPTH_M, maxZ: orientation.constant + DOOR_CLEARANCE_DEPTH_M }
-        : { minX: orientation.constant - DOOR_CLEARANCE_DEPTH_M, maxX: orientation.constant + DOOR_CLEARANCE_DEPTH_M, minZ: alongLo, maxZ: alongHi }
+        ? { minX: alongLo, maxX: alongHi, minZ: orientation.constant - depths.negative, maxZ: orientation.constant + depths.positive }
+        : { minX: orientation.constant - depths.negative, maxX: orientation.constant + depths.positive, minZ: alongLo, maxZ: alongHi }
       for (let i = 0; i < floorItems.length; i++) {
         if (footprintsIntersect(footprints[i]!, clearance, 0)) {
           const item = floorItems[i]!
@@ -3873,7 +4081,7 @@ export function checkFurniturePlacement(
             kind: 'door_clearance',
             itemId: item.id,
             itemName: item.name,
-            message: `家具「${label(item)}」占用了墙 ${wall.id} 上房门的开启/通行空间，请移开让出门口约 ${DOOR_CLEARANCE_DEPTH_M}m 的净空`,
+            message: `家具「${label(item)}」占用了墙 ${wall.id} 上房门的开启/通行空间，请移开并让出门口净空`,
           })
         }
       }
@@ -4342,17 +4550,25 @@ export function buildPlanTargets(brief: DesignBrief): PlanTargets {
     requiredRooms.push({ type: 'bedroom', count: bedrooms })
   }
   const requested = arrayFact(brief, ['rooms', 'required_rooms', 'room_program', 'function_spaces'])
-  const presencePatterns: Array<[RoomType, RegExp]> = [
-    ['kitchen', ROOM_NAME_PATTERNS.kitchen],
-    ['bathroom', ROOM_NAME_PATTERNS.bathroom],
-    ['living', ROOM_NAME_PATTERNS.living],
-  ]
-  const embedsQuantity = /[0-9０-９两三四五六七八九]/
-  for (const [type, pattern] of presencePatterns) {
-    const matches = requested.filter(room => pattern.test(room))
-    if (matches.length > 0 && !matches.some(room => embedsQuantity.test(room))) {
-      requiredRooms.push({ type, count: matches.length })
-    }
+  const requestedText = requested.join('、')
+  const compactCount = (pattern: RegExp): number | undefined => {
+    const match = pattern.exec(requestedText.normalize('NFKC'))
+    if (!match?.[1]) return undefined
+    const raw = match[1]
+    return CJK_DIGITS[raw] ?? Number.parseInt(raw, 10)
+  }
+  const bathroomCount = compactCount(/([1-9一两二三四五六七八九])\s*(?:个|间)?(?:卫(?:生间)?|浴室)/)
+  const kitchenCount = compactCount(/([1-9一两二三四五六七八九])\s*(?:个|间)?厨(?:房)?/)
+  if (bathroomCount) requiredRooms.push({ type: 'bathroom', count: bathroomCount })
+  else if (requested.some(room => ROOM_NAME_PATTERNS.bathroom.test(room))) {
+    requiredRooms.push({ type: 'bathroom', count: 1 })
+  }
+  if (kitchenCount) requiredRooms.push({ type: 'kitchen', count: kitchenCount })
+  else if (requested.some(room => ROOM_NAME_PATTERNS.kitchen.test(room))) {
+    requiredRooms.push({ type: 'kitchen', count: 1 })
+  }
+  if (requested.some(room => ROOM_NAME_PATTERNS.living.test(room) || /厅/.test(room))) {
+    requiredRooms.push({ type: 'living', count: 1 })
   }
   return {
     ...(totalAreaSqm !== undefined && totalAreaSqm > 0 ? { totalAreaSqm } : {}),
@@ -4552,12 +4768,7 @@ function findFact(brief: DesignBrief, keys: string[]): RequirementFact | undefin
 
 function numberFact(brief: DesignBrief, keys: string[]): number | undefined {
   const value = findFact(brief, keys)?.value
-  if (typeof value === 'number') return value
-  if (typeof value === 'string') {
-    const parsed = Number.parseInt(value, 10)
-    if (Number.isFinite(parsed)) return parsed
-  }
-  return undefined
+  return numericFactValue(value)
 }
 
 function arrayFact(brief: DesignBrief, keys: string[]): string[] {

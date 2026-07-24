@@ -3,6 +3,7 @@ import type { DesignBrief, RequirementFact } from '../types'
 import {
   checkAreaRequirements,
   computeZoneAreaStats,
+  numericFactValue,
   pointInPolygon,
   polygonArea,
 } from './area-validation'
@@ -33,6 +34,13 @@ function areaBrief(area: number): DesignBrief {
 }
 
 describe('area validation domain', () => {
+  test('numeric facts prefer an area-qualified value and reject ambiguous bare numbers', () => {
+    expect(numericFactValue('3室2厅约140平方米')).toBe(140)
+    expect(numericFactValue('2026年翻新，约140㎡')).toBe(140)
+    expect(numericFactValue('约 180')).toBe(180)
+    expect(numericFactValue('3室2厅')).toBeUndefined()
+  })
+
   test('measures polygons and point inclusion without infrastructure', () => {
     const polygon = rectangle('room', 'Room', 0, 0, 4, 3).polygon
     expect(polygonArea(polygon)).toBe(12)

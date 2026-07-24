@@ -107,6 +107,7 @@ describe('SqliteModelAttemptRecorder', () => {
       expect(rows[1]?.prompt_version).toBe(prompt.promptVersion)
       expect(rows[1]?.prompt_hash).toBe(prompt.promptHash)
       expect(JSON.parse(rows[1]?.request_params ?? '{}')).toEqual({ temperature: 0.2 })
+      expect(repository.countDistinctCallsBySession(identity.sessionId)).toEqual({ extract: 1 })
       expect(JSON.stringify(rows)).not.toContain(prompt.parts.system)
       expect(JSON.stringify(rows)).not.toContain('user question must not be stored')
       expect(recorder.status()).toEqual({ ok: true, failureCount: 0 })

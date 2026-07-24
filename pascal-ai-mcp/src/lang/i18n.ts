@@ -105,6 +105,11 @@ export const MESSAGES = {
     p => `この修正では、新しい Plan に基づいて現在の階の構造を再構築する必要があります。既存の部屋・壁・開口部・チェックリスト家具は再生成され、追加の手動家具は可能な限り再配置されますが、位置が変わることがあります。${p.manualDrift ? 'また、シーンに手動編集が検出されており、その差分が上書きされる可能性があります。' : ''}確認前にシーンは変更されません。続行するには確認を送信するか、修正内容を改めて入力してください。`,
     p => `This change requires rebuilding the current floor from a new Plan. Existing rooms, walls, openings, and checklist furniture will be regenerated; extra manually placed furniture will be replayed where possible, but its position may change. ${p.manualDrift ? 'Manual scene edits were also detected and may be overwritten. ' : ''}Nothing changes before confirmation. Confirm to continue, or describe a different change.`,
   ),
+  modifyStrictLocalUnavailable: def<{ reason: string }>(
+    () => '暂时无法在保持其他房间不变的情况下安全完成这项修改。删除或调整这个空间可能影响相邻墙体、房门、入口动线或其他房间，因此本次在写入场景前已停止，当前场景没有被修改。建议在编辑器中手动调整。',
+    () => '他の部屋を変更せずに、この修正を安全に完了することはできませんでした。この空間の削除や調整は、隣接する壁・ドア・玄関からの動線・他の部屋に影響する可能性があります。そのため、シーンへ書き込む前に停止しており、現在のシーンは変更されていません。エディタで手動調整することをおすすめします。',
+    () => 'This change cannot currently be completed safely while keeping the other rooms unchanged. Removing or adjusting this space could affect adjacent walls, doors, entry circulation, or other rooms, so the operation stopped before writing and the current scene was not changed. Please make this adjustment manually in the editor.',
+  ),
   modifyUnsupportedSafe: def<Record<string, never>>(
     () => '无法把这项请求安全地归类为已支持的局部修改或结构重建，因此没有更改场景。请明确描述房间或家具的增加、删除、面积调整或改名；门窗类修改暂不自动执行。',
     () => 'このリクエストを、対応済みの局所修正または構造再構築として安全に分類できなかったため、シーンは変更していません。部屋や家具の追加・削除、面積変更、名称変更を明確に指定してください。開口部の変更は現在、自動実行の対象外です。',

@@ -4,7 +4,9 @@
 
 > **legacy 路径处置（2026-07-23 安全收口）**：旧自由编辑实现仍保留在显式的 `PASCAL_MODIFY_LEGACY=1` 对照开关后，但默认路径不再把未知操作、解析失败或缺少 Intent/Plan 快照的结构请求静默降级给它。缺快照时家具修改仍可执行；结构修改会安全拒绝并说明需要重新生成或建立规划快照。
 
-> **D2 修改模式（2026-07-23）**：每次解析后的操作先确定为 `local_patch` 或 `plan_rebuild`。前者只允许目标 zone/item 与必要的父级 children 变化，并在写后做确定性 scene diff；后者在任何场景写入前明确说明重建范围并要求确认。确认绑定解析后 ModifyOp 数组按确定性 JSON 序列化所得的 SHA-256，确认后若模型二次翻译产生不同操作会重新提示。模式、reason code 和 workflow step 终态共同构成可查询的审计结果。
+> **D2 修改模式（2026-07-23，2026-07-24 修订确认契约）**：每次解析后的操作先确定为 `local_patch` 或 `plan_rebuild`。前者只允许目标 zone/item 与必要的父级 children 变化，并在写后做确定性 scene diff；后者在任何场景写入前明确说明重建范围并要求确认。确认绑定首次解析后持久化的规范化 ModifyPlan 及 canonical SHA-256，确认时不重新翻译。模式、reason code 和 workflow step 终态共同构成可查询的审计结果。
+
+> **Provider 评测修订（2026-07-24）**：真实模型证明“确认后重新翻译并比较 hash”会因语义相同但字面不同的输出漂移而长期停在确认态。现改为首次翻译后把规范化 ModifyPlan 和 canonical hash 持久化在 Session；用户确认时不再调用模型，直接执行其看到并同意的同一份计划。删除与其他结构修改共用这一个最终确认入口，不再叠加通用删除确认。
 
 **与生成流程的边界**：修改流程不依赖生成流程的内部实现，只依赖三个契约——① `LayoutIntent` schema 向后兼容；② 生成完成后写全 session 快照（`layoutIntent` / `layoutPlan` / `strategy`，这是两条流程唯一的接口）；③ `partitionLayout` / `executeLayoutPlan` 签名扩展用可选参数。守住这三条，生成侧任意演进（新拓扑、调参、预设户型库产 plan）对修改侧透明，且质量提升自动流入修改侧（同一分区器/执行器）；稳定性锚点是 session 的旧 plan 快照而非当前生成算法，生成算法升级不会让存量场景的修改行为漂移。
 
@@ -74,7 +76,7 @@ type ModifyPlan = { ops: ModifyOp[]; note?: string }   // note：模型对歧义
 - 房间引用解析顺序：plan 房间 id 精确匹配 → 名称精确匹配 → room-vocab 类型匹配（唯一时）；解析不到 → correction loop；
 - `rename_room` 和纯家具 op **不触发重分区**（结构零变化是这类请求的正确语义）；
 - 面积语义：`resize_room` 的目标面积会被 NormProfile 面积界夹紧（超 fatal 界直接拒绝并说明，在 soft 界外记 warning note）——case-13 的 15㎡ 书房问题在 schema 层面消灭；
-- 与旧流程的 `pendingOperation: 'create'|'update'|'delete'` 分类兼容：路由层把三类都译成 ModifyOp（delete 确认机制保留，见 §7）。
+- 与旧流程的 `pendingOperation: 'create'|'update'|'delete'` 分类兼容：路由层把三类都译成 ModifyOp；delete 与其他结构修改统一使用 §7 的单次最终确认。
 
 ## 4. 布局稳定性（本设计唯一的新算法问题）
 
@@ -115,7 +117,7 @@ type ModifyPlan = { ops: ModifyOp[]; note?: string }   // note：模型对歧义
 
 ## 7. 与现有路由的衔接
 
-- `ingest()` 的意图分类（update/delete/create）不动；delete 路由的原确认仍保留，ModifyOp 判定为 `plan_rebuild` 后还必须完成一次带明确影响范围的模式确认；
+- `ingest()` 的意图分类（update/delete/create）不动；三类请求先形成并持久化规范化 ModifyPlan，结构类只展示一次带明确影响范围的最终确认，确认时不重新调用模型；
 - `modify()` 内部整体替换为新管线；旧自由编辑路径保留在 `PASCAL_MODIFY_LEGACY=1` 环境变量后面（对照实验用，不进 AppConfig，与 `AI_PLAN_LLM_GEOMETRY` 同风格），稳定后删除；
 - 无 `layoutIntent`/`layoutPlan` 快照的旧场景（新流程上线前生成的）：家具类 op 照常走新路径（只需 zoneRoomTypes 或名称回退）；结构类 op 默认安全拒绝，不自动进入 legacy。
 - 当前 ModifyOp v1 不含门窗操作，也没有带明确目标位置的 `move_furniture`。此类请求会按未知操作安全拒绝；只有在增加确定性位置契约、执行器、目标范围声明和写后 diff 证明后，才能进入 `local_patch`。

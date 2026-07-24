@@ -30,7 +30,17 @@ export type FurnitureModifyOp =
 
 export type ModifyOp = StructuralModifyOp | FurnitureModifyOp
 
-export type ModifyPlan = { ops: ModifyOp[]; note?: string }
+export type ModificationPreservationPolicy = {
+  mode: 'strict_local' | 'best_effort' | 'allow_rebuild'
+  allowedRoomRefs: string[]
+  preserveFootprint: boolean
+}
+
+export type ModifyPlan = {
+  ops: ModifyOp[]
+  note?: string
+  preservation?: ModificationPreservationPolicy
+}
 
 const STRUCTURAL_OPS = new Set(['add_room', 'remove_room', 'resize_room', 'rename_room'])
 const FURNITURE_OPS = new Set(['add_furniture', 'remove_furniture', 'swap_furniture'])

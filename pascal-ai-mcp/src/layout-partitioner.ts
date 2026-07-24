@@ -73,6 +73,11 @@ function minWidthFor(type: RoomType, p: PartitionParams): number {
 const PRIVATE_TYPES: ReadonlySet<RoomType> = new Set([
   'bedroom', 'study', 'balcony', 'other',
 ])
+function isPrivateRoom(room: NormRoom): boolean {
+  return room.type !== 'other'
+    ? PRIVATE_TYPES.has(room.type)
+    : room.window
+}
 const CARVE_TYPES: ReadonlySet<RoomType> = new Set(['bathroom', 'storage', 'entry'])
 
 type NormRoom = {
@@ -594,7 +599,11 @@ function assignCarves(
         }
       }
       bathIndex++
-    } else if (room.type === 'storage' || room.type === 'entry') {
+    } else if (
+      room.type === 'storage'
+      || room.type === 'entry'
+      || (room.type === 'other' && !room.window && room.area <= p.carveablePublicMaxSqm)
+    ) {
       carveSpecs.push({ room, hostId: hub.id })
     } else if (
       carveSmallPublic
@@ -651,7 +660,7 @@ function tryBandLayout(
   wetStackEnabled: boolean,
 ): Attempt {
   const others = rooms.filter(r => r.id !== hub.id)
-  const privates = others.filter(r => PRIVATE_TYPES.has(r.type))
+  const privates = others.filter(isPrivateRoom)
   const corridorRoom = others.find(r => r.type === 'hallway') ?? null
   const corridorNeeded = privates.length >= 2
 
@@ -682,7 +691,7 @@ function tryBandLayout(
   const carvedIds = new Set(carveSpecs.map(c => c.room.id))
 
   const publicColumns = others.filter(r =>
-    !carvedIds.has(r.id) && !PRIVATE_TYPES.has(r.type) && r.id !== corridorRoom?.id
+    !carvedIds.has(r.id) && !isPrivateRoom(r) && r.id !== corridorRoom?.id
     && r.id !== wetStack?.bath.id,
   )
   const privateColumns = privates.filter(r => !carvedIds.has(r.id))
@@ -971,9 +980,9 @@ function tryNarrowLotLayout(
 
   const stackable = others.filter(r => !carvedIds.has(r.id) && r.id !== corridorRoom?.id)
   const stacked = [
-    ...stackable.filter(r => !PRIVATE_TYPES.has(r.type) && r.type === 'kitchen'),
-    ...stackable.filter(r => !PRIVATE_TYPES.has(r.type) && r.type !== 'kitchen'),
-    ...stackable.filter(r => PRIVATE_TYPES.has(r.type)),
+    ...stackable.filter(r => !isPrivateRoom(r) && r.type === 'kitchen'),
+    ...stackable.filter(r => !isPrivateRoom(r) && r.type !== 'kitchen'),
+    ...stackable.filter(isPrivateRoom),
   ]
   const corridorNeeded = stacked.length >= 2
   const stackW = corridorNeeded ? round2(W - p.corridorWidthM) : W
@@ -1199,8 +1208,8 @@ function tryTanojiLayout(
   for (const [wingIndex, wingRooms] of wings.entries()) {
     const [x0, x1] = wingBounds[wingIndex]!
     const ordered = [
-      ...wingRooms.filter(r => !PRIVATE_TYPES.has(r.type)),
-      ...wingRooms.filter(r => PRIVATE_TYPES.has(r.type)),
+      ...wingRooms.filter(r => !isPrivateRoom(r)),
+      ...wingRooms.filter(isPrivateRoom),
     ]
     const colW = x1 - x0
     let z = 0
@@ -1269,7 +1278,7 @@ function tryTanojiLayout(
       connections.push({ from: room.id, to: corridorId })
     } else if (
       entryRoom
-      && !PRIVATE_TYPES.has(room.type)
+      && !isPrivateRoom(room)
       && Math.min(rect.z1, entryD) - rect.z0 >= p.minDoorEdgeM
     ) {
       connections.push({ from: room.id, to: entryRoom.id })
@@ -1336,12 +1345,12 @@ function tryLShapeLayout(
   notes.unshift('L 形拓扑：主翼公区 + 侧翼私区')
   const carvedIds = new Set(carveSpecs.map(c => c.room.id))
   const wingRooms = others.filter(r =>
-    !carvedIds.has(r.id) && r.id !== corridorRoom?.id && PRIVATE_TYPES.has(r.type))
+    !carvedIds.has(r.id) && r.id !== corridorRoom?.id && isPrivateRoom(r))
   if (wingRooms.length === 0) {
     return { reject: 'L 形拓扑需要至少一间侧翼房间', l10n: { id: 'planLShapeTooFewRooms', params: {} } }
   }
   const mainColumns = others.filter(r =>
-    !carvedIds.has(r.id) && r.id !== corridorRoom?.id && !PRIVATE_TYPES.has(r.type))
+    !carvedIds.has(r.id) && r.id !== corridorRoom?.id && !isPrivateRoom(r))
 
   const corridorNeeded = wingRooms.length >= 2
   const corrW = corridorNeeded ? p.corridorWidthM : 0
@@ -1710,6 +1719,76 @@ export function absorbRoomInPlan(
       : plan.connections.filter(c => c.from !== roomId && c.to !== roomId)
     const entry = hostsEntry ? { ...plan.entry, roomId: neighbor.id } : plan.entry
     return { plan: { ...plan, entry, rooms, connections }, absorbedInto }
+  }
+  return null
+}
+
+export function absorbRoomsInPlan(
+  plan: LayoutPlan,
+  roomIds: readonly string[],
+  maxAspect?: number,
+): { plan: LayoutPlan; absorbedInto: LayoutPlanRoom[] } | null {
+  const uniqueIds = [...new Set(roomIds)]
+  if (uniqueIds.length === 0) return null
+  if (uniqueIds.length === 1) {
+    const result = absorbRoomInPlan(plan, uniqueIds[0]!, maxAspect)
+    return result ? { plan: result.plan, absorbedInto: [result.absorbedInto] } : null
+  }
+  const removedIds = new Set(uniqueIds)
+  const targets = uniqueIds.map(id => plan.rooms.find(room => room.id === id))
+  if (targets.some(room => !room || room.type === 'hallway')) return null
+  const removed = targets as LayoutPlanRoom[]
+  const hostsEntry = removedIds.has(plan.entry.roomId)
+  const candidates = plan.rooms
+    .filter(room => !removedIds.has(room.id))
+    .filter(room => !hostsEntry || ENTRY_HOST_TYPES.has(room.type))
+    .map(room => ({
+      room,
+      shared: removed.reduce(
+        (sum, target) => sum + sharedBoundaryLength(room.polygon, target.polygon),
+        0,
+      ),
+    }))
+    .filter(entry => entry.shared >= 0.05)
+    .sort((left, right) =>
+      (hostsEntry ? 0 : Number(left.room.type === 'hallway') - Number(right.room.type === 'hallway'))
+      || right.shared - left.shared)
+
+  for (const { room: candidate } of candidates) {
+    let polygon = candidate.polygon
+    const remaining = new Map(removed.map(room => [room.id, room]))
+    while (remaining.size > 0) {
+      const mergeable = [...remaining.values()]
+        .map(room => ({
+          room,
+          shared: sharedBoundaryLength(polygon, room.polygon),
+          union: unionAdjacentPolygons(polygon, room.polygon),
+        }))
+        .filter(entry => entry.shared >= 0.05 && entry.union !== null)
+        .sort((left, right) => right.shared - left.shared)[0]
+      if (!mergeable?.union) break
+      polygon = mergeable.union
+      remaining.delete(mergeable.room.id)
+    }
+    if (remaining.size > 0) continue
+    if (
+      maxAspect !== undefined
+      && TYPE_TO_KIND[candidate.type] !== 'circulation'
+      && polygonAspectRatio(polygon) > maxAspect
+    ) continue
+    const absorbedInto = { ...candidate, polygon }
+    const rooms = plan.rooms
+      .filter(room => !removedIds.has(room.id))
+      .map(room => room.id === candidate.id ? absorbedInto : room)
+    const connections = dedupeConnections(plan.connections.map(connection => ({
+      from: removedIds.has(connection.from) ? candidate.id : connection.from,
+      to: removedIds.has(connection.to) ? candidate.id : connection.to,
+    })))
+    const entry = hostsEntry ? { ...plan.entry, roomId: candidate.id } : plan.entry
+    return {
+      plan: { ...plan, entry, rooms, connections },
+      absorbedInto: [absorbedInto],
+    }
   }
   return null
 }

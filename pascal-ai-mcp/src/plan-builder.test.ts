@@ -91,6 +91,26 @@ describe('buildLayoutPlan (intent path)', () => {
     expect(result.validation.fatal).toEqual([])
   })
 
+  test('confirmed target area overrides model drift on every intent round', async () => {
+    const drifted = {
+      ...oneBedroomIntent,
+      targetTotalAreaSqm: 150,
+      rooms: oneBedroomIntent.rooms.map(room => ({
+        ...room,
+        targetAreaSqm: (room.targetAreaSqm ?? 5) * 2.5,
+      })),
+    }
+    const { complete } = scriptedModel([JSON.stringify(drifted)])
+    const result = await buildLayoutPlan(
+      { briefSummary: '约140㎡住宅', targets: { totalAreaSqm: 140 } },
+      complete,
+    )
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('unreachable')
+    expect(result.intent?.targetTotalAreaSqm).toBe(140)
+    expect(result.plan.footprint.width * result.plan.footprint.depth).toBeCloseTo(140, 0)
+  })
+
   test('passes the registry-owned version and hash to the model boundary', async () => {
     let audit: { promptVersion: string; promptHash: string } | undefined
     const result = await buildLayoutPlan(

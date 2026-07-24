@@ -86,7 +86,7 @@ export async function runModifyWorkflow(
     const loaded = await dependencies.loadScene(session, sceneId)
     const loadedVersion = finiteNumber(loaded.version)
     if (process.env.PASCAL_MODIFY_LEGACY !== '1') {
-      return dependencies.runPlanFirst(session, feedback, sceneId, loadedVersion)
+      return await dependencies.runPlanFirst(session, feedback, sceneId, loadedVersion)
     }
 
     const legacyNoSnapshot = !session.layoutIntent || !session.layoutPlan
@@ -133,6 +133,7 @@ export async function runModifyWorkflow(
     delete session.pendingModificationMode
     delete session.pendingModificationReasonCode
     delete session.pendingModificationPlanHash
+    delete session.pendingModifyPlan
     delete session.modifyModeConfirmed
     delete session.modifyDriftConfirmed
     const { reply } = finishSceneWorkflow({
@@ -153,15 +154,18 @@ export async function runModifyWorkflow(
     return { session, reply, next: 'finish' }
   } catch (error) {
     const destructiveWriteFailed = session.destructiveSceneWriteStarted === true
+      || session.modificationWriteStarted === true
       || dependencies.clearDestructiveWrite(session.sessionId)
     if (destructiveWriteFailed) {
       dependencies.clearDestructiveWrite(session.sessionId)
       delete session.destructiveSceneWriteStarted
+      delete session.modificationWriteStarted
       delete session.pendingModification
       delete session.pendingOperation
       delete session.pendingModificationMode
       delete session.pendingModificationReasonCode
       delete session.pendingModificationPlanHash
+      delete session.pendingModifyPlan
       delete session.modifyModeConfirmed
       delete session.modifyDriftConfirmed
       session.phase = session.sceneResult ? 'completed_with_issues' : 'failed'
