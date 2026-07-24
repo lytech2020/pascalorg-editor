@@ -2,6 +2,7 @@ import type { LayoutIntent, LayoutPlan, RoomType } from './layout-plan'
 import type { ModifyPlan } from './modify-ops'
 import type { StrategyDecision } from './strategy'
 import type { ModificationMode, ModificationModeReason } from './domain/modification-mode'
+import type { WriteEffectState } from './scene-executor'
 
 export type ChatRole = 'system' | 'user' | 'assistant' | 'tool'
 
@@ -209,9 +210,18 @@ export type WorkflowSession = {
   // Confirmation executes this exact plan; it never asks the model to
   // translate the same request a second time.
   pendingModifyPlan?: ModifyPlan
-  // A local or structural scene write has occurred and its post-write scope
-  // or goal verification has not completed. Such a turn must not be replayed.
-  modificationWriteStarted?: boolean
+  // R1.3: the REAL side-effect state of the current modify turn, updated by
+  // the MCP mutation wrapper as writes return — never a pre-call guess. Drives
+  // the failure wording: `no_write` is a safe, recoverable zero-write failure
+  // (never "scene may be partially modified"); `write_attempted` means a
+  // mutation's result is unknown; `write_confirmed`/`partial_write_confirmed`
+  // mean real side effects landed. Absent until the first executor stage runs.
+  modificationWriteEffect?: WriteEffectState
+  // R4/P1-5: the concrete movable-item ids a bulk clear was confirmed against,
+  // keyed by roomId. On the confirmed turn the scene is re-read and compared to
+  // this set; if furniture changed during the confirmation wait, the clear is
+  // re-confirmed against the new targets instead of deleting a different set.
+  pendingClearTargets?: Record<string, string[]>
   modifyModeConfirmed?: boolean
   // Set by the plan-first structural rebuild: the user has EDITED the room
   // program via modify ops, so the completion gates must judge against the

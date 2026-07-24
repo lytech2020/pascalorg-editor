@@ -151,6 +151,18 @@ export function findVocabularyOption(term: string): FurnitureOption | null {
   return null
 }
 
+// R4.2: fixed / necessary equipment that a bulk "clear the room's furniture"
+// must RETAIN — kitchen appliances and bathroom sanitary ware are built-in
+// fixtures, not movable furniture. A clear op deletes everything EXCEPT items
+// whose name matches one of these (plus wall/ceiling-attached items, which the
+// executor already excludes as non-floor furniture).
+const FIXED_EQUIPMENT_REQUIREMENTS: readonly FurnitureRequirement[] = [...KITCHEN, ...BATHROOM]
+
+export function isFixedEquipmentName(name: string): boolean {
+  return FIXED_EQUIPMENT_REQUIREMENTS.some(requirement =>
+    requirement.options.some(option => option.match.test(name)))
+}
+
 // Which checklist requirements did this (just deleted) item satisfy? Feeds
 // the modify gates' intent exemption: an item removed at the user's explicit
 // request must not resurface as "the AI failed to equip the room" — the gate

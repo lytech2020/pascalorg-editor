@@ -13,13 +13,40 @@ export const MODIFICATION_POSTCONDITION_CODES = [
   'room_not_renamed',
   'rename_changed_geometry',
   'furniture_target_not_met',
+  'furniture_result_missing',
 ] as const
 
 export type ModificationPostconditionCode = typeof MODIFICATION_POSTCONDITION_CODES[number]
 
+// Furniture postcondition codes describe a furniture op that did not achieve
+// its goal. They are surfaced to the user as per-op failed details (and audited
+// via runValidationStage) — but they are NOT scene-integrity failures, so they
+// must never throw the destructive ModificationVerificationError the way a
+// structural finding (room not added/removed/renamed) does. A furniture op that
+// failed with zero writes is a safe, recoverable outcome. (R1.4 / P1-2)
+export const FURNITURE_POSTCONDITION_CODES = new Set<ModificationPostconditionCode>([
+  'furniture_target_not_met',
+])
+
+export function isStructuralPostconditionCode(code: ModificationPostconditionCode): boolean {
+  return !FURNITURE_POSTCONDITION_CODES.has(code)
+}
+
 export type ModificationPostconditionFinding = {
   code: ModificationPostconditionCode
   operationIndex: number
+}
+
+// R6.2: does a built area satisfy the target under its mode? `at_least` is a
+// one-sided lower bound (target − 0.05). `exact` is two-sided — the same lower
+// bound PLUS a tight upper bound, so "调整到 16㎡" that lands at 25㎡ (or even
+// 19.2㎡) fails instead of silently passing (P2-7). The upper tolerance is
+// max(0.5, 10%): enough to absorb the partitioner's grid/corridor overhead, not
+// enough to call a materially larger room "exact".
+function areaSatisfiesTarget(actual: number, target: number, mode: 'exact' | 'at_least'): boolean {
+  if (actual < target - 0.05) return false
+  if (mode === 'at_least') return true
+  return actual <= target + Math.max(0.5, target * 0.1)
 }
 
 export function validateModificationPostconditions(options: {
@@ -30,7 +57,11 @@ export function validateModificationPostconditions(options: {
 }): ModificationPostconditionFinding[] {
   const { before, after, plan, furnitureReport } = options
   const findings: ModificationPostconditionFinding[] = []
-  let furnitureIndex = 0
+  // R2.4 / P2-5: furniture results are matched to their op by stable
+  // operationId, never by array position. Deliberately skipped operations also
+  // have explicit results; a missing result is therefore an execution/accounting
+  // failure rather than an implicit skip.
+  let furnitureFallbackIndex = 0
   for (const [operationIndex, op] of plan.ops.entries()) {
     if (op.op === 'add_room') {
       if (!before || !after) {
@@ -42,7 +73,7 @@ export function validateModificationPostconditions(options: {
       const addedRoom = candidates.length > beforeCount
         ? candidates.find(room => room.name === op.room.name
           && (op.room.targetAreaSqm === undefined
-            || polygonArea(room.polygon) >= op.room.targetAreaSqm - 0.05))
+            || areaSatisfiesTarget(polygonArea(room.polygon), op.room.targetAreaSqm, op.areaMode ?? 'at_least')))
         : undefined
       const added = addedRoom !== undefined
       if (!added) findings.push({ code: 'room_not_added', operationIndex })
@@ -83,7 +114,9 @@ export function validateModificationPostconditions(options: {
       }
       const target = before.rooms.find(room => room.id === op.room || room.name === op.room)
       const current = target && after.rooms.find(room => room.id === target.id)
-      if (!current || polygonArea(current.polygon) < op.targetAreaSqm - 0.05) {
+      // resize defaults to `exact` — "调整到 N㎡" is the common phrasing, and it
+      // must be judged two-sided (R6.2 / P2-7).
+      if (!current || !areaSatisfiesTarget(polygonArea(current.polygon), op.targetAreaSqm, op.areaMode ?? 'exact')) {
         findings.push({ code: 'room_area_target_not_met', operationIndex })
       }
     } else if (op.op === 'rename_room') {
@@ -99,8 +132,14 @@ export function validateModificationPostconditions(options: {
         findings.push({ code: 'rename_changed_geometry', operationIndex })
       }
     } else {
-      const result = furnitureReport?.results[furnitureIndex++]
-      if (!result?.ok) findings.push({ code: 'furniture_target_not_met', operationIndex })
+      const result = op.operationId !== undefined
+        ? furnitureReport?.results.find(entry => entry.op.operationId === op.operationId)
+        : furnitureReport?.results[furnitureFallbackIndex++]
+      if (!result) {
+        findings.push({ code: 'furniture_result_missing', operationIndex })
+      } else if (!result.ok) {
+        findings.push({ code: 'furniture_target_not_met', operationIndex })
+      }
     }
   }
   return findings

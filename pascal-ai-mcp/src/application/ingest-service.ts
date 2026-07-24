@@ -1,4 +1,5 @@
 import { t } from '../lang/i18n'
+import { planRequiresBatchConfirmation } from '../domain/modification-mode'
 import type { ChatInput, DesignBrief, RequirementFact, WorkflowSession } from '../types'
 
 export type IngestPlan =
@@ -24,6 +25,7 @@ export function planIngestAction(input: ChatInput, session: WorkflowSession): In
     delete session.pendingModificationReasonCode
     delete session.pendingModificationPlanHash
     delete session.pendingModifyPlan
+    delete session.pendingClearTargets
     delete session.modifyModeConfirmed
     delete session.modifyDriftConfirmed
     return { kind: 'reply', reply: t(session.language, 'taskCancelled', {}) }
@@ -35,7 +37,13 @@ export function planIngestAction(input: ChatInput, session: WorkflowSession): In
       && session.pendingModification
       && session.pendingModifyPlan
     ) {
-      if (session.pendingModificationMode === 'plan_rebuild') {
+      // A plan_rebuild or a bulk furniture clear (R4) replays the exact pending
+      // plan on confirmation — mark it confirmed so the modify flow executes
+      // instead of re-asking.
+      if (
+        session.pendingModificationMode === 'plan_rebuild'
+        || planRequiresBatchConfirmation(session.pendingModifyPlan.ops)
+      ) {
         session.modifyModeConfirmed = true
       }
       session.phase = 'modifying'
@@ -68,6 +76,7 @@ export function planIngestAction(input: ChatInput, session: WorkflowSession): In
     delete session.pendingModificationReasonCode
     delete session.pendingModificationPlanHash
     delete session.pendingModifyPlan
+    delete session.pendingClearTargets
     delete session.modifyModeConfirmed
     delete session.modifyDriftConfirmed
     return { kind: 'route-existing', message }

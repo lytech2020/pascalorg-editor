@@ -52,18 +52,28 @@ type RecordedCall = { name: string; args: Record<string, unknown> }
 function makeMockMcp(options: {
   walls?: WallSegment[]
   zoneAreas?: Record<string, number>
+  // Known server-side rejections: returned as an {error} payload (like a real
+  // MCP validation failure). No commit — safe to continue past.
   failures?: Record<string, number>
+  // Transport-level failures: thrown. The result is UNKNOWN, so these halt all
+  // further writes (P1-2).
+  throwOn?: Record<string, number>
   strictLength?: boolean
 } = {}) {
   const calls: RecordedCall[] = []
   const failures = { ...(options.failures ?? {}) }
+  const throwOn = { ...(options.throwOn ?? {}) }
   const zonePolygons = new Map<string, Array<[number, number]>>()
   let counter = 0
   const callMcp = async (name: string, args: Record<string, unknown>) => {
     calls.push({ name, args })
+    if ((throwOn[name] ?? 0) > 0) {
+      throwOn[name] = throwOn[name]! - 1
+      throw new Error(`transport failure ${name}`)
+    }
     if ((failures[name] ?? 0) > 0) {
       failures[name] = failures[name]! - 1
-      throw new Error(`injected ${name} failure`)
+      return { structuredContent: { error: `injected ${name} failure` } }
     }
     const wrap = (payload: Record<string, unknown>) => ({ structuredContent: payload })
     switch (name) {
@@ -167,17 +177,55 @@ describe('executeLayoutPlan', () => {
     expect(report.openings.every(opening => opening.nodeId !== null)).toBe(true)
   })
 
-  test('retries a failed create_room once and succeeds without recording an issue', async () => {
-    const { callMcp, calls } = makeMockMcp({ failures: { create_room: 1 } })
+  // R1.1/R1.2 + P1-2: create_room is a mutation — a lost response is NEVER
+  // replayed, and once the result is unknown all further writes stop. The first
+  // create_room fails (unknown) → no retry, and the second is not dispatched.
+  test('never replays a failed create_room and halts further writes', async () => {
+    const { callMcp, calls } = makeMockMcp({ throwOn: { create_room: 1 } })
     const report = await executeLayoutPlan({
       plan: twoRoomPlan,
       levelId: 'level-1',
       callMcp,
       dedupeSharedWalls: async () => {},
     })
-    expect(report.executionIssues).toEqual([])
-    expect(callsNamed(calls, 'create_room')).toHaveLength(3) // 1 failed + 2 ok
-    expect(report.rooms.every(room => room.zoneId !== null)).toBe(true)
+    // Only the first create_room dispatched; no retry, no second room.
+    expect(callsNamed(calls, 'create_room')).toHaveLength(1)
+    expect(report.rooms[0]!.zoneId).toBeNull()
+    expect(report.rooms[1]!.zoneId).toBeNull()
+    expect(report.executionIssues.some(issue => issue.includes('写入结果未知'))).toBe(true)
+    expect(report.writeEffect).toBe('write_attempted')
+  })
+
+  // R1.5 / P1-2: a mutation whose response is lost in transit is never replayed,
+  // AND once a write's result is unknown the executor STOPS all further writes.
+  // The first create_room throws (result unknown) → the second is not even
+  // dispatched, and no openings are attempted.
+  test('halts all further writes after a create_room result becomes unknown', async () => {
+    let createDispatched = 0
+    const calls: RecordedCall[] = []
+    const callMcp = async (name: string, args: Record<string, unknown>) => {
+      calls.push({ name, args })
+      if (name === 'create_room') {
+        createDispatched++
+        throw new Error('socket hang up (response lost after commit)')
+      }
+      if (name === 'get_walls') return { structuredContent: { walls: twoRoomWalls } }
+      if (name === 'get_zones') return { structuredContent: { zones: [] } }
+      return { structuredContent: {} }
+    }
+    const report = await executeLayoutPlan({
+      plan: twoRoomPlan,
+      levelId: 'level-1',
+      callMcp,
+      dedupeSharedWalls: async () => {},
+    })
+    // Only the first create_room was dispatched; the halt stopped the rest.
+    expect(createDispatched).toBe(1)
+    expect(callsNamed(calls, 'create_room')).toHaveLength(1)
+    // No opening mutations after the halt.
+    expect(callsNamed(calls, 'add_door')).toHaveLength(0)
+    expect(callsNamed(calls, 'add_window')).toHaveLength(0)
+    expect(report.writeEffect).toBe('write_attempted')
   })
 
   test('records an issue and keeps going when a call fails twice', async () => {

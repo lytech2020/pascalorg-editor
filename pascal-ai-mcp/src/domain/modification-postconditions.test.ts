@@ -35,6 +35,37 @@ describe('modification postconditions', () => {
     })).toEqual([{ code: 'room_area_target_not_met', operationIndex: 0 }])
   })
 
+  // R6.2 / P2-7: an `exact` resize to 16㎡ that lands at 25㎡ must FAIL — the
+  // one-sided lower-bound check used to let a gross overshoot pass.
+  test('exact resize rejects a gross overshoot', () => {
+    const after: LayoutPlan = {
+      ...before,
+      rooms: before.rooms.map(room => room.id === 'bed'
+        ? { ...room, polygon: [[0, 0], [6.25, 0], [6.25, 4], [0, 4]] } // 25㎡
+        : room),
+    }
+    expect(validateModificationPostconditions({
+      before,
+      after,
+      plan: { ops: [{ op: 'resize_room', room: '主卧', targetAreaSqm: 16, areaMode: 'exact' }] },
+    })).toEqual([{ code: 'room_area_target_not_met', operationIndex: 0 }])
+  })
+
+  // The same overshoot is acceptable under `at_least` (a lower bound only).
+  test('at_least resize accepts an overshoot above the floor', () => {
+    const after: LayoutPlan = {
+      ...before,
+      rooms: before.rooms.map(room => room.id === 'bed'
+        ? { ...room, polygon: [[0, 0], [6.25, 0], [6.25, 4], [0, 4]] } // 25㎡ ≥ 16㎡
+        : room),
+    }
+    expect(validateModificationPostconditions({
+      before,
+      after,
+      plan: { ops: [{ op: 'resize_room', room: '主卧', targetAreaSqm: 16, areaMode: 'at_least' }] },
+    })).toEqual([])
+  })
+
   test('requires an added room to have the requested connection', () => {
     const study = {
       id: 'study',
@@ -89,5 +120,57 @@ describe('modification postconditions', () => {
       after: { ...before, rooms: [] },
       plan: { ops: [{ op: 'remove_room', room: '主卧' }] },
     })).toEqual([{ code: 'unexpected_room_removed', operationIndex: 0 }])
+  })
+
+  // R2.4 / P2-5: matching furniture results by stable operationId — not by
+  // array position — keeps a skipped result and a succeeding result paired
+  // with their original operations.
+  test('furniture findings key by operationId so a dropped op does not mispair', () => {
+    const plan = {
+      ops: [
+        // Dropped before execution (room 主卧 removed in the same plan): present
+        // in the plan, absent from the furniture report.
+        { op: 'remove_furniture' as const, room: '主卧', item: '床', operationId: 'op-0' },
+        // Executed and succeeded.
+        { op: 'add_furniture' as const, room: '客厅', item: '茶几', operationId: 'op-1' },
+      ],
+    }
+    const furnitureReport = {
+      results: [
+        {
+          op: { op: 'remove_furniture' as const, room: '主卧', item: '床', operationId: 'op-0' },
+          ok: true,
+          status: 'skipped' as const,
+          reasonCode: 'skipped_dependency' as const,
+          detail: '主卧已随房间删除，家具操作未执行',
+        },
+        {
+          op: { op: 'add_furniture' as const, room: '客厅', item: '茶几', operationId: 'op-1' },
+          ok: true,
+          detail: '已在客厅放置茶几',
+        },
+      ],
+      executionIssues: [],
+      writeEffect: 'write_confirmed' as const,
+    }
+    // Position-based matching could pair the two results with the wrong ops.
+    // Id-based matching recognizes both explicit outcomes.
+    expect(validateModificationPostconditions({ before, after: before, plan, furnitureReport }))
+      .toEqual([])
+  })
+
+  test('an unregistered missing furniture result is a stopping finding', () => {
+    const plan = {
+      ops: [
+        { op: 'remove_furniture' as const, room: '主卧', item: '床', operationId: 'op-0' },
+      ],
+    }
+    const furnitureReport = {
+      results: [],
+      executionIssues: [],
+      writeEffect: 'no_write' as const,
+    }
+    expect(validateModificationPostconditions({ before, after: before, plan, furnitureReport }))
+      .toEqual([{ code: 'furniture_result_missing', operationIndex: 0 }])
   })
 })

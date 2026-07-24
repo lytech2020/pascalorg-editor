@@ -6,6 +6,7 @@ export const MODIFICATION_MODE_REASONS = [
   'rename_only',
   'furniture_only',
   'rename_and_furniture',
+  'clear_room_furniture',
   'add_room',
   'remove_room',
   'resize_room',
@@ -29,7 +30,16 @@ const FURNITURE_OPERATIONS = new Set([
   'add_furniture',
   'remove_furniture',
   'swap_furniture',
+  'clear_room_furniture',
 ])
+
+// R4: a bulk furniture clear is destructive enough to require an explicit
+// count-and-confirm turn before it writes, even though it stays a local patch.
+export function planRequiresBatchConfirmation(
+  operations: readonly ModificationOperation[],
+): boolean {
+  return operations.some(operation => operation.op === 'clear_room_furniture')
+}
 
 const STRUCTURAL_OPERATIONS = new Set([
   'add_room',
@@ -65,11 +75,14 @@ export function classifyModificationMode(
 
   const hasRename = operationTypes.includes('rename_room')
   const hasFurniture = operationTypes.some(operation => FURNITURE_OPERATIONS.has(operation))
+  const hasClear = operationTypes.includes('clear_room_furniture')
   return {
     mode: 'local_patch',
     reasonCode: hasRename && hasFurniture
       ? 'rename_and_furniture'
-      : hasRename ? 'rename_only' : 'furniture_only',
+      : hasRename ? 'rename_only'
+        : hasClear ? 'clear_room_furniture'
+          : 'furniture_only',
     operationTypes,
   }
 }

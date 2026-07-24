@@ -596,6 +596,20 @@ describe('ingest state machine: planIngestAction', () => {
     expect(s.modifyModeConfirmed).toBe(true)
   })
 
+  test('confirm records consent for a bulk furniture clear (local patch, R4)', () => {
+    const s = session({
+      phase: 'awaiting_modification_confirmation',
+      pendingModification: '把客厅家具都删了',
+      // A clear stays local_patch, but still needs explicit consent to write.
+      pendingModificationMode: 'local_patch',
+      pendingModificationReasonCode: 'clear_room_furniture',
+      pendingModifyPlan: { ops: [{ op: 'clear_room_furniture', room: '客厅' }] },
+    })
+    const plan = planIngestAction(input({ action: 'confirm' }), s)
+    expect(plan).toMatchObject({ kind: 'route', next: 'modify' })
+    expect(s.modifyModeConfirmed).toBe(true)
+  })
+
   test('confirm when nothing is confirmable is rejected', () => {
     const s = session({ phase: 'intake' })
     const plan = planIngestAction(input({ action: 'confirm' }), s)

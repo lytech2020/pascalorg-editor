@@ -38,8 +38,29 @@ describe('parseModifyOps', () => {
         { op: 'teleport_room', room: '客厅' }, // unknown op
       ],
     }))
-    expect(plan?.ops).toEqual([{ op: 'rename_room', room: '次卧', name: '儿童房' }])
+    // A stable operationId is assigned to every kept op (R2.4).
+    expect(plan?.ops).toEqual([{ op: 'rename_room', room: '次卧', name: '儿童房', operationId: 'op-0' }])
     expect(errors).toHaveLength(2)
+  })
+
+  test('parses clear_room_furniture and areaMode (R4 / R6)', () => {
+    const { plan, errors } = parseModifyOps(JSON.stringify({
+      ops: [
+        { op: 'clear_room_furniture', room: '洋室1' },
+        { op: 'resize_room', room: '主卧', targetAreaSqm: 16, areaMode: 'exact' },
+        { op: 'add_room', room: { name: '书房', type: 'study', targetAreaSqm: 7 }, areaMode: 'at_least' },
+      ],
+    }))
+    expect(errors).toEqual([])
+    expect(plan?.ops[0]).toMatchObject({ op: 'clear_room_furniture', room: '洋室1' })
+    expect(plan?.ops[1]).toMatchObject({ op: 'resize_room', targetAreaSqm: 16, areaMode: 'exact' })
+    expect(plan?.ops[2]).toMatchObject({ op: 'add_room', areaMode: 'at_least' })
+  })
+
+  test('clear_room_furniture without a room is a shape defect', () => {
+    const { plan, errors } = parseModifyOps(JSON.stringify({ ops: [{ op: 'clear_room_furniture' }] }))
+    expect(plan).toBeNull()
+    expect(errors).toHaveLength(1)
   })
 
   test('no JSON / empty ops → null plan', () => {
@@ -186,7 +207,17 @@ describe('applyModifyOps mixed-op order independence (M2)', () => {
       expect(applied.errors).toEqual([])
       expect(applied.furnitureOps).toEqual([])
       expect(applied.intent.rooms.some(room => room.id === 'bath-1')).toBe(false)
-      expect(applied.notes.some(note => note.includes('已随房间删除'))).toBe(true)
+      expect(applied.notes.some(note => note.includes('已随房间删除'))).toBe(false)
+      // P2-D / R5.1: the dropped furniture op keeps an explicit skipped status,
+      // not just a note — so every sub-operation has a recorded outcome.
+      expect(applied.skippedFurnitureOps).toEqual([
+        {
+          op: { op: 'remove_furniture', room: '卫生间', item: '洗衣机' },
+          roomName: '卫生间',
+          status: 'skipped',
+          reasonCode: 'room_removed',
+        },
+      ])
     }
   })
 

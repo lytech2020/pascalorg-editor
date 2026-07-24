@@ -19,7 +19,9 @@ import {
 import {
   executeFurnitureModifyOps,
   isChecklistItem,
+  previewRoomFurnitureClear,
   replayManualItems,
+  skippedFurnitureResults,
   type FurnitureModifyReport,
   type ManualItem,
 } from './furniture-modify'
@@ -30,13 +32,14 @@ import {
   resolveRoomRef,
   type FurnitureModifyOp,
   type ModifyPlan,
+  type SkippedFurnitureOp,
 } from './modify-ops'
 import { computeLayoutQuality } from './layout-metrics'
 import { kitchenIsCirculation } from './layout-plan'
 import type { IssueL10n, LayoutIntent, LayoutPlan, RoomType } from './layout-plan'
 import { buildLayoutPlan, type PlanBuildResult } from './plan-builder'
 import type { PlanTargets, PlanValidation } from './plan-validator'
-import { executeLayoutPlan, toolPayload, type McpCaller, type SceneExecutionReport } from './scene-executor'
+import { combineWriteEffects, executeLayoutPlan, toolPayload, type McpCaller, type SceneExecutionReport, type WriteEffectState } from './scene-executor'
 import { classifyScopeRequest, SCOPE_POLICY_VERSION } from './domain/guardrail/scope-policy'
 import { directTemplateEligibility } from './domain/policy/direct-template-policy'
 import type { ValidationStage } from './domain/validation-registry'
@@ -44,6 +47,7 @@ import {
   classifyModificationMode,
   confirmedModificationMatches,
   needsModificationConfirmation,
+  planRequiresBatchConfirmation,
   type ModificationModeDecision,
 } from './domain/modification-mode'
 import {
@@ -61,6 +65,7 @@ import {
   type PreservationFinding,
 } from './domain/modification-preservation'
 import {
+  isStructuralPostconditionCode,
   validateModificationPostconditions,
   type ModificationPostconditionFinding,
 } from './domain/modification-postconditions'
@@ -686,6 +691,17 @@ export class PascalAiAgent {
     )
   }
 
+  // P1: an uncertain write (result unknown, or a confirmed+unknown partial)
+  // must never continue to a normal, scene-saving completion. Throwing here
+  // hands the turn to the modify-service catch, which reads the persisted
+  // side-effect state and produces the result-unknown / destructive reply
+  // without saving the scene or allowing an auto-replay.
+  private throwIfWriteUncertain(writeEffect: WriteEffectState, issues: readonly string[]): void {
+    if (writeEffect === 'write_attempted' || writeEffect === 'partial_write_confirmed') {
+      throw new Error(issues.length > 0 ? issues.join('；') : '本次修改的写入结果无法确认')
+    }
+  }
+
   private async verifyModificationPostconditions(
     session: WorkflowSession,
     findings: ModificationPostconditionFinding[],
@@ -697,8 +713,14 @@ export class PascalAiAgent {
       results,
       VALIDATOR_IDS.modificationPostconditions,
     )
-    if (recorded.length > 0) {
-      throw new ModificationVerificationError(recorded.map(finding => finding.code))
+    // R1.4 / P1-2: only STRUCTURAL findings are scene-integrity failures worth
+    // throwing (and thereby routing to the destructive-write reply). Furniture
+    // findings are already surfaced as per-op failed details by
+    // finishPlanFirstModify, so a zero-write furniture miss no longer masquer-
+    // ades as a partial structural rebuild.
+    const structural = recorded.filter(finding => isStructuralPostconditionCode(finding.code))
+    if (structural.length > 0) {
+      throw new ModificationVerificationError(structural.map(finding => finding.code))
     }
   }
 
@@ -1531,8 +1553,82 @@ export class PascalAiAgent {
     const removalsOf = (report: FurnitureModifyReport | null): IntentRemoval[] =>
       report?.results.flatMap(result => (result.removed ? [result.removed] : [])) ?? []
 
+    // P1-3: persist the real side-effect state the instant a write is dispatched
+    // or resolved, so a crash mid-operation never leaves the session at no_write.
+    const persistWriteEffect = (state: WriteEffectState) => {
+      session.modificationWriteEffect = state
+      this.persistSession(session)
+    }
+
+    // R4.3 / P1-1 / P1-5: a bulk clear needs an explicit count-and-confirm turn
+    // bound to CONCRETE target ids, for EVERY local path (furniture-only AND
+    // rename+clear) — not just the furniture-only block. Runs before the path
+    // split. plan_rebuild + clear is handled by the rebuild confirmation, whose
+    // clear runs on a freshly furnished scene where target-binding is moot.
+    let clearTargets: Record<string, string[]> | undefined
+    if (modificationDecision.mode === 'local_patch' && planRequiresBatchConfirmation(parsed.plan.ops)) {
+      const clearLevelId = await this.findLevelId(session)
+      if (!clearLevelId) {
+        return this.finishSafeModificationRejection(session, t(session.language, 'modifyLocalUnavailable', {}))
+      }
+      const clearRoomIds: string[] = []
+      for (const op of parsed.plan.ops) {
+        if (op.op !== 'clear_room_furniture') continue
+        const resolved = resolveRoomRef(op.room, rooms)
+        if ('error' in resolved) {
+          return this.finishSafeModificationRejection(
+            session, t(session.language, 'modifyRoomAmbiguous', { detail: resolved.error }))
+        }
+        clearRoomIds.push(resolved.room.id)
+      }
+      const preview = await previewRoomFurnitureClear({
+        rooms: rooms.filter(room => clearRoomIds.includes(room.id)),
+        levelId: clearLevelId,
+        callMcp: traceMcp,
+        beforeCall,
+      })
+      // P1-B: a failed furniture read must NOT be shown as "nothing to clear".
+      // Bail as a safe, zero-write rejection so the user can retry.
+      if (preview.readFailed) {
+        return this.finishSafeModificationRejection(session, t(session.language, 'modifyLocalUnavailable', {}))
+      }
+      const currentTargets: Record<string, string[]> = {}
+      for (const room of preview.perRoom) currentTargets[room.roomId] = [...room.itemIds].sort()
+      const total = preview.perRoom.reduce((sum, room) => sum + room.itemIds.length, 0)
+      const detail = preview.perRoom
+        .map(room => `「${room.roomName}」${room.itemIds.length} 件可移动家具`)
+        .join('；')
+      const sameTargets = clearRoomIds.every(id =>
+        JSON.stringify((session.pendingClearTargets ?? {})[id] ?? []) === JSON.stringify(currentTargets[id] ?? []))
+
+      if (total === 0) {
+        // Nothing movable to clear — complete without asking (zero writes).
+        delete session.pendingClearTargets
+        return this.finishSafeModificationRejection(session, t(session.language, 'modifyClearNothing', { detail }))
+      }
+      if (!confirmedCurrentPlan) {
+        session.pendingClearTargets = currentTargets
+        session.phase = 'awaiting_modification_confirmation'
+        const reply = t(session.language, 'modifyClearConfirm', { detail, total })
+        session.messages.push({ role: 'assistant', content: reply })
+        return { session, reply, next: 'finish' }
+      }
+      // Confirmed — but re-check the targets did not shift during the wait.
+      if (!session.pendingClearTargets || !sameTargets) {
+        session.pendingClearTargets = currentTargets
+        session.phase = 'awaiting_modification_confirmation'
+        delete session.modifyModeConfirmed
+        const reply = t(session.language, 'modifyClearRetarget', { detail, total })
+        session.messages.push({ role: 'assistant', content: reply })
+        return { session, reply, next: 'finish' }
+      }
+      clearTargets = currentTargets
+      delete session.pendingClearTargets
+    }
+
     const furnitureOnly = parsed.plan.ops.every(op =>
-      op.op === 'add_furniture' || op.op === 'remove_furniture' || op.op === 'swap_furniture')
+      op.op === 'add_furniture' || op.op === 'remove_furniture'
+      || op.op === 'swap_furniture' || op.op === 'clear_room_furniture')
     if (furnitureOnly) {
       const levelId = await this.findLevelId(session)
       if (!levelId) {
@@ -1541,22 +1637,49 @@ export class PascalAiAgent {
           t(session.language, 'modifyLocalUnavailable', {}),
         )
       }
+      // R2.1/R2.2/R2.3: bind every furniture op to a concrete live room BEFORE
+      // any write. The furniture-only path runs the model plan directly (it
+      // never passes through applyModifyOps' strict resolution), so this is
+      // where the substring-first guess used to leak in. Ambiguous or unknown
+      // rooms are a safe, zero-write clarification — never a first-item pick.
+      const bound: FurnitureModifyOp[] = []
+      for (const op of parsed.plan.ops as FurnitureModifyOp[]) {
+        const resolved = resolveRoomRef(op.room, rooms)
+        if ('error' in resolved) {
+          return this.finishSafeModificationRejection(
+            session,
+            t(session.language, 'modifyRoomAmbiguous', { detail: resolved.error }),
+          )
+        }
+        bound.push({ ...op, room: resolved.room.id })
+      }
       const beforeSnapshot = snapshotSceneNodes(
         toolPayload(await this.callMcp(session.sessionId, 'get_scene', {})),
       )
-      session.modificationWriteStarted = true
-      this.persistSession(session)
+      // R1.3/P1-3: no premature write-started guess. The mutation wrapper reports
+      // the real side-effect state live via onWriteEffect (persisted the instant
+      // a write is dispatched), so a zero-write failure stays `no_write` and a
+      // crash mid-batch is never lost as no_write.
       const report = await executeFurnitureModifyOps({
-        ops: parsed.plan.ops as FurnitureModifyOp[],
+        ops: bound,
         rooms,
         levelId,
         callMcp: traceMcp,
         beforeCall,
+        onWriteEffect: persistWriteEffect,
+        clearTargets,
       })
+      session.modificationWriteEffect = report.writeEffect
+      this.persistSession(session)
+      // P1: a write whose result is unknown (or a confirmed+unknown partial)
+      // must NOT be saved and reported as a normal completion. Throw so the
+      // modify-service catch routes it by side-effect state (result-unknown /
+      // destructive) — never save_scene, never auto-replay.
+      this.throwIfWriteUncertain(report.writeEffect, report.executionIssues)
       await this.verifyLocalPatchScope(
         session,
         beforeSnapshot,
-        localPatchAllowances([], report, rooms, parsed.plan.ops as FurnitureModifyOp[], levelId),
+        localPatchAllowances([], report, rooms, bound, levelId),
       )
       await this.verifyModificationPostconditions(session, validateModificationPostconditions({
         before: session.layoutPlan,
@@ -1570,6 +1693,7 @@ export class PascalAiAgent {
         failedDetails: report.results.filter(r => !r.ok).map(r => r.detail),
         baselineGateFailures,
         intentRemovals: removalsOf(report),
+        sceneWasWritten: report.writeEffect !== 'no_write',
       })
     }
 
@@ -1705,6 +1829,7 @@ export class PascalAiAgent {
                 }, new Map<RoomType, number>())].map(([type, count]) => ({ type, count })),
               }, profile),
               furnitureOps: [],
+              skippedFurnitureOps: [],
               appliedNotes: [],
               baselineGateFailures,
               beforePlan,
@@ -1772,9 +1897,16 @@ export class PascalAiAgent {
           }),
         )
       }
-      session.modificationWriteStarted = true
-      this.persistSession(session)
-      if (patches.length > 0) await traceMcp('apply_patch', { patches })
+      // R1.3: the rename patch IS a real write — mark the result unknown right
+      // before dispatch (honest, since a mutation is about to fire), then
+      // confirm once it returns. A zero-patch rename (nothing to write) stays
+      // no_write until the furniture stage, if any.
+      if (patches.length > 0) {
+        session.modificationWriteEffect = 'write_attempted'
+        this.persistSession(session)
+        await traceMcp('apply_patch', { patches })
+        session.modificationWriteEffect = 'write_confirmed'
+      }
       session.layoutIntent = applied.intent
       // Keep the plan snapshot's names in step, or the rename would read as
       // drift on the next structural modify.
@@ -1787,8 +1919,20 @@ export class PascalAiAgent {
           levelId: localLevelId!,
           callMcp: traceMcp,
           beforeCall,
+          // P1-3: real-time state, seeded with the rename patch so the verdict
+          // spans both the patch and the furniture ops.
+          onWriteEffect: persistWriteEffect,
+          priorConfirmedWrites: patches.length > 0 ? 1 : 0,
+          clearTargets,
         })
+        session.modificationWriteEffect = combineWriteEffects(
+          session.modificationWriteEffect,
+          furnReport.writeEffect,
+        )
       }
+      this.persistSession(session)
+      // P1: an uncertain combined write must not save & complete normally.
+      this.throwIfWriteUncertain(session.modificationWriteEffect ?? 'no_write', furnReport?.executionIssues ?? [])
       await this.verifyLocalPatchScope(
         session,
         beforeSnapshot,
@@ -1823,6 +1967,7 @@ export class PascalAiAgent {
         failedDetails: furnReport?.results.filter(r => !r.ok).map(r => r.detail) ?? [],
         baselineGateFailures,
         intentRemovals: removalsOf(furnReport),
+        sceneWasWritten: patches.length > 0 || (furnReport?.writeEffect ?? 'no_write') !== 'no_write',
       })
     }
 
@@ -1921,6 +2066,7 @@ export class PascalAiAgent {
       planNotes,
       strategy,
       furnitureOps: applied.furnitureOps,
+      skippedFurnitureOps: applied.skippedFurnitureOps,
       appliedNotes: applied.notes,
       baselineGateFailures,
       beforePlan,
@@ -1945,6 +2091,7 @@ export class PascalAiAgent {
     planNotes: string[]
     strategy: StrategyDecision
     furnitureOps: FurnitureModifyOp[]
+    skippedFurnitureOps: SkippedFurnitureOp[]
     appliedNotes: string[]
     baselineGateFailures: GateFailure[]
     beforePlan: LayoutPlan
@@ -1952,7 +2099,7 @@ export class PascalAiAgent {
   }): Promise<Partial<WorkflowGraphState>> {
     const {
       session, sceneId, loadedVersion, trace, traceMcp, beforeCall,
-      zones, intent, plan, planNotes, strategy, furnitureOps, appliedNotes,
+      zones, intent, plan, planNotes, strategy, furnitureOps, skippedFurnitureOps, appliedNotes,
       baselineGateFailures,
       beforePlan,
       modifyPlan,
@@ -2053,6 +2200,14 @@ export class PascalAiAgent {
         beforeCall,
       })
     }
+    const skippedResults = skippedFurnitureResults(skippedFurnitureOps)
+    if (skippedResults.length > 0) {
+      furnReport = {
+        results: [...(furnReport?.results ?? []), ...skippedResults],
+        executionIssues: furnReport?.executionIssues ?? [],
+        writeEffect: furnReport?.writeEffect ?? 'no_write',
+      }
+    }
     const replay = await replayManualItems({
       items: manualItems,
       rooms: furnitureRooms,
@@ -2060,6 +2215,29 @@ export class PascalAiAgent {
       callMcp: traceMcp,
       beforeCall,
     })
+    // R1.3: the clear+rebuild always committed real writes (destructive delete
+    // + create_room); fold in every executor's side-effect verdict. This path
+    // also flags destructiveSceneWriteStarted, so the failure wording stays
+    // destructive regardless — but keep the effect coherent for consistency.
+    session.modificationWriteEffect = combineWriteEffects(
+      'write_confirmed',
+      built.writeEffect,
+      furnished.writeEffect,
+      furnReport?.writeEffect,
+      replay.writeEffect,
+    )
+    // P1: a deferred furniture write whose result is unknown must not complete
+    // normally — throw so the (destructive) result-unknown reply fires instead
+    // of saving a scene whose final state is uncertain.
+    this.throwIfWriteUncertain(session.modificationWriteEffect, [
+      ...built.executionIssues,
+      ...(furnReport?.executionIssues ?? []),
+      ...replay.executionIssues,
+    ])
+    // P2-A: verify the built structure against the ACTUAL zones FIRST. Only
+    // once the scene provably matches `plan` do we refresh the session snapshot
+    // to it — otherwise an incomplete build would leave the session holding the
+    // ideal plan instead of the real, partial scene.
     const actualZonesPayload = toolPayload(await this.callMcp(session.sessionId, 'get_zones', {}))
     const actualZones = Array.isArray(actualZonesPayload.zones)
       ? actualZonesPayload.zones.filter(isZoneSummary)
@@ -2071,17 +2249,11 @@ export class PascalAiAgent {
     if (executedFindings.length > 0) {
       throw new ModificationVerificationError(executedFindings.map(finding => finding.code))
     }
-    await this.verifyModificationPostconditions(session, validateModificationPostconditions({
-      before: beforePlan,
-      after: plan,
-      plan: modifyPlan,
-      furnitureReport: furnReport,
-    }))
-    // Snapshot refresh (§2 病灶④): the next modify must see THIS state. It is
-    // written only after every execution stage succeeded — an exception above
-    // propagates to modify()'s catch with the OLD snapshots intact, so a
-    // retried pending modification still resolves against the pre-change
-    // intent instead of a half-applied one.
+    // R5.2/R5.3: structure confirmed to match `plan` — refresh the session
+    // snapshot NOW, before the furniture postcondition verification below, which
+    // may throw. If it does, the session still reflects the rebuilt structure
+    // (verified accurate above), never the pre-change one; otherwise the next
+    // modify would compute against a snapshot conflicting with the actual scene.
     session.zoneRoomTypes = Object.fromEntries(
       furnitureRooms.filter(room => room.zoneId !== null).map(room => [room.zoneId as string, room.type]),
     )
@@ -2091,6 +2263,13 @@ export class PascalAiAgent {
     // The room program is now user-edited: gates judge against the intent
     // from here on (see gateTargetsForSession).
     session.programEditedByModify = true
+    this.persistSession(session)
+    await this.verifyModificationPostconditions(session, validateModificationPostconditions({
+      before: beforePlan,
+      after: plan,
+      plan: modifyPlan,
+      furnitureReport: furnReport,
+    }))
     trace.converged = true
     try {
       const result = await this.finishPlanFirstModify(session, sceneId, loadedVersion, trace, {
@@ -2114,7 +2293,7 @@ export class PascalAiAgent {
       })
       this.destructiveWrites.delete(session.sessionId)
       delete session.destructiveSceneWriteStarted
-      delete session.modificationWriteStarted
+      delete session.modificationWriteEffect
       return result
     } catch (error) {
       if (error instanceof DestructiveSceneWriteError) throw error
@@ -2141,9 +2320,10 @@ export class PascalAiAgent {
     delete session.pendingModificationReasonCode
     delete session.pendingModificationPlanHash
     delete session.pendingModifyPlan
+    delete session.pendingClearTargets
     delete session.modifyModeConfirmed
     delete session.modifyDriftConfirmed
-    delete session.modificationWriteStarted
+    delete session.modificationWriteEffect
     session.phase = modifyFailureRecovery(false, Boolean(session.sceneResult)).phase
     const reply = t(session.language, 'modifyFailedNoRetry', { error: errors.join('；') })
     session.messages.push({ role: 'assistant', content: reply })
@@ -2160,9 +2340,10 @@ export class PascalAiAgent {
     delete session.pendingModificationReasonCode
     delete session.pendingModificationPlanHash
     delete session.pendingModifyPlan
+    delete session.pendingClearTargets
     delete session.modifyModeConfirmed
     delete session.modifyDriftConfirmed
-    delete session.modificationWriteStarted
+    delete session.modificationWriteEffect
     session.phase = session.sceneResult?.remainingIssueCount ? 'completed_with_issues' : 'completed'
     session.messages.push({ role: 'assistant', content: reply })
     return { session, reply, next: 'finish' }
@@ -2181,15 +2362,24 @@ export class PascalAiAgent {
       // 见 effectiveGateFailures。
       baselineGateFailures: GateFailure[]
       intentRemovals?: IntentRemoval[]
+      // P2: whether this turn actually wrote to the scene. A zero-write failure
+      // (nothing found / no catalog match / no legal position) must NOT call
+      // save_scene — the acceptance requires zero write-tool calls on a safe
+      // failure. Defaults to true for paths that always write (rebuild/rename).
+      sceneWasWritten?: boolean
     },
   ): Promise<Partial<WorkflowGraphState>> {
     const diagnostics = await this.collectDiagnostics(session, 'modify')
-    const sceneVersion = await this.persistScene(
-      session.sessionId,
-      sceneId,
-      diagnostics.validation.valid,
-      loadedVersion,
-    )
+    // P2: skip the persistence write entirely when nothing was written to the
+    // scene — otherwise a purely-failed furniture turn still bumps a version.
+    const sceneVersion = results.sceneWasWritten === false
+      ? loadedVersion
+      : await this.persistScene(
+        session.sessionId,
+        sceneId,
+        diagnostics.validation.valid,
+        loadedVersion,
+      )
     const gates = await this.evaluateGates(session, 'modify')
     const { effective, waived } = effectiveGateFailures(
       gates.report.failures,
@@ -2229,9 +2419,10 @@ export class PascalAiAgent {
     delete session.pendingModificationReasonCode
     delete session.pendingModificationPlanHash
     delete session.pendingModifyPlan
+    delete session.pendingClearTargets
     delete session.modifyModeConfirmed
     delete session.modifyDriftConfirmed
-    delete session.modificationWriteStarted
+    delete session.modificationWriteEffect
     const base = buildCompletionReply({
       lang: session.language ?? 'en',
       successText: t(session.language, 'modifySuccess', {}),
@@ -4137,6 +4328,8 @@ function localPatchAllowances(
   for (const result of report?.results ?? []) {
     allowFields(result.removedItemId, 'all')
     allowFields(result.addedItemId, 'all')
+    // R4: a bulk clear removes many items in one op.
+    for (const removedId of result.removedItemIds ?? []) allowFields(removedId, 'all')
   }
   for (const operation of operations) {
     const room = rooms.find(entry =>

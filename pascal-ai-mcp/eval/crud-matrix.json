@@ -6,6 +6,10 @@
       "verb": "create",
       "target": "room",
       "disposition": "supported",
+      "conditional": true,
+      "limitations": [
+        "Depends on a template/partition being feasible for the brief; may safely reject before any write on area/connectivity/stability constraints."
+      ],
       "deterministicEvidence": ["plan-builder", "scene-executor"],
       "providerCases": ["case-03-two-bed-standard"]
     },
@@ -14,7 +18,12 @@
       "verb": "create",
       "target": "room",
       "disposition": "supported",
-      "deterministicEvidence": ["modify-ops:add_room", "layout-partitioner:case-13"],
+      "conditional": true,
+      "limitations": [
+        "Executed as a whole-plan rebuild; may safely reject before writing when area/connectivity/stability constraints are infeasible.",
+        "areaMode governs area judgement: exact is two-sided, at_least is a lower bound."
+      ],
+      "deterministicEvidence": ["modify-ops:add_room", "layout-partitioner:case-13", "modification-postconditions:area-two-sided"],
       "providerCases": ["case-13-modify-add-room"]
     },
     {
@@ -22,7 +31,12 @@
       "verb": "delete",
       "target": "room",
       "disposition": "supported",
-      "deterministicEvidence": ["modify-ops:remove_room", "local-patch-scope"],
+      "conditional": true,
+      "limitations": [
+        "Only some layouts absorb the removed room locally; otherwise a whole-plan rebuild runs. No rollback is promised.",
+        "Removing an entry/corridor host or a room whose removal isolates others is safely rejected before writing."
+      ],
+      "deterministicEvidence": ["modify-ops:remove_room", "local-patch-scope", "modification-preservation:absorb"],
       "providerCases": ["case-19-modify-remove-room", "case-20-modify-remove-room-local"]
     },
     {
@@ -38,7 +52,12 @@
       "verb": "update",
       "target": "room",
       "disposition": "supported",
-      "deterministicEvidence": ["modify-ops:resize_room", "layout-partitioner:case-14"],
+      "conditional": true,
+      "limitations": [
+        "Whole-plan rebuild; the exact target is verified two-sided (an overshoot fails, not only a shortfall).",
+        "Corridor/footprint constraints may keep the result a few percent off the target; reported honestly."
+      ],
+      "deterministicEvidence": ["modify-ops:resize_room", "layout-partitioner:case-14", "modification-postconditions:area-two-sided"],
       "providerCases": ["case-14-modify-resize"]
     },
     {
@@ -78,7 +97,13 @@
       "verb": "create",
       "target": "furniture",
       "disposition": "supported",
-      "deterministicEvidence": ["furniture-modify:add_furniture", "local-patch-scope"],
+      "conditional": true,
+      "limitations": [
+        "Requires a resolvable furniture concept, a catalog hit, and a legal position; each failure is a distinct zero-write reason (needs_clarification / catalog_no_match / no_safe_position).",
+        "A vague term (桌子) is clarified, never silently mapped to a specific table.",
+        "Placement follows the concept's strategy (wall-aligned or room-centre)."
+      ],
+      "deterministicEvidence": ["furniture-modify:add_furniture", "furniture-concepts", "local-patch-scope"],
       "providerCases": ["case-16-modify-add-furniture"]
     },
     {
@@ -86,6 +111,11 @@
       "verb": "delete",
       "target": "furniture",
       "disposition": "supported",
+      "conditional": true,
+      "limitations": [
+        "Deletes one matched item; with multiple matches the wording states the count and does not claim a reliable placement order.",
+        "Room target is bound strictly (no substring guess); ambiguity is clarified before any write."
+      ],
       "deterministicEvidence": ["furniture-modify:remove_furniture", "local-patch-scope"],
       "providerCases": ["case-17-modify-remove-furniture"]
     },
@@ -94,8 +124,26 @@
       "verb": "update",
       "target": "furniture",
       "disposition": "supported",
+      "conditional": true,
+      "limitations": [
+        "Delete-then-place: a later placement failure leaves the old item removed and reports the partial outcome (no auto-rollback)."
+      ],
       "deterministicEvidence": ["furniture-modify:swap_furniture", "local-patch-scope"],
       "providerCases": ["case-18-modify-swap-furniture"]
+    },
+    {
+      "id": "clear-room-furniture",
+      "verb": "delete",
+      "target": "furniture",
+      "disposition": "supported",
+      "conditional": true,
+      "limitations": [
+        "Requires an explicit count-and-confirm turn before writing; nothing is deleted until confirmed.",
+        "Clears movable furniture only — fixed kitchen/bath equipment and wall/ceiling fixtures are retained.",
+        "Per-item single execution; a partial failure is reported honestly with no auto-rollback."
+      ],
+      "deterministicEvidence": ["modify-ops:clear_room_furniture", "furniture-modify:clear", "modification-mode:batch-confirmation"],
+      "providerCases": []
     },
     {
       "id": "move-furniture-with-position",
@@ -110,7 +158,12 @@
       "verb": "mixed",
       "target": "scene",
       "disposition": "supported",
-      "deterministicEvidence": ["modify-ops:order-independent", "workflow:session-snapshot"],
+      "conditional": true,
+      "limitations": [
+        "Sub-operations run in order; a later failure reports per-op done/undone status instead of a single total failure.",
+        "After a structural stage commits, the session snapshot is refreshed to the new structure so a later failure never leaves it conflicting with the scene."
+      ],
+      "deterministicEvidence": ["modify-ops:order-independent", "modification-postconditions:operationId", "workflow:session-snapshot"],
       "providerCases": ["case-23-modify-chained"]
     },
     {
@@ -118,7 +171,7 @@
       "verb": "mixed",
       "target": "scene",
       "disposition": "safe_rejection",
-      "deterministicEvidence": ["modify-ops:invalid", "modification-mode:unsupported_or_unknown"],
+      "deterministicEvidence": ["modify-ops:invalid", "modification-mode:unsupported_or_unknown", "modify-ops:resolveRoomRef-ambiguous"],
       "providerCases": []
     },
     {
@@ -126,7 +179,11 @@
       "verb": "mixed",
       "target": "scene",
       "disposition": "failed_recoverable",
-      "deterministicEvidence": ["durable-agent:safe-plan-boundary", "request-worker:process_interrupted"],
+      "limitations": [
+        "A mutation whose result is unknown is never auto-replayed; the write-effect state (no_write/write_attempted/write_confirmed/partial_write_confirmed) drives the failure wording.",
+        "A zero-write failure never shows a partial-modification warning."
+      ],
+      "deterministicEvidence": ["durable-agent:safe-plan-boundary", "request-worker:process_interrupted", "scene-executor:write-effect-ledger"],
       "providerCases": []
     }
   ]

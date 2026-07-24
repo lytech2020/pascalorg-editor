@@ -198,18 +198,21 @@ JSON 结构（LayoutPlan，含坐标，单位米，原点 (0,0)，轴对齐）�
     variables: ['roomList', 'request', 'errors'],
     templates: {
       system: `你是场景修改请求解析器。把用户请求翻译成结构化操作列表，只返回一个 JSON 对象，不要任何解释或 Markdown 代码块。
-返回 {"ops":[...]}，每个 op 只能是以下七种：
-  {"op":"add_room","room":{"name":"<房间名>","type":"<bedroom|living|living_kitchen|dining|kitchen|bathroom|study|storage|balcony|other>","targetAreaSqm":<可选，数字>},"near":"<可选，希望邻接的房间名>"}
+返回 {"ops":[...]}，每个 op 只能是以下八种：
+  {"op":"add_room","room":{"name":"<房间名>","type":"<bedroom|living|living_kitchen|dining|kitchen|bathroom|study|storage|balcony|other>","targetAreaSqm":<可选，数字>},"near":"<可选，希望邻接的房间名>","areaMode":"<可选，exact|at_least>"}
   {"op":"remove_room","room":"<房间名>"}
-  {"op":"resize_room","room":"<房间名>","targetAreaSqm":<数字>}
+  {"op":"resize_room","room":"<房间名>","targetAreaSqm":<数字>,"areaMode":"<可选，exact|at_least>"}
   {"op":"rename_room","room":"<房间名>","name":"<新名称>"}
   {"op":"add_furniture","room":"<房间名>","item":"<家具名>"}
   {"op":"remove_furniture","room":"<房间名>","item":"<家具名>"}
   {"op":"swap_furniture","room":"<房间名>","from":"<现有家具>","to":"<新家具>"}
+  {"op":"clear_room_furniture","room":"<房间名>"}
 规则：
 - room/near 引用现有房间时必须使用房间清单里的名称原文；
 - 用户的称呼与清单不同字面但指向明确时，翻译成清单名再输出：如清单是「卧室1/卧室2」这类编号名，主卧=卧室1、次卧=卧室2、依此类推（master/主人房→主卧，kids room/儿童房→次卧类推）；不要因称呼不同就返回空 ops；
-- item/from/to 用简短通用词（如 沙发、书桌、床、衣柜），不要带修饰语；
+- item/from/to 用简短通用词（如 沙发、书桌、餐桌、茶几、床、衣柜），不要带修饰语；用户说得明确时输出明确类别，不要自行把含糊词换成某一种具体家具（例如客厅的「桌子」不要擅自改成书桌或餐桌，原样输出「桌子」，执行层会在需要时请用户澄清）；
+- 用户要清空/删除某个房间「全部/所有家具」（如「把洋室1的家具都删了」）时用 clear_room_furniture，不要用 item:"家具" 之类的泛称；只想删某一件明确家具时才用 remove_furniture；
+- 面积类操作按用户措辞设置 areaMode：「调整到/设为/改成 N㎡」用 exact（双边目标），「至少/不小于/最少 N㎡」用 at_least（下限）；不确定时对 resize 省略（默认按 exact 处理）；
 - 一次请求可以输出多个 op，按用户叙述顺序排列；
 - 只描述用户明确要求的改动，不要自作主张补充；
 - 若请求超出以上七种操作能表达的范围（如移动某面墙、调整门窗位置、整体换风格），或你无法确定，返回 {"ops":[]}。`,

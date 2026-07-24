@@ -95,6 +95,31 @@ export const MESSAGES = {
     p => `シーン ${p.sceneId} の構造再構築は書き込み開始後に失敗しました：${p.error}。現在のインターフェースには正式なチェックポイント復元機能がないため、シーンが部分的に変更されている可能性があります。自動再試行は無効化しました。エディタで確認してから、手動修正または再生成を選んでください。`,
     p => `Structural rebuild of scene ${p.sceneId} failed after writes began: ${p.error}. The current interface has no authoritative checkpoint restore, so the scene may be partially modified; automatic retry has been disabled. Inspect it in the editor before choosing manual repair or regeneration.`,
   ),
+  modifyClearConfirm: def<{ detail: string; total: number }>(
+    p => `即将清空${p.detail}，共 ${p.total} 件（厨房、卫浴的固定设备和内置构件会保留）。此操作不可自动撤销，确认后才会删除。发送确认以继续，或重新描述需求。`,
+    p => `${p.detail}を空にします（合計 ${p.total} 点。キッチン・浴室の固定設備と作り付けの構造物は残します）。この操作は自動で元に戻せません。確認後にのみ削除します。続行するには確認を送信するか、内容を改めて入力してください。`,
+    p => `About to clear ${p.detail} — ${p.total} item(s) in total (fixed kitchen/bathroom equipment and built-in fixtures are kept). This cannot be undone automatically; items are deleted only after you confirm. Send a confirmation to proceed, or describe a different change.`,
+  ),
+  modifyClearRetarget: def<{ detail: string; total: number }>(
+    p => `确认期间该房间的家具发生了变化。现在将清空${p.detail}，共 ${p.total} 件（固定设备保留）。请再次发送确认以按新的清单执行，或重新描述需求。`,
+    p => `確認の間に対象の家具が変わりました。現在は${p.detail}（合計 ${p.total} 点、固定設備は保持）を空にします。新しいリストで実行するには再度確認を送信するか、内容を改めて入力してください。`,
+    p => `The furniture in that room changed during confirmation. It will now clear ${p.detail} — ${p.total} item(s) (fixed equipment kept). Send a confirmation again to proceed with the new list, or describe a different change.`,
+  ),
+  modifyClearNothing: def<{ detail: string }>(
+    p => `${p.detail}——没有可清空的可移动家具，场景未改动。`,
+    p => `${p.detail}——空にできる可動家具はありません。シーンは変更していません。`,
+    p => `${p.detail} — there is no movable furniture to clear, so the scene was not changed.`,
+  ),
+  modifyRoomAmbiguous: def<{ detail: string }>(
+    p => `无法确定这次家具修改要作用于哪个房间：${p.detail}。为避免改错房间，本次没有修改场景。请指明具体房间名后重试。`,
+    p => `今回の家具修正をどの部屋に適用するか特定できませんでした：${p.detail}。誤った部屋を変更しないよう、シーンは変更していません。具体的な部屋名を指定して再度お試しください。`,
+    p => `Could not determine which room this furniture change applies to: ${p.detail}. To avoid editing the wrong room, the scene was not changed. Name the specific room and try again.`,
+  ),
+  modifyResultUnknown: def<{ sceneId: string; error: string }>(
+    p => `场景 ${p.sceneId} 的修改在写入过程中中断，最后一次写入的结果无法确认：${p.error}。系统不会自动重试，以免重复写入。请先在编辑器中检查当前场景，再决定是否重新提交这次修改。`,
+    p => `シーン ${p.sceneId} の修正は書き込み中に中断し、最後の書き込みの結果を確認できません：${p.error}。重複書き込みを避けるため自動再試行は行いません。エディタで現在のシーンを確認してから、この修正を再送信するか判断してください。`,
+    p => `The modification of scene ${p.sceneId} was interrupted mid-write and the last write's result could not be confirmed: ${p.error}. It will not be retried automatically (to avoid a duplicate write). Inspect the scene in the editor before deciding whether to resubmit this change.`,
+  ),
   modifyDriftWarning: def<Record<string, never>>(
     () => '检测到当前场景与原规划之间存在手动修改的差异。继续执行这次结构修改会按新规划重建结构，手动改动可能被覆盖（家具类修改不受影响）。发送确认以继续，或重新描述修改需求。',
     () => '現在のシーンと元のプランに手動編集による差分が検出されました。この構造修正を続行すると新しいプランに基づいて再構築され、手動の変更は上書きされる可能性があります（家具の変更は影響を受けません）。続行するには確認を送信するか、修正内容を改めて入力してください。',

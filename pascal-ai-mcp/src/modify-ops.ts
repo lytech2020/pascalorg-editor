@@ -17,16 +17,32 @@ import { areaBoundFor } from './domain/policy/room-policy'
 import { ROOM_TYPES, type LayoutIntent, type LayoutIntentRoom, type RoomType } from './layout-plan'
 import type { NormProfile } from './norms/profile'
 
-export type StructuralModifyOp =
-  | { op: 'add_room'; room: { name: string; type: RoomType; targetAreaSqm?: number }; near?: string }
-  | { op: 'remove_room'; room: string }
-  | { op: 'resize_room'; room: string; targetAreaSqm: number }
-  | { op: 'rename_room'; room: string; name: string }
+// R2.4: every parsed op carries a stable operationId so execution reports and
+// postcondition verification key by identity, never by array position (P2-5:
+// a dropped op used to shift every later furniture result onto the wrong op).
+export type ModifyOpBase = { operationId?: string }
 
-export type FurnitureModifyOp =
+// R6.1: how a target area should be judged. `exact` ("调整到 16㎡") is a
+// two-sided range — 25㎡ is as wrong as 10㎡. `at_least` ("至少 16㎡") is a
+// one-sided lower bound.
+export type AreaMode = 'exact' | 'at_least'
+
+export type StructuralModifyOp = ModifyOpBase & (
+  | { op: 'add_room'; room: { name: string; type: RoomType; targetAreaSqm?: number }; near?: string; areaMode?: AreaMode }
+  | { op: 'remove_room'; room: string }
+  | { op: 'resize_room'; room: string; targetAreaSqm: number; areaMode?: AreaMode }
+  | { op: 'rename_room'; room: string; name: string }
+)
+
+export type FurnitureModifyOp = ModifyOpBase & (
   | { op: 'add_furniture'; room: string; item: string }
   | { op: 'remove_furniture'; room: string; item: string }
   | { op: 'swap_furniture'; room: string; from: string; to: string }
+  // R4: clear all MOVABLE furniture from one room (fixed kitchen/bath equipment
+  // and built-in fixtures are retained). A bulk destructive op — requires a
+  // count-and-confirm turn before it writes.
+  | { op: 'clear_room_furniture'; room: string }
+)
 
 export type ModifyOp = StructuralModifyOp | FurnitureModifyOp
 
@@ -43,7 +59,7 @@ export type ModifyPlan = {
 }
 
 const STRUCTURAL_OPS = new Set(['add_room', 'remove_room', 'resize_room', 'rename_room'])
-const FURNITURE_OPS = new Set(['add_furniture', 'remove_furniture', 'swap_furniture'])
+const FURNITURE_OPS = new Set(['add_furniture', 'remove_furniture', 'swap_furniture', 'clear_room_furniture'])
 
 // --- parse -------------------------------------------------------------------
 // Tolerant parse, same posture as parseLayoutIntent: strip fences, take the
@@ -76,6 +92,8 @@ export function parseModifyOps(raw: string): { plan: ModifyPlan | null; errors: 
     const fail = (why: string) => errors.push(`ops[${i}]（${op || '未知'}）：${why}`)
     const str = (key: string): string | null =>
       typeof entry[key] === 'string' && (entry[key] as string).trim() ? (entry[key] as string).trim() : null
+    const areaMode = (): AreaMode | undefined =>
+      entry.areaMode === 'exact' || entry.areaMode === 'at_least' ? entry.areaMode : undefined
 
     if (op === 'add_room') {
       const room = entry.room as Record<string, unknown> | undefined
@@ -91,10 +109,12 @@ export function parseModifyOps(raw: string): { plan: ModifyPlan | null; errors: 
         ? room.targetAreaSqm
         : undefined
       const near = str('near')
+      const mode = areaMode()
       ops.push({
         op: 'add_room',
         room: { name, type, ...(area !== undefined ? { targetAreaSqm: area } : {}) },
         ...(near ? { near } : {}),
+        ...(mode ? { areaMode: mode } : {}),
       })
     } else if (op === 'remove_room') {
       const room = str('room')
@@ -106,7 +126,8 @@ export function parseModifyOps(raw: string): { plan: ModifyPlan | null; errors: 
         ? entry.targetAreaSqm
         : null
       if (!room || area === null) { fail('room/targetAreaSqm 缺失或非法'); continue }
-      ops.push({ op: 'resize_room', room, targetAreaSqm: area })
+      const mode = areaMode()
+      ops.push({ op: 'resize_room', room, targetAreaSqm: area, ...(mode ? { areaMode: mode } : {}) })
     } else if (op === 'rename_room') {
       const room = str('room')
       const name = str('name')
@@ -123,11 +144,19 @@ export function parseModifyOps(raw: string): { plan: ModifyPlan | null; errors: 
       const to = str('to')
       if (!room || !from || !to) { fail('room/from/to 缺失'); continue }
       ops.push({ op: 'swap_furniture', room, from, to })
+    } else if (op === 'clear_room_furniture') {
+      const room = str('room')
+      if (!room) { fail('room 缺失'); continue }
+      ops.push({ op: 'clear_room_furniture', room })
     } else {
       fail('未知操作类型')
     }
   }
   if (ops.length === 0) return { plan: null, errors }
+  // Stable per-plan operation ids (R2.4). Assigned once here; preserved through
+  // applyModifyOps (spreads) and confirmation (pendingModifyPlan is replayed
+  // verbatim), so a result can always be traced back to its op by identity.
+  ops.forEach((op, index) => { op.operationId = `op-${index}` })
   const note = typeof value.note === 'string' && value.note.trim() ? value.note.trim() : undefined
   // Partial success keeps the parsed ops AND the errors: the caller decides
   // whether defects block (they do — errors feed the correction loop).
@@ -138,10 +167,17 @@ export function parseModifyOps(raw: string): { plan: ModifyPlan | null; errors: 
 // §3: id exact → name exact → room-vocab type match when it names a unique
 // room. Ambiguity is an error, not a guess.
 
-export function resolveRoomRef(
+// §3 strict resolution: id exact → name exact → room-vocab type match when it
+// names a unique room. Ambiguity is a safe error, never a first-item guess
+// (R2). Generic over any {id, name, type} room shape so the furniture path can
+// bind against the LIVE zone rooms with the exact same discipline the
+// structural path uses against the intent — no substring fallback anywhere.
+export type ResolvableRoom = { id: string; name: string; type: RoomType }
+
+export function resolveRoomRef<T extends ResolvableRoom>(
   ref: string,
-  rooms: readonly LayoutIntentRoom[],
-): { room: LayoutIntentRoom } | { error: string } {
+  rooms: readonly T[],
+): { room: T } | { error: string } {
   const byId = rooms.find(room => room.id === ref)
   if (byId) return { room: byId }
   const byName = rooms.filter(room => room.name === ref)
@@ -166,9 +202,20 @@ export type AppliedModify = {
   structural: boolean
   // Furniture ops pass through untouched for the executor stage (M1).
   furnitureOps: FurnitureModifyOp[]
+  // R5.1 / P2-D: furniture ops the planner DROPPED before execution (their room
+  // was removed in the same plan). They never reach the executor, so they get an
+  // explicit skipped-dependency status here — not silently forgotten.
+  skippedFurnitureOps: SkippedFurnitureOp[]
   notes: string[]
   // Non-empty ⇒ do NOT proceed; feed back to the correction loop / user.
   errors: string[]
+}
+
+export type SkippedFurnitureOp = {
+  op: FurnitureModifyOp
+  roomName: string
+  status: 'skipped'
+  reasonCode: 'room_removed'
 }
 
 function roomArea(room: LayoutIntentRoom, profile: NormProfile): number {
@@ -224,6 +271,7 @@ export function applyModifyOps(
   const notes: string[] = []
   const errors: string[] = []
   const furnitureOps: FurnitureModifyOp[] = []
+  const skippedFurnitureOps: SkippedFurnitureOp[] = []
   let rooms = [...intent.rooms]
   let adjacency = intent.adjacency ? [...intent.adjacency] : undefined
   let totalArea = intent.targetTotalAreaSqm
@@ -325,7 +373,12 @@ export function applyModifyOps(
         continue
       }
       if (removedRooms.some(room => room.id === original.room.id)) {
-        notes.push(`「${original.room.name}」已随房间删除，其中的家具操作（${fop.op}）不再需要，忽略`)
+        skippedFurnitureOps.push({
+          op: fop,
+          roomName: original.room.name,
+          status: 'skipped',
+          reasonCode: 'room_removed',
+        })
         continue
       }
     }
@@ -334,5 +387,5 @@ export function applyModifyOps(
 
   const applied: LayoutIntent = { targetTotalAreaSqm: totalArea, rooms }
   if (adjacency !== undefined && adjacency.length > 0) applied.adjacency = adjacency
-  return { intent: applied, structural, furnitureOps, notes, errors }
+  return { intent: applied, structural, furnitureOps, skippedFurnitureOps, notes, errors }
 }

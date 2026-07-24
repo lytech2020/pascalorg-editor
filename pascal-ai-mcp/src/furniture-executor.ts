@@ -22,7 +22,7 @@ import {
   type FurnitureRequirement,
 } from './furniture-checklist'
 import { pointInPolygon, polygonArea, type RoomType } from './layout-plan'
-import { callWithRetry, type McpCaller } from './scene-executor'
+import { callWithRetry, WriteEffectLedger, type McpCaller, type WriteEffectState } from './scene-executor'
 
 export type FurnitureRoom = {
   id: string
@@ -54,6 +54,8 @@ export type FurnitureExecutionReport = {
   placed: PlacedFurniture[]
   missing: MissingFurniture[]
   executionIssues: string[]
+  // R1.3: real side-effect state produced by the mutation wrapper.
+  writeEffect: WriteEffectState
 }
 
 // Same conventions as agent.ts checkFurniturePlacement — an executor output
@@ -249,6 +251,52 @@ export function findWallPlacement(options: {
   return null
 }
 
+// Room-centre placement scan (R3.3). For centre-of-room furniture (餐桌/茶几/
+// 中岛) the wall scan is the wrong model — such items belong away from the
+// walls. Starts at the polygon's bounding-box centre and searches a grid
+// outward (nearest-first), trying both axis-aligned orientations, honouring the
+// same collision / door-clearance / in-bounds constraints as the wall scan.
+export function findCenterPlacement(options: {
+  polygon: Array<[number, number]>
+  itemDims: [number, number, number]
+  occupied: Footprint2D[]
+  collisionOccupied?: Footprint2D[]
+  keepClear: Footprint2D[]
+}): { position: [number, number, number]; rotationY: number } | null {
+  const { polygon, itemDims, occupied, collisionOccupied = occupied, keepClear } = options
+  const [w, , d] = itemDims
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity
+  for (const [x, z] of polygon) {
+    if (x < minX) minX = x
+    if (x > maxX) maxX = x
+    if (z < minZ) minZ = z
+    if (z > maxZ) maxZ = z
+  }
+  const centerX = (minX + maxX) / 2
+  const centerZ = (minZ + maxZ) / 2
+  // Candidate centres on a grid, tested nearest-to-centre first.
+  const candidates: Array<[number, number]> = []
+  for (let x = minX + w / 2; x <= maxX - w / 2 + 1e-9; x += SCAN_STEP_M) {
+    for (let z = minZ + d / 2; z <= maxZ - d / 2 + 1e-9; z += SCAN_STEP_M) {
+      candidates.push([x, z])
+    }
+  }
+  candidates.sort((a, b) =>
+    (Math.hypot(a[0] - centerX, a[1] - centerZ)) - (Math.hypot(b[0] - centerX, b[1] - centerZ)))
+  for (const [cx, cz] of candidates) {
+    for (const rotationY of [0, Math.PI / 2]) {
+      const fp = footprintAt(cx, cz, w, d, rotationY)
+      const collisionFp = footprintAt(cx, cz, w, d, 0)
+      if (!footprintInsidePolygon(fp, polygon)) continue
+      if (occupied.some(other => footprintsIntersect(fp, other, -SCAN_CLEARANCE_M))) continue
+      if (collisionOccupied.some(other => footprintsIntersect(collisionFp, other, -SCAN_CLEARANCE_M))) continue
+      if (keepClear.some(zone => footprintsIntersect(fp, zone, -SCAN_CLEARANCE_M))) continue
+      return { position: [cx, 0, cz], rotationY }
+    }
+  }
+  return null
+}
+
 export function parseCandidates(payload: Record<string, unknown> | null): CatalogCandidate[] {
   if (!payload || !Array.isArray(payload.results)) return []
   const out: CatalogCandidate[] = []
@@ -328,6 +376,7 @@ export async function executeFurniturePlan(options: {
   const issues: string[] = []
   const placed: PlacedFurniture[] = []
   const missing: MissingFurniture[] = []
+  const ledger = new WriteEffectLedger()
 
   // One walls read for every room's door clearances.
   const wallsPayload = await callWithRetry(callMcp, 'get_walls', { levelId }, issues, '读取墙体清单', beforeCall)
@@ -432,6 +481,7 @@ export async function executeFurniturePlan(options: {
           issues,
           `在「${room.name}」放置「${candidate.name}」`,
           beforeCall,
+          ledger,
         )
         const itemId = typeof payload?.itemId === 'string' ? payload.itemId : null
         if (!itemId || payload?.status === 'catalog_unavailable') continue
@@ -480,5 +530,5 @@ export async function executeFurniturePlan(options: {
     }
   }
 
-  return { placed, missing, executionIssues: issues }
+  return { placed, missing, executionIssues: issues, writeEffect: ledger.state }
 }

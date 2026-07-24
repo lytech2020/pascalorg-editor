@@ -6,7 +6,7 @@ const EXPECTED_PROMPT_SNAPSHOT = {
   'scene-intent:v1': 'e349db1c0bfca34dea8c82a6f155e1ad7c10128c117c0953772dbaeb5c0f42c4',
   'plan:intent:v1': 'cc188ca849609bf8909bdd5270e93e82da3b9033f16385aab03608c5720c0018',
   'plan:geometry:v1': '7471d105e31eb2e62cc9a06ca0cd86cd48dcc8dd2715ad78e8d2f6385a4575e5',
-  'modify-ops:v1': '06725af13b51414a962edef9e4f504c390b9d26ba4113e2ef18d96f2f4e59024',
+  'modify-ops:v1': '6eca0e58a4c68946240ceb8376dc55ee0bd4bf36ca7e6caa9ab3937aa8ebfae2',
   'modification-guard:v1': '3a9e5b1cc312d69c31029f002142c914ae7a72b6adeb89141a837b202529546f',
   'inspect:v1': 'a7f310a3f36a74adab147840e968695452128820c551e0ce9c37ffaa4b08438c',
   'scene-agent:v1': 'c0ce5b9bcbef561974bd7c0e5f354dfc7ed7aa71e728016e6d79b08a7fcfa250',

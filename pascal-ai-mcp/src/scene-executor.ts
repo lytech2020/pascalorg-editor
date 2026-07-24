@@ -66,6 +66,8 @@ export type SceneExecutionReport = {
   rooms: ExecutedRoom[]
   openings: ExecutedOpening[]
   executionIssues: string[]
+  // R1.3: real side-effect state produced by the mutation wrapper.
+  writeEffect: WriteEffectState
 }
 
 const DOOR_WIDTH_M = 0.9
@@ -104,13 +106,177 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-// One retry per call (§4). Returns the unwrapped payload, or null after the
-// second failure (recorded in `issues`). An `{error}` payload from a tool
-// counts as a failure too — MCP tool errors often come back as content, not
-// as thrown exceptions. `beforeCall` runs OUTSIDE the try so a cancellation
-// it throws aborts the whole execution instead of being retried and recorded
-// as a tool failure.
-export async function callWithRetry(
+// ---------------------------------------------------------------------------
+// R1: write safety and real side-effect state.
+//
+// Read tools may be retried transparently — a lost read costs nothing and a
+// re-read is idempotent. Write tools MUST NOT: when a mutation's response is
+// lost in transit the connection layer already refuses to replay it, and the
+// executor must not silently undo that guarantee by retrying (a duplicated
+// `place_item` / `create_room` is a real double side effect). So mutations
+// run exactly once and record whether they may have committed.
+// ---------------------------------------------------------------------------
+
+// Scene-writing tools the deterministic executors call. A call to any of these
+// is a potential side effect and is never retried. (Kept local to the executor
+// module — the agent's broader MUTATING_TOOLS list serves the repair-rollback
+// lock, a different concern.)
+export const MUTATION_TOOLS = new Set([
+  'create_room',
+  'cut_opening',
+  'apply_patch',
+  'add_door',
+  'add_window',
+  'place_item',
+  'delete_node',
+])
+
+export function isMutationTool(name: string): boolean {
+  return MUTATION_TOOLS.has(name)
+}
+
+export type WriteEffectState =
+  | 'no_write'
+  | 'write_attempted'
+  | 'write_confirmed'
+  | 'partial_write_confirmed'
+
+// Payload fields a successful mutation returns as its target id — recorded as
+// low-sensitivity evidence of a confirmed write (never the raw args/response).
+const CONFIRM_ID_FIELDS = ['zoneId', 'doorId', 'windowId', 'openingId', 'itemId', 'nodeId', 'id'] as const
+
+function firstTargetId(payload: Record<string, unknown>): string | null {
+  for (const field of CONFIRM_ID_FIELDS) {
+    const value = payload[field]
+    if (typeof value === 'string' && value) return value
+  }
+  return null
+}
+
+// Real side-effect state, updated only by the mutation wrapper as calls are
+// dispatched and return — never guessed before a call. Counts an IN-FLIGHT
+// dispatch (dispatched but not yet resolved) as uncertain, so if the process
+// dies between `place_item` leaving and its response arriving, the persisted
+// state already reads `write_attempted`, not `no_write` (P1-3). A thrown
+// mutation is `unknown`; a server-rejected `{error}` left no commit.
+//
+// `onChange` fires on every state transition so the caller can persist the
+// real state in real time. `halted` is true once ANY result is unknown — after
+// that the mutation wrapper refuses to dispatch further writes: once a write's
+// outcome is unknown the whole operation must stop, not press on to the next
+// candidate / item / room (P1-2).
+export class WriteEffectLedger {
+  private dispatched = 0
+  private confirmedCount = 0
+  private unknownCount = 0
+  private rejectedCount = 0
+  private readonly targets: string[] = []
+  private lastFired: WriteEffectState = 'no_write'
+
+  constructor(private readonly onChange?: (state: WriteEffectState) => void) {}
+
+  private emit(): void {
+    const next = this.state
+    if (next === this.lastFired) return
+    this.lastFired = next
+    this.onChange?.(next)
+  }
+
+  // Seeds already-known, already-resolved confirmed writes (e.g. an apply_patch
+  // that ran before this ledger's stage) so a shared side-effect verdict spans
+  // both stages.
+  seedConfirmed(count: number): void {
+    if (count <= 0) return
+    this.dispatched += count
+    this.confirmedCount += count
+    this.emit()
+  }
+
+  // Called immediately BEFORE a mutation is dispatched: from this instant its
+  // result is unknown until proven otherwise.
+  recordDispatch(): void {
+    this.dispatched++
+    this.emit()
+  }
+
+  recordConfirmed(targetId: string | null): void {
+    this.confirmedCount++
+    if (targetId) this.targets.push(targetId)
+    this.emit()
+  }
+
+  recordResultUnknown(): void {
+    this.unknownCount++
+    this.emit()
+  }
+
+  recordRejected(): void {
+    this.rejectedCount++
+    this.emit()
+  }
+
+  merge(other: WriteEffectLedger): void {
+    this.dispatched += other.dispatched
+    this.confirmedCount += other.confirmedCount
+    this.unknownCount += other.unknownCount
+    this.rejectedCount += other.rejectedCount
+    this.targets.push(...other.targets)
+    this.emit()
+  }
+
+  // Once a write's result is unknown, no further writes may be dispatched.
+  get halted(): boolean {
+    return this.unknownCount > 0
+  }
+
+  // Any mutation was dispatched.
+  get attempted(): boolean {
+    return this.dispatched > 0
+  }
+
+  get confirmedTargets(): readonly string[] {
+    return this.targets
+  }
+
+  get state(): WriteEffectState {
+    const pending = this.dispatched - this.confirmedCount - this.unknownCount - this.rejectedCount
+    const uncertain = this.unknownCount > 0 || pending > 0
+    if (this.confirmedCount > 0 && uncertain) return 'partial_write_confirmed'
+    if (uncertain) return 'write_attempted'
+    if (this.confirmedCount > 0) return 'write_confirmed'
+    return 'no_write'
+  }
+}
+
+// Fold several stages' write-effect states into one — used when a modify turn
+// runs multiple executors (structure + furniture + manual replay) and needs a
+// single side-effect verdict for the failure wording.
+export function combineWriteEffects(
+  ...states: Array<WriteEffectState | undefined>
+): WriteEffectState {
+  let confirmed = false
+  let unknown = false
+  for (const state of states) {
+    if (state === 'write_confirmed' || state === 'partial_write_confirmed') confirmed = true
+    if (state === 'write_attempted' || state === 'partial_write_confirmed') unknown = true
+  }
+  if (confirmed && unknown) return 'partial_write_confirmed'
+  if (unknown) return 'write_attempted'
+  if (confirmed) return 'write_confirmed'
+  return 'no_write'
+}
+
+export type CallOptions = {
+  beforeCall?: () => void
+  ledger?: WriteEffectLedger
+}
+
+// Read tools: one retry (§4). Returns the unwrapped payload, or null after the
+// second failure (recorded in `issues`). An `{error}` payload counts as a
+// failure too — MCP tool errors often come back as content, not thrown
+// exceptions. `beforeCall` runs OUTSIDE the try so a cancellation it throws
+// aborts execution instead of being retried and recorded as a tool failure.
+async function callReadWithRetry(
   callMcp: McpCaller,
   name: string,
   args: Record<string, unknown>,
@@ -134,6 +300,70 @@ export async function callWithRetry(
   }
   issues.push(`${label}失败（${name}）：${lastError || '未知错误'}`)
   return null
+}
+
+// Write tools: exactly one attempt, never replayed (R1.1/R1.2). A thrown error
+// leaves the write's result UNKNOWN (it may already have committed) — recorded
+// as such, not retried. A structured `{error}` payload is a server-side
+// rejection: the tool refused, so nothing committed. `catalog_unavailable` is a
+// placement no-op — the payload flows back so the caller can react, but no
+// write is recorded.
+export async function callMutationOnce(
+  callMcp: McpCaller,
+  name: string,
+  args: Record<string, unknown>,
+  issues: string[],
+  label: string,
+  options?: CallOptions,
+): Promise<Record<string, unknown> | null> {
+  const ledger = options?.ledger
+  // P1-2: a prior write's result is unknown — stop. No further writes may be
+  // dispatched once the boundary is uncertain (never press on to the next
+  // candidate/item/room after a lost response).
+  if (ledger?.halted) {
+    issues.push(`${label}已跳过（${name}）：前序写入结果未知，已停止后续写入`)
+    return null
+  }
+  options?.beforeCall?.()
+  // Mark the dispatch BEFORE the call: from here the result is unknown until we
+  // hear back, so a crash mid-flight persists as write_attempted, not no_write.
+  ledger?.recordDispatch()
+  try {
+    const payload = toolPayload(await callMcp(name, args))
+    if (typeof payload.error === 'string' && payload.error) {
+      // Server-side rejection: the tool refused, so nothing committed.
+      issues.push(`${label}失败（${name}）：${payload.error}`)
+      ledger?.recordRejected()
+      return null
+    }
+    // P1-4: `catalog_unavailable` is NOT a no-op — the MCP's place_item creates
+    // a placeholder item and returns its id. That IS a committed write, so it
+    // counts as confirmed; the caller inspects the status and must not keep
+    // trying more candidates (which would create more placeholders).
+    ledger?.recordConfirmed(firstTargetId(payload))
+    return payload
+  } catch (error) {
+    issues.push(`${label}失败（${name}，写入结果未知，不自动重试）：${errorText(error)}`)
+    ledger?.recordResultUnknown()
+    return null
+  }
+}
+
+// Dispatcher preserving the original signature: reads retry, mutations run
+// once. The optional 7th arg lets a caller collect the write-effect ledger.
+export async function callWithRetry(
+  callMcp: McpCaller,
+  name: string,
+  args: Record<string, unknown>,
+  issues: string[],
+  label: string,
+  beforeCall?: () => void,
+  ledger?: WriteEffectLedger,
+): Promise<Record<string, unknown> | null> {
+  if (isMutationTool(name)) {
+    return callMutationOnce(callMcp, name, args, issues, label, { beforeCall, ledger })
+  }
+  return callReadWithRetry(callMcp, name, args, issues, label, beforeCall)
 }
 
 function footprintPolygon(
@@ -301,8 +531,9 @@ export async function executeLayoutPlan(options: {
 }): Promise<SceneExecutionReport> {
   const { plan, levelId, callMcp, beforeCall } = options
   const issues: string[] = []
+  const ledger = new WriteEffectLedger()
   const call = (name: string, args: Record<string, unknown>, label: string) =>
-    callWithRetry(callMcp, name, args, issues, label, beforeCall)
+    callWithRetry(callMcp, name, args, issues, label, beforeCall, ledger)
   const openings: ExecutedOpening[] = []
   const roomById = new Map(plan.rooms.map(room => [room.id, room]))
 
@@ -344,7 +575,7 @@ export async function executeLayoutPlan(options: {
     : []
   if (walls.length === 0) {
     issues.push('建墙后未读取到任何墙体，门窗阶段跳过')
-    return { rooms, openings, executionIssues: issues }
+    return { rooms, openings, executionIssues: issues, writeEffect: ledger.state }
   }
 
   // Points already hosting a door, so window edges can yield to them (§2:
@@ -501,5 +732,5 @@ export async function executeLayoutPlan(options: {
     }
   }
 
-  return { rooms, openings, executionIssues: issues }
+  return { rooms, openings, executionIssues: issues, writeEffect: ledger.state }
 }

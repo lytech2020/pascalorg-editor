@@ -108,7 +108,9 @@ describe('modify application service', () => {
       persistSession: () => {},
       loadScene: async () => ({ version: 4 }),
       runPlanFirst: async current => {
-        current.modificationWriteStarted = true
+        // A rename patch is a real, confirmed write; a later verification
+        // failure must route to the destructive-write reply.
+        current.modificationWriteEffect = 'write_confirmed'
         throw new Error('room_not_renamed')
       },
       snapshotScene: async () => ({}),
@@ -144,8 +146,60 @@ describe('modify application service', () => {
       expect(result.reply).toContain('禁止自动重试')
       expect(result.session.pendingModification).toBeUndefined()
       expect(result.session.pendingModifyPlan).toBeUndefined()
-      expect(result.session.modificationWriteStarted).toBeUndefined()
+      expect(result.session.modificationWriteEffect).toBeUndefined()
       expect(clearCalls).toBe(1)
+    } finally {
+      if (previousLegacyFlag === undefined) delete process.env.PASCAL_MODIFY_LEGACY
+      else process.env.PASCAL_MODIFY_LEGACY = previousLegacyFlag
+    }
+  })
+
+  // P1-A: a write whose result is UNKNOWN (transport failure) must route to the
+  // result-unknown reply — never a normal completion, never auto-retry, never
+  // save_scene. The catch handler reads the persisted write-effect state.
+  test('routes an unknown-result write to result-unknown (no save, no retry)', async () => {
+    const previousLegacyFlag = process.env.PASCAL_MODIFY_LEGACY
+    delete process.env.PASCAL_MODIFY_LEGACY
+    let persistSceneCalls = 0
+    const session = {
+      ...baseSession(),
+      sceneId: 'scene-1',
+      pendingOperation: 'update' as const,
+      pendingModifyPlan: { ops: [{ op: 'remove_furniture' as const, room: '主卧', item: '床' }] },
+    }
+    const dependencies: ModifyWorkflowDependencies = {
+      persistSession: () => {},
+      loadScene: async () => ({ version: 4 }),
+      runPlanFirst: async current => {
+        // A delete_node whose response was lost — result unknown.
+        current.modificationWriteEffect = 'write_attempted'
+        throw new Error('delete_node 写入结果未知')
+      },
+      snapshotScene: async () => ({}),
+      runLegacyPhase: async () => ({ messages: [], toolNamesUsed: new Set(), furnitureIssues: [] }),
+      dedupeSharedWalls: async () => {},
+      checkProtection: async () => [],
+      refine: async () => { throw new Error('refine must not run') },
+      persistScene: async () => { persistSceneCalls++; return 5 },
+      evaluateGates: async () => ({ report: { passed: true, failures: [] }, layoutQuality: 1 }),
+      clearDestructiveWrite: () => false,
+      isCancellationError: () => false,
+      errorMessage: error => error instanceof Error ? error.message : String(error),
+      planSnapshot: () => '',
+    }
+    try {
+      const result = await runModifyWorkflow(
+        { input: { sessionId: session.sessionId }, session, reply: '', next: 'modify' },
+        dependencies,
+      )
+      if (!result.session) throw new Error('expected a session result')
+      // Result-unknown wording, not the clean-completion or destructive text.
+      expect(result.reply).toContain('无法确认')
+      expect(result.reply).toContain('不会自动重试')
+      // No scene was saved on an uncertain write.
+      expect(persistSceneCalls).toBe(0)
+      expect(result.session.modificationWriteEffect).toBeUndefined()
+      expect(result.session.pendingModifyPlan).toBeUndefined()
     } finally {
       if (previousLegacyFlag === undefined) delete process.env.PASCAL_MODIFY_LEGACY
       else process.env.PASCAL_MODIFY_LEGACY = previousLegacyFlag

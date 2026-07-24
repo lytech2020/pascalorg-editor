@@ -134,6 +134,7 @@ export async function runModifyWorkflow(
     delete session.pendingModificationReasonCode
     delete session.pendingModificationPlanHash
     delete session.pendingModifyPlan
+    delete session.pendingClearTargets
     delete session.modifyModeConfirmed
     delete session.modifyDriftConfirmed
     const { reply } = finishSceneWorkflow({
@@ -153,21 +154,33 @@ export async function runModifyWorkflow(
     })
     return { session, reply, next: 'finish' }
   } catch (error) {
-    const destructiveWriteFailed = session.destructiveSceneWriteStarted === true
-      || session.modificationWriteStarted === true
-      || dependencies.clearDestructiveWrite(session.sessionId)
-    if (destructiveWriteFailed) {
-      dependencies.clearDestructiveWrite(session.sessionId)
+    // R1.4: the failure wording is driven by the REAL side-effect state, not a
+    // pre-call guess. `no_write` (including a definitively-rejected write) is a
+    // safe, recoverable failure — never the "scene may be partially modified"
+    // warning. Confirmed / partial writes keep that warning; a result-unknown
+    // write gets its own honest wording and is never auto-replayed.
+    // Consume the in-memory destructive-write guard exactly once. A structural
+    // rebuild that entered the destructive clear is treated as a confirmed
+    // write regardless of the ledger.
+    const wasDestructiveRebuild = dependencies.clearDestructiveWrite(session.sessionId)
+    const writeEffect = session.destructiveSceneWriteStarted === true || wasDestructiveRebuild
+      ? 'write_confirmed'
+      : session.modificationWriteEffect ?? 'no_write'
+    const clearModifyState = () => {
       delete session.destructiveSceneWriteStarted
-      delete session.modificationWriteStarted
+      delete session.modificationWriteEffect
       delete session.pendingModification
       delete session.pendingOperation
       delete session.pendingModificationMode
       delete session.pendingModificationReasonCode
       delete session.pendingModificationPlanHash
       delete session.pendingModifyPlan
+      delete session.pendingClearTargets
       delete session.modifyModeConfirmed
       delete session.modifyDriftConfirmed
+    }
+    if (writeEffect === 'write_confirmed' || writeEffect === 'partial_write_confirmed') {
+      clearModifyState()
       session.phase = session.sceneResult ? 'completed_with_issues' : 'failed'
       const reply = t(session.language, 'modifyDestructiveFailed', {
         sceneId,
@@ -176,6 +189,20 @@ export async function runModifyWorkflow(
       session.messages.push({ role: 'assistant', content: reply })
       return { session, reply, next: 'finish' }
     }
+    if (writeEffect === 'write_attempted') {
+      // A mutation's result is unknown (transport failure). Do not claim the
+      // scene is fine, and do not auto-retry — surface the uncertainty.
+      clearModifyState()
+      session.phase = session.sceneResult ? 'completed_with_issues' : 'failed'
+      const reply = t(session.language, 'modifyResultUnknown', {
+        sceneId,
+        error: dependencies.errorMessage(error),
+      })
+      session.messages.push({ role: 'assistant', content: reply })
+      return { session, reply, next: 'finish' }
+    }
+    // no_write: nothing committed — safe to recover / re-submit.
+    delete session.modificationWriteEffect
     if (dependencies.isCancellationError(error)) {
       return finishModificationFailure(session, 'cancelled')
     }
