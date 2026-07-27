@@ -202,6 +202,34 @@ export function doorClearances(
 // with its back to the edge and its front facing the room interior, sliding
 // along the edge in SCAN_STEP_M increments until every constraint passes.
 // Deterministic: edge order and scan direction are fixed by the polygon.
+// Is one concrete placement acceptable? The single source of truth for the
+// four acceptance conditions — in bounds, clear of other items (both at the
+// item's real rotation and axis-aligned), and clear of door keep-out zones.
+// Both placement scans below and the post-rebuild furniture restoration
+// (domain/furniture-preservation) go through it, so "a spot the scan would
+// have chosen" and "a spot we may keep as-is" can never drift apart.
+export function placementFits(options: {
+  position: [number, number, number]
+  rotationY: number
+  itemDims: [number, number, number]
+  polygon: Array<[number, number]>
+  occupied: readonly Footprint2D[]
+  collisionOccupied?: readonly Footprint2D[]
+  keepClear: readonly Footprint2D[]
+}): boolean {
+  const { position, rotationY, itemDims, polygon, occupied, keepClear } = options
+  const collisionOccupied = options.collisionOccupied ?? occupied
+  const [w, , d] = itemDims
+  const fp = footprintAt(position[0], position[2], w, d, rotationY)
+  const collisionFp = footprintAt(position[0], position[2], w, d, 0)
+  if (!footprintInsidePolygon(fp, polygon)) return false
+  if (occupied.some(other => footprintsIntersect(fp, other, -SCAN_CLEARANCE_M))) return false
+  if (collisionOccupied.some(other =>
+    footprintsIntersect(collisionFp, other, -SCAN_CLEARANCE_M))) return false
+  if (keepClear.some(zone => footprintsIntersect(fp, zone, -SCAN_CLEARANCE_M))) return false
+  return true
+}
+
 export function findWallPlacement(options: {
   polygon: Array<[number, number]>
   itemDims: [number, number, number]
@@ -238,14 +266,11 @@ export function findWallPlacement(options: {
     for (let t = w / 2 + BOUNDS_SLACK_M; t <= length - w / 2 - BOUNDS_SLACK_M; t += SCAN_STEP_M) {
       const cx = sx + ux * t + nx * centerOffset
       const cz = sz + uz * t + nz * centerOffset
-      const fp = footprintAt(cx, cz, w, d, rotationY)
-      const collisionFp = footprintAt(cx, cz, w, d, 0)
-      if (!footprintInsidePolygon(fp, polygon)) continue
-      if (occupied.some(other => footprintsIntersect(fp, other, -SCAN_CLEARANCE_M))) continue
-      if (collisionOccupied.some(other =>
-        footprintsIntersect(collisionFp, other, -SCAN_CLEARANCE_M))) continue
-      if (keepClear.some(zone => footprintsIntersect(fp, zone, -SCAN_CLEARANCE_M))) continue
-      return { position: [cx, 0, cz], rotationY }
+      const position: [number, number, number] = [cx, 0, cz]
+      if (!placementFits({
+        position, rotationY, itemDims, polygon, occupied, collisionOccupied, keepClear,
+      })) continue
+      return { position, rotationY }
     }
   }
   return null
@@ -285,13 +310,11 @@ export function findCenterPlacement(options: {
     (Math.hypot(a[0] - centerX, a[1] - centerZ)) - (Math.hypot(b[0] - centerX, b[1] - centerZ)))
   for (const [cx, cz] of candidates) {
     for (const rotationY of [0, Math.PI / 2]) {
-      const fp = footprintAt(cx, cz, w, d, rotationY)
-      const collisionFp = footprintAt(cx, cz, w, d, 0)
-      if (!footprintInsidePolygon(fp, polygon)) continue
-      if (occupied.some(other => footprintsIntersect(fp, other, -SCAN_CLEARANCE_M))) continue
-      if (collisionOccupied.some(other => footprintsIntersect(collisionFp, other, -SCAN_CLEARANCE_M))) continue
-      if (keepClear.some(zone => footprintsIntersect(fp, zone, -SCAN_CLEARANCE_M))) continue
-      return { position: [cx, 0, cz], rotationY }
+      const position: [number, number, number] = [cx, 0, cz]
+      if (!placementFits({
+        position, rotationY, itemDims, polygon, occupied, collisionOccupied, keepClear,
+      })) continue
+      return { position, rotationY }
     }
   }
   return null
@@ -400,18 +423,33 @@ export async function executeFurniturePlan(options: {
       name?: unknown
       position?: unknown
       rotation?: unknown
-      asset?: { dimensions?: unknown; attachTo?: unknown }
+      scale?: unknown
+      asset?: { name?: unknown; dimensions?: unknown; attachTo?: unknown }
     }
     if (!isNumberTriple(item.position)) continue
-    if (item.asset?.attachTo === 'wall' || item.asset?.attachTo === 'ceiling') continue
+    // Any attachTo value (wall / wall-side / ceiling) stores position in the
+    // HOST's local frame — those numbers are not floor coordinates.
+    if (item.asset?.attachTo !== undefined && item.asset.attachTo !== null) continue
     const position = item.position
-    const dims = isNumberTriple(item.asset?.dimensions) ? item.asset.dimensions : [1, 1, 1] as [number, number, number]
+    const spec = isNumberTriple(item.asset?.dimensions) ? item.asset.dimensions : [1, 1, 1] as [number, number, number]
+    // The item's REAL footprint includes its node scale: a bed scaled 2× is
+    // 3.6m wide, and reserving only the catalogue's 1.8m would let the next
+    // item be placed inside it.
+    const scale = isNumberTriple(item.scale) ? item.scale : [1, 1, 1] as [number, number, number]
+    const dims: [number, number, number] = [spec[0] * scale[0], spec[1] * scale[1], spec[2] * scale[2]]
     const rotationY = isNumberTriple(item.rotation) ? item.rotation[1] : 0
     occupied.push(footprintAt(position[0], position[2], dims[0], dims[2], rotationY))
     collisionOccupied.push(footprintAt(position[0], position[2], dims[0], dims[2], 0))
     const home = rooms.find(room => pointInPolygon(position[0], position[2], room.polygon))
-    if (home && typeof item.name === 'string') {
-      existingByRoom.set(home.id, [...(existingByRoom.get(home.id) ?? []), item.name])
+    if (!home) continue
+    // Match the checklist on BOTH the node name and the catalogue asset name.
+    // A user-renamed piece ("祖传宝贝") no longer looks like a bed by name, and
+    // matching on the node name alone would make the furnishing pass add a
+    // SECOND bed next to the one just restored.
+    const names = [item.name, item.asset?.name].filter((value): value is string =>
+      typeof value === 'string' && value.length > 0)
+    if (names.length > 0) {
+      existingByRoom.set(home.id, [...(existingByRoom.get(home.id) ?? []), ...names])
     }
   }
 

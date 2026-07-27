@@ -386,3 +386,59 @@ describe('placement geometry', () => {
     expect(ranked.map(c => c.id)).toEqual(['small-compact', 'small-std', 'big'])
   })
 })
+
+// The restore→furnish handshake (Codex复审 Blocker 1). After a structural
+// rebuild the preserved furniture is placed back FIRST, then this pass fills
+// only what is genuinely missing. It must recognise a restored piece even when
+// the user renamed it, or it adds a second bed next to the one just restored.
+describe('executeFurniturePlan recognises already-restored furniture', () => {
+  const restoredBed = (over: Record<string, unknown> = {}) => ({
+    id: 'restored-bed',
+    name: 'Double Bed',
+    position: [2, 0, 2.4] as [number, number, number],
+    rotation: [0, Math.PI, 0] as [number, number, number],
+    asset: { name: 'Double Bed', dimensions: [1.8, 0.5, 2.1] as [number, number, number] },
+    ...over,
+  })
+
+  test('does not add a second bed when the restored one keeps its catalog name', async () => {
+    const { callMcp } = makeMockMcp({ existingItems: [restoredBed()] })
+    const report = await executeFurniturePlan({ rooms: [bedroom], levelId: 'level-1', callMcp })
+    expect(report.placed.some(item => item.catalogItemId.includes('bed'))).toBe(false)
+  })
+
+  test('does not add a second bed when the user renamed the restored one', async () => {
+    const { callMcp } = makeMockMcp({
+      // Node name is the user's; asset.name still identifies it as a bed.
+      existingItems: [restoredBed({ name: '祖传宝贝' })],
+    })
+    const report = await executeFurniturePlan({ rooms: [bedroom], levelId: 'level-1', callMcp })
+    expect(report.placed.some(item => item.catalogItemId.includes('bed'))).toBe(false)
+  })
+
+  test('reserves a scaled item’s REAL footprint, not the catalog spec', async () => {
+    // A 1.8×2.1 bed scaled 2× occupies 3.6×4.2 — nearly the whole 4×3.5 room,
+    // so the wardrobe can no longer be squeezed in beside it.
+    const { callMcp } = makeMockMcp({
+      existingItems: [restoredBed({ scale: [2, 1, 2], position: [2, 0, 1.75] })],
+    })
+    const report = await executeFurniturePlan({ rooms: [bedroom], levelId: 'level-1', callMcp })
+    expect(report.placed).toEqual([])
+    expect(report.missing.some(entry => entry.label.includes('衣柜'))).toBe(true)
+  })
+
+  test('ignores wall-side items when computing floor occupancy', async () => {
+    const { callMcp } = makeMockMcp({
+      existingItems: [restoredBed({
+        id: 'wall-shelf',
+        name: 'Wall Shelf',
+        // Wall-local coordinates — must never be read as floor space.
+        position: [0.5, 1.2, 0],
+        asset: { name: 'Wall Shelf', dimensions: [1.2, 0.3, 0.25], attachTo: 'wall-side' },
+      })],
+    })
+    const report = await executeFurniturePlan({ rooms: [bedroom], levelId: 'level-1', callMcp })
+    // The room is still empty as far as the floor is concerned: bed + wardrobe.
+    expect(report.placed).toHaveLength(2)
+  })
+})

@@ -32,6 +32,12 @@ import {
   resolveFurnitureConcept,
   type PlacementStrategy,
 } from './domain/furniture-concepts'
+import {
+  planFurnitureRestoration,
+  relocationOrder,
+  type FurnitureRestoreReasonCode,
+  type PreservedFurniture,
+} from './domain/furniture-preservation'
 import { pointInPolygon } from './layout-plan'
 import type { FurnitureModifyOp, SkippedFurnitureOp } from './modify-ops'
 import { callWithRetry, WriteEffectLedger, type McpCaller, type WriteEffectState } from './scene-executor'
@@ -586,108 +592,222 @@ export async function executeFurnitureModifyOps(options: {
   return { results, executionIssues: issues, writeEffect: ledger.state }
 }
 
-// --- manual-item replay (MODIFY_REDESIGN.md §6, structural rebuild) ---------
+// --- furniture preservation across a structural rebuild --------------------
+//
+// A local structural edit still rebuilds the level, so every item is cleared.
+// This puts them back: an item whose room survived and whose old spot is still
+// legal goes back at its EXACT original coordinates, rotation, scale and name;
+// one whose spot became illegal is re-scanned within the same room; one whose
+// room was removed is dropped and reported. The furnishing pass then only fills
+// what is genuinely missing, because it reads the restored items back through
+// get_level_summary.
 
-// An item is checklist-covered when any checklist option recognizes its name
-// — those come back through the furnishing pass after a rebuild. Everything
-// else (decor, user-picked extras) is "manual" and must be replayed.
-export function isChecklistItem(name: string): boolean {
-  return findVocabularyOption(name) !== null
-}
-
-export type ManualItem = {
-  catalogItemId: string
-  name: string
-  dimensions: [number, number, number]
-  // Room name in the PRE-rebuild scene; replay matches it against the
-  // rebuilt rooms by name (rename keeps snapshots in step, so names hold).
-  roomName: string
-}
-
-export type ManualReplayReport = {
-  replaced: string[]
-  lost: Array<{ name: string; reason: string }>
+export type FurnitureRestoreReport = {
+  // Items back at their original coordinates.
+  restoredInPlace: string[]
+  // Items that survived but had to move within their room.
+  relocated: string[]
+  lost: Array<{ name: string; reason: string; reasonCode: FurnitureRestoreReasonCode }>
+  // Items whose catalogue asset is gone: place_item still created a 0.5m
+  // PLACEHOLDER node, so the scene now contains one. Surfaced separately
+  // because "not restored" and "nothing was written" are different facts.
+  placeholders: Array<{ name: string; itemId: string }>
+  // Placed at the right spot, but the follow-up name/scale patch was REJECTED —
+  // the piece is back where it was under the catalogue's default identity.
+  // Never fold these into restoredInPlace: that would claim a full restore.
+  identityNotRestored: string[]
+  // The walls read failed, so door keep-out zones could not be computed for
+  // this restore. Furniture was still restored (see the note in the executor),
+  // but nothing here is proven clear of a doorway.
+  doorClearanceUnverified: boolean
   executionIssues: string[]
   writeEffect: WriteEffectState
 }
 
-// Best-effort re-placement of manual items after a structural rebuild:
-// same wall-scan constraints as every other placement — an item that no
-// longer fits (room shrank / removed) lands in `lost`, reported, never
-// silently dropped.
-export async function replayManualItems(options: {
-  items: ManualItem[]
+export async function restoreFurnitureAfterRebuild(options: {
+  items: readonly PreservedFurniture[]
   rooms: FurnitureRoom[]
   levelId: string
   callMcp: McpCaller
   beforeCall?: () => void
-}): Promise<ManualReplayReport> {
+}): Promise<FurnitureRestoreReport> {
   const { items, rooms, levelId, callMcp, beforeCall } = options
   const issues: string[] = []
-  const replaced: string[] = []
-  const lost: Array<{ name: string; reason: string }> = []
+  const restoredInPlace: string[] = []
+  const relocated: string[] = []
+  const lost: Array<{ name: string; reason: string; reasonCode: FurnitureRestoreReasonCode }> = []
+  const placeholders: Array<{ name: string; itemId: string }> = []
+  const identityNotRestored: string[] = []
+  let doorClearanceUnverified = false
   const ledger = new WriteEffectLedger()
-  if (items.length === 0) return { replaced, lost, executionIssues: issues, writeEffect: ledger.state }
+  const report = (): FurnitureRestoreReport => ({
+    restoredInPlace, relocated, lost, placeholders, identityNotRestored,
+    doorClearanceUnverified, executionIssues: issues, writeEffect: ledger.state,
+  })
+  if (items.length === 0) return report()
 
+  // Door keep-out zones of the REBUILT structure — a doorway that moved must
+  // not end up blocked by an item we preserved.
   const wallsPayload = await callWithRetry(callMcp, 'get_walls', { levelId }, issues, '读取墙体清单', beforeCall)
   const isPair = (v: unknown): v is [number, number] =>
     Array.isArray(v) && v.length === 2 && typeof v[0] === 'number' && typeof v[1] === 'number'
+  // A FAILED read is not the same as "this level has no doors". Say so, rather
+  // than silently restoring furniture into unverified doorways.
+  // Deliberately NOT fail-safe-by-skipping: the level has already been cleared,
+  // so refusing to restore would permanently destroy every item, while a piece
+  // restored near a moved doorway stays visible, reported by the placement
+  // diagnostics, and trivially movable. We restore and flag it loudly instead.
+  if (wallsPayload === null) {
+    doorClearanceUnverified = true
+    issues.push('无法读取墙体清单，本次家具恢复未能校验门净空，请检查门口是否被家具遮挡')
+  }
   const walls = (Array.isArray(wallsPayload?.walls) ? wallsPayload.walls : [])
     .filter((wall): wall is { start: [number, number]; end: [number, number]; openings: never[] } => {
       const value = wall as { start?: unknown; end?: unknown; openings?: unknown }
       return isPair(value?.start) && isPair(value?.end) && Array.isArray(value?.openings)
     })
-  const keepClear = doorClearances(walls)
+  const keepClear = doorClearances(walls, rooms)
 
-  const summaryPayload = await callWithRetry(callMcp, 'get_level_summary', {}, issues, '读取已放置家具', beforeCall)
-  const rawItems = Array.isArray(summaryPayload?.items) ? summaryPayload.items : []
-  const occupied: Footprint2D[] = []
-  for (const entry of rawItems) {
-    const value = entry as { position?: unknown; rotation?: unknown; asset?: { dimensions?: unknown; attachTo?: unknown } }
-    if (!isNumberTriple(value.position)) continue
-    if (value.asset?.attachTo === 'wall' || value.asset?.attachTo === 'ceiling') continue
-    const dims = isNumberTriple(value.asset?.dimensions) ? value.asset.dimensions : [1, 1, 1] as [number, number, number]
-    const rotationY = isNumberTriple(value.rotation) ? value.rotation[1] : 0
-    occupied.push(footprintAt(value.position[0], value.position[2], dims[0], dims[2], rotationY))
+  const { decisions, keptFootprints, keptCollisionFootprints } =
+    planFurnitureRestoration({ items, rooms, keepClear })
+  // Seed occupancy with EVERY kept footprint before placing anything. The
+  // planner reserved these spots; if the executor started empty, a relocation
+  // processed earlier could be scanned straight onto a spot a later keep is
+  // about to be restored to, and the two would overlap for good.
+  const occupied: Footprint2D[] = [...keptFootprints]
+  const collisionOccupied: Footprint2D[] = [...keptCollisionFootprints]
+
+  // place_item cannot set name or scale, and always creates the node at
+  // scale 1 under the catalogue's own name. Restore both afterwards so a
+  // user-renamed or user-resized piece survives the rebuild unchanged.
+  const restoreNodeIdentity = async (itemId: string, item: PreservedFurniture): Promise<boolean> => {
+    const data: Record<string, unknown> = {}
+    if (item.name !== item.assetName) data.name = item.name
+    if (item.scale.some(factor => Math.abs(factor - 1) > 1e-6)) data.scale = item.scale
+    if (Object.keys(data).length === 0) return true
+    const patched = await callWithRetry(
+      callMcp,
+      'apply_patch',
+      { patches: [{ op: 'update', id: itemId, data }] },
+      issues,
+      `恢复「${item.name}」的名称/缩放`,
+      beforeCall,
+      ledger,
+    )
+    // A definitively rejected patch means the node kept the catalogue's name
+    // and scale 1 — the position is right but the identity is not.
+    if (patched === null) {
+      identityNotRestored.push(item.name)
+      return false
+    }
+    return true
   }
 
-  for (const item of items) {
-    const room = rooms.find(entry => entry.name === item.roomName)
-    if (!room) {
-      lost.push({ name: item.name, reason: `所在房间「${item.roomName}」已不存在` })
-      continue
-    }
-    const spot = findWallPlacement({
-      polygon: room.polygon,
-      itemDims: item.dimensions,
-      occupied,
-      keepClear,
-    })
-    if (!spot) {
-      lost.push({ name: item.name, reason: `「${item.roomName}」中没有可放置的位置` })
-      continue
-    }
+  const place = async (
+    item: PreservedFurniture,
+    room: FurnitureRoom,
+    position: [number, number, number],
+    rotationY: number,
+  ): Promise<'placed' | 'placeholder' | 'failed'> => {
     const payload = await callWithRetry(
       callMcp,
       'place_item',
       {
         catalogItemId: item.catalogItemId,
         targetNodeId: room.zoneId ?? levelId,
-        position: spot.position,
-        rotation: spot.rotationY,
+        position,
+        rotation: rotationY,
       },
       issues,
-      `重放「${item.name}」到「${room.name}」`,
+      `恢复「${item.name}」到「${room.name}」`,
       beforeCall,
       ledger,
     )
     const itemId = typeof payload?.itemId === 'string' ? payload.itemId : null
-    if (!itemId || payload?.status === 'catalog_unavailable') {
-      lost.push({ name: item.name, reason: '资产已不在目录中，无法重放' })
+    if (!itemId) return 'failed'
+    // The asset left the catalogue: place_item did NOT skip the write — it
+    // created a 0.5m placeholder node. Reserve its footprint (nothing may be
+    // stacked on it) and report it as a placeholder, never as "nothing
+    // happened".
+    if (payload?.status === 'catalog_unavailable') {
+      occupied.push(footprintAt(position[0], position[2], 0.5, 0.5, rotationY))
+      collisionOccupied.push(footprintAt(position[0], position[2], 0.5, 0.5, 0))
+      placeholders.push({ name: item.name, itemId })
+      return 'placeholder'
+    }
+    await restoreNodeIdentity(itemId, item)
+    return 'placed'
+  }
+
+  // Keeps first: their spots are already reserved, so they cannot be stolen.
+  for (const decision of decisions) {
+    if (decision.kind !== 'keep') continue
+    const { item, room } = decision
+    const outcome = await place(item, room, item.position, item.rotationY)
+    if (outcome === 'placed') restoredInPlace.push(item.name)
+    else if (outcome === 'placeholder') {
+      lost.push({
+        name: item.name,
+        reason: '资产已不在目录中，原位置留下了一个占位物，请在编辑器中替换',
+        reasonCode: 'catalog_unavailable',
+      })
+    } else {
+      lost.push({ name: item.name, reason: '恢复写入被拒绝', reasonCode: 'restore_write_failed' })
+    }
+  }
+
+  // Then relocations, bulkiest first so the big pieces claim the leftover space.
+  for (const decision of relocationOrder(decisions)) {
+    const { item, room } = decision
+    const spot = findWallPlacement({
+      polygon: room.polygon,
+      itemDims: item.dimensions,
+      occupied,
+      collisionOccupied,
+      keepClear,
+    }) ?? findCenterPlacement({
+      polygon: room.polygon,
+      itemDims: item.dimensions,
+      occupied,
+      collisionOccupied,
+      keepClear,
+    })
+    if (!spot) {
+      lost.push({
+        name: item.name,
+        reason: `「${room.name}」中已没有可放置的位置`,
+        reasonCode: 'no_valid_placement',
+      })
       continue
     }
-    occupied.push(footprintAt(spot.position[0], spot.position[2], item.dimensions[0], item.dimensions[2], spot.rotationY))
-    replaced.push(item.name)
+    const outcome = await place(item, room, spot.position, spot.rotationY)
+    if (outcome === 'placed') {
+      relocated.push(item.name)
+      occupied.push(footprintAt(
+        spot.position[0], spot.position[2], item.dimensions[0], item.dimensions[2], spot.rotationY,
+      ))
+      collisionOccupied.push(footprintAt(
+        spot.position[0], spot.position[2], item.dimensions[0], item.dimensions[2], 0,
+      ))
+    } else if (outcome === 'placeholder') {
+      lost.push({
+        name: item.name,
+        reason: '资产已不在目录中，场景中留下了一个占位物，请在编辑器中替换',
+        reasonCode: 'catalog_unavailable',
+      })
+    } else {
+      lost.push({ name: item.name, reason: '恢复写入被拒绝', reasonCode: 'restore_write_failed' })
+    }
   }
-  return { replaced, lost, executionIssues: issues, writeEffect: ledger.state }
+
+  for (const decision of decisions) {
+    if (decision.kind !== 'drop') continue
+    lost.push({
+      name: decision.item.name,
+      reason: decision.reason,
+      reasonCode: decision.reasonCode,
+    })
+  }
+
+  return report()
 }

@@ -18,13 +18,12 @@ import {
 } from './furniture-executor'
 import {
   executeFurnitureModifyOps,
-  isChecklistItem,
   previewRoomFurnitureClear,
-  replayManualItems,
+  restoreFurnitureAfterRebuild,
   skippedFurnitureResults,
   type FurnitureModifyReport,
-  type ManualItem,
 } from './furniture-modify'
+import { preservedFurnitureFromNodes } from './domain/furniture-preservation'
 import { partitionLayout } from './layout-partitioner'
 import {
   applyModifyOps,
@@ -2142,32 +2141,13 @@ export class PascalAiAgent {
         t(session.language, 'modifyRebuildUnavailable', {}),
       )
     }
-    // §6 manual-item replay: items outside the furniture checklist (decor,
-    // user-picked extras) don't come back through the furnishing pass —
-    // capture them (with their pre-rebuild room) before everything is
-    // cleared, re-place them after.
-    const manualItems: ManualItem[] = Object.values(nodes).flatMap(node => {
-      if (node.type !== 'item') return []
-      const value = node as {
-        name?: unknown
-        position?: unknown
-        asset?: { id?: unknown; name?: unknown; dimensions?: unknown; attachTo?: unknown }
-      }
-      const assetId = typeof value.asset?.id === 'string' ? value.asset.id : null
-      const position = value.position
-      if (!assetId || !Array.isArray(position) || position.length !== 3) return []
-      if (value.asset?.attachTo === 'wall' || value.asset?.attachTo === 'ceiling') return []
-      const name = typeof value.name === 'string' && value.name
-        ? value.name
-        : typeof value.asset?.name === 'string' ? value.asset.name : assetId
-      if (isChecklistItem(name)) return []
-      const dims = Array.isArray(value.asset?.dimensions) && value.asset.dimensions.length === 3
-        ? value.asset.dimensions as [number, number, number]
-        : [1, 1, 1] as [number, number, number]
-      const home = zones.find(zone => pointInPolygon(position[0] as number, position[2] as number, zone.polygon))
-      if (!home) return []
-      return [{ catalogItemId: assetId, name, dimensions: dims, roomName: home.name }]
-    })
+    // Furniture preservation: capture EVERY free-standing floor item (checklist
+    // furniture and user extras alike) with its exact coordinates, rotation,
+    // scale and name before the clear. After the rebuild they go back where
+    // they were — a local edit must not shuffle furniture in rooms the user
+    // never touched. Extraction rules (coordinate frames, stable room join key)
+    // live in the domain module so they are locked down by tests.
+    const preservedFurniture = preservedFurnitureFromNodes({ nodes, beforePlan, zones })
     const clearTypes = new Set(['zone', 'wall', 'slab', 'ceiling', 'item'])
     session.destructiveSceneWriteStarted = true
     this.persistSession(session)
@@ -2211,6 +2191,18 @@ export class PascalAiAgent {
       polygon: planRoom.polygon,
       zoneId: built.rooms.find(entry => entry.planRoomId === planRoom.id)?.zoneId ?? null,
     }))
+    // Put the preserved furniture back FIRST, then let the furnishing pass run.
+    // Order matters: executeFurniturePlan reads the live items back through
+    // get_level_summary, so restored pieces both satisfy their checklist
+    // requirement (no duplicate bed) and occupy their floor space (nothing gets
+    // placed on top of them). Anything genuinely missing is still filled in.
+    const restored = await restoreFurnitureAfterRebuild({
+      items: preservedFurniture,
+      rooms: furnitureRooms,
+      levelId,
+      callMcp: traceMcp,
+      beforeCall,
+    })
     const furnished = await executeFurniturePlan({
       rooms: furnitureRooms,
       connections: plan.connections,
@@ -2238,13 +2230,6 @@ export class PascalAiAgent {
         writeEffect: furnReport?.writeEffect ?? 'no_write',
       }
     }
-    const replay = await replayManualItems({
-      items: manualItems,
-      rooms: furnitureRooms,
-      levelId,
-      callMcp: traceMcp,
-      beforeCall,
-    })
     // R1.3: the clear+rebuild always committed real writes (destructive delete
     // + create_room); fold in every executor's side-effect verdict. This path
     // also flags destructiveSceneWriteStarted, so the failure wording stays
@@ -2252,17 +2237,17 @@ export class PascalAiAgent {
     session.modificationWriteEffect = combineWriteEffects(
       'write_confirmed',
       built.writeEffect,
+      restored.writeEffect,
       furnished.writeEffect,
       furnReport?.writeEffect,
-      replay.writeEffect,
     )
     // P1: a deferred furniture write whose result is unknown must not complete
     // normally — throw so the (destructive) result-unknown reply fires instead
     // of saving a scene whose final state is uncertain.
     this.throwIfWriteUncertain(session.modificationWriteEffect, [
       ...built.executionIssues,
+      ...restored.executionIssues,
       ...(furnReport?.executionIssues ?? []),
-      ...replay.executionIssues,
     ])
     // P2-A: verify the built structure against the ACTUAL zones FIRST. Only
     // once the scene provably matches `plan` do we refresh the session snapshot
@@ -2307,15 +2292,23 @@ export class PascalAiAgent {
           ...appliedNotes,
           ...planNotes,
           ...(furnReport?.results.filter(r => r.ok).map(r => r.detail) ?? []),
-          ...replay.replaced.map(name => `手动家具「${name}」已在重建后重新放置`),
+          ...(restored.restoredInPlace.length > 0
+            ? [`${restored.restoredInPlace.length} 件家具保持原位未移动`]
+            : []),
+          ...restored.relocated.map(name => `家具「${name}」原位置已不可用，已在同一房间内重新安排`),
         ],
         failedDetails: [
           ...built.executionIssues,
           ...furnished.missing.map(entry => `「${entry.room}」缺少${entry.label}：${entry.reason}`),
           ...furnished.executionIssues,
           ...(furnReport?.results.filter(r => !r.ok).map(r => r.detail) ?? []),
-          ...replay.lost.map(entry => `手动家具「${entry.name}」未能重放：${entry.reason}`),
-          ...replay.executionIssues,
+          ...restored.lost.map(entry => `家具「${entry.name}」未能保留：${entry.reason}`),
+          ...restored.executionIssues,
+          ...(restored.placeholders.length > 0
+            ? [`${restored.placeholders.length} 件家具的资产已不在目录中，场景中留下了占位物，请在编辑器中替换`]
+            : []),
+          ...restored.identityNotRestored.map(name =>
+            `家具「${name}」已回到原位，但名称/缩放未能恢复为你此前的设置`),
         ],
         previousVersion: loadedVersion,
         baselineGateFailures,

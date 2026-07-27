@@ -2,11 +2,11 @@ import { describe, expect, test } from 'bun:test'
 import type { FurnitureRoom } from './furniture-executor'
 import {
   executeFurnitureModifyOps,
-  isChecklistItem,
   previewRoomFurnitureClear,
-  replayManualItems,
+  restoreFurnitureAfterRebuild,
   skippedFurnitureResults,
 } from './furniture-modify'
+import type { PreservedFurniture } from './domain/furniture-preservation'
 
 // 4×3.5 bedroom, door centered on the south wall (same fixture family as
 // furniture-executor.test.ts).
@@ -58,7 +58,7 @@ const existingWardrobe = {
   asset: { id: 'wardrobe', name: 'Wardrobe Closet', dimensions: [1.2, 2.2, 0.6] as [number, number, number] },
 }
 
-function makeMockMcp(options: { items?: unknown[]; catalog?: typeof CATALOG } = {}) {
+function makeMockMcp(options: { items?: unknown[]; catalog?: typeof CATALOG; unavailable?: string[] } = {}) {
   const calls: Array<{ name: string; args: Record<string, unknown> }> = []
   const catalog = options.catalog ?? CATALOG
   let counter = 0
@@ -75,9 +75,19 @@ function makeMockMcp(options: { items?: unknown[]; catalog?: typeof CATALOG } = 
         const results = catalog[args.query as string] ?? []
         return wrap({ results, total: results.length })
       }
-      case 'place_item':
+      case 'place_item': {
         counter++
-        return wrap({ itemId: `new-item-${counter}` })
+        // Mirrors packages/mcp place-item.ts: an unknown catalogItemId does NOT
+        // skip the write — it creates a 0.5m placeholder node and reports
+        // catalog_unavailable alongside a real itemId.
+        const unavailable = (options.unavailable ?? []).includes(args.catalogItemId as string)
+        return wrap({
+          itemId: `new-item-${counter}`,
+          ...(unavailable ? { status: 'catalog_unavailable' } : {}),
+        })
+      }
+      case 'apply_patch':
+        return wrap({ appliedOps: 1, deletedIds: [], createdIds: [] })
       case 'delete_node':
         deleted.push(args.id as string)
         return wrap({ ok: true })
@@ -684,42 +694,234 @@ describe('executeFurnitureModifyOps', () => {
   })
 })
 
-describe('manual-item replay (MODIFY_REDESIGN §6)', () => {
-  test('isChecklistItem separates checklist furniture from manual decor', () => {
-    expect(isChecklistItem('Double Bed')).toBe(true)
-    expect(isChecklistItem('Wardrobe Closet')).toBe(true)
-    expect(isChecklistItem('Potted Plant 03')).toBe(false)
-    expect(isChecklistItem('Bookshelf')).toBe(false)
+describe('furniture preservation across a structural rebuild', () => {
+  const preserved = (
+    over: Partial<PreservedFurniture> & Pick<PreservedFurniture, 'name' | 'roomId'>,
+  ): PreservedFurniture => ({
+    sourceItemId: `src-${over.name}`,
+    catalogItemId: 'double-bed',
+    assetName: over.name,
+    dimensions: [1.8, 0.5, 2.1],
+    scale: [1, 1, 1],
+    position: [2, 0, 2.4],
+    rotationY: Math.PI,
+    roomName: '主卧',
+    ...over,
   })
 
-  test('replays a manual item into the surviving room, reports the vanished room', async () => {
+  // The headline fix: an untouched room's furniture must go back EXACTLY where
+  // it was, not be re-scanned into a new spot.
+  test('restores an item at its original coordinates and rotation', async () => {
     const { callMcp, calls } = makeMockMcp({ items: [] })
-    const report = await replayManualItems({
+    const report = await restoreFurnitureAfterRebuild({
+      items: [preserved({ name: 'Double Bed', roomId: 'bedroom-1' })],
+      rooms: [bedroom],
+      levelId: 'level-1',
+      callMcp,
+    })
+    expect(report.restoredInPlace).toEqual(['Double Bed'])
+    expect(report.relocated).toEqual([])
+    expect(report.lost).toEqual([])
+    const place = calls.find(call => call.name === 'place_item')
+    expect(place?.args.position).toEqual([2, 0, 2.4])
+    expect(place?.args.rotation).toBe(Math.PI)
+    expect(place?.args.targetNodeId).toBe('zone-bed')
+  })
+
+  test('drops an item whose room was removed and reports it', async () => {
+    const { callMcp } = makeMockMcp({ items: [] })
+    const report = await restoreFurnitureAfterRebuild({
       items: [
-        { catalogItemId: 'plant-03', name: 'Potted Plant 03', dimensions: [0.4, 1.1, 0.4], roomName: '主卧' },
-        { catalogItemId: 'bookshelf', name: 'Bookshelf', dimensions: [0.8, 1.8, 0.3], roomName: '书房' }, // 房间已删除
+        preserved({ name: 'Double Bed', roomId: 'bedroom-1' }),
+        preserved({ name: 'Bookshelf', roomId: 'study-1', catalogItemId: 'bookshelf', dimensions: [0.8, 1.8, 0.3] }),
       ],
       rooms: [bedroom],
       levelId: 'level-1',
       callMcp,
     })
-    expect(report.replaced).toEqual(['Potted Plant 03'])
+    expect(report.restoredInPlace).toEqual(['Double Bed'])
     expect(report.lost).toHaveLength(1)
-    expect(report.lost[0]!.reason).toContain('已不存在')
-    const place = calls.find(call => call.name === 'place_item')
-    expect(place?.args.catalogItemId).toBe('plant-03')
-    expect(place?.args.targetNodeId).toBe('zone-bed')
+    expect(report.lost[0]!.name).toBe('Bookshelf')
+    expect(report.lost[0]!.reasonCode).toBe('room_removed')
   })
 
-  test('a manual item that no longer fits lands in lost, not silently dropped', async () => {
-    const { callMcp } = makeMockMcp({ items: [existingBed, existingWardrobe] })
-    const report = await replayManualItems({
-      items: [{ catalogItemId: 'grand-piano', name: 'Grand Piano', dimensions: [3.9, 1.0, 3.4], roomName: '主卧' }],
+  test('relocates an item whose original spot is no longer legal', async () => {
+    const { callMcp, calls } = makeMockMcp({ items: [] })
+    const shrunk: FurnitureRoom = { ...bedroom, polygon: [[0, 0], [4, 0], [4, 3], [0, 3]] }
+    const report = await restoreFurnitureAfterRebuild({
+      items: [preserved({ name: 'Double Bed', roomId: 'bedroom-1' })],
+      rooms: [shrunk],
+      levelId: 'level-1',
+      callMcp,
+    })
+    expect(report.restoredInPlace).toEqual([])
+    expect(report.relocated).toEqual(['Double Bed'])
+    const place = calls.find(call => call.name === 'place_item')
+    expect(place?.args.position).not.toEqual([2, 0, 2.4])
+  })
+
+  // Blocker regression: the planner reserves every KEEP up front, so a
+  // relocation processed first can never be scanned onto a spot a later keep is
+  // about to be restored to. Before the fix both items landed on identical
+  // coordinates and overlapped permanently.
+  test('a relocated item never takes the spot reserved for a kept item', async () => {
+    const { callMcp, calls } = makeMockMcp({ items: [] })
+    const dims: [number, number, number] = [1.0, 0.5, 0.5]
+    // The spot the wall scan picks first in this room.
+    const scanFirstSpot: [number, number, number] = [0.55, 0, 0.28]
+    const report = await restoreFurnitureAfterRebuild({
+      items: [
+        // A is out of bounds → must relocate, and its scan starts at the very
+        // spot B legitimately occupies.
+        preserved({ name: 'A', roomId: 'bedroom-1', dimensions: dims, position: [2, 0, 99], rotationY: 0 }),
+        // B is exactly on the scan's first candidate → kept.
+        preserved({ name: 'B', roomId: 'bedroom-1', dimensions: dims, position: scanFirstSpot, rotationY: 0 }),
+      ],
       rooms: [bedroom],
       levelId: 'level-1',
       callMcp,
     })
-    expect(report.replaced).toEqual([])
-    expect(report.lost[0]!.reason).toContain('没有可放置的位置')
+    expect(report.restoredInPlace).toEqual(['B'])
+    expect(report.relocated).toEqual(['A'])
+    const positions = calls
+      .filter(call => call.name === 'place_item')
+      .map(call => JSON.stringify(call.args.position))
+    expect(new Set(positions).size).toBe(positions.length)
+    expect(positions).toContain(JSON.stringify(scanFirstSpot))
+  })
+
+  // Blocker regression: an unknown catalogItemId still WRITES a 0.5m
+  // placeholder node. Reporting it as "not restored" while saying nothing about
+  // the placeholder left in the scene was a silent data-integrity lie.
+  test('reports the placeholder MCP leaves behind when an asset left the catalog', async () => {
+    const { callMcp } = makeMockMcp({ items: [], unavailable: ['gone-asset'] })
+    const report = await restoreFurnitureAfterRebuild({
+      items: [preserved({ name: 'Custom Chair', roomId: 'bedroom-1', catalogItemId: 'gone-asset' })],
+      rooms: [bedroom],
+      levelId: 'level-1',
+      callMcp,
+    })
+    expect(report.restoredInPlace).toEqual([])
+    expect(report.placeholders).toHaveLength(1)
+    expect(report.placeholders[0]!.name).toBe('Custom Chair')
+    expect(report.lost[0]!.reasonCode).toBe('catalog_unavailable')
+    expect(report.lost[0]!.reason).toContain('占位物')
+  })
+
+  // A placeholder occupies real space: nothing may be stacked on top of it.
+  test('reserves the placeholder footprint so later items are not stacked on it', async () => {
+    const { callMcp, calls } = makeMockMcp({ items: [], unavailable: ['gone-asset'] })
+    const spot: [number, number, number] = [0.55, 0, 0.28]
+    await restoreFurnitureAfterRebuild({
+      items: [
+        preserved({ name: 'Ghost', roomId: 'bedroom-1', catalogItemId: 'gone-asset', dimensions: [0.5, 0.5, 0.5], position: spot, rotationY: 0 }),
+        preserved({ name: 'Mover', roomId: 'bedroom-1', dimensions: [1.0, 0.5, 0.5], position: [2, 0, 99], rotationY: 0 }),
+      ],
+      rooms: [bedroom],
+      levelId: 'level-1',
+      callMcp,
+    })
+    const positions = calls.filter(call => call.name === 'place_item').map(call => call.args.position)
+    expect(new Set(positions.map(p => JSON.stringify(p))).size).toBe(positions.length)
+  })
+
+  // place_item cannot set name or scale, so a user-renamed / user-resized piece
+  // needs a follow-up patch or it silently reverts to the catalogue default.
+  test('restores a user-edited name and scale via apply_patch', async () => {
+    const { callMcp, calls } = makeMockMcp({ items: [] })
+    await restoreFurnitureAfterRebuild({
+      items: [preserved({
+        name: '我的床', roomId: 'bedroom-1', assetName: 'Double Bed', scale: [1, 1, 1.5],
+      })],
+      rooms: [bedroom],
+      levelId: 'level-1',
+      callMcp,
+    })
+    const patch = calls.find(call => call.name === 'apply_patch')
+    const patches = patch?.args.patches as Array<{ data: Record<string, unknown> }>
+    expect(patches[0]!.data.name).toBe('我的床')
+    expect(patches[0]!.data.scale).toEqual([1, 1, 1.5])
+  })
+
+  test('does not patch an item whose name and scale are unchanged', async () => {
+    const { callMcp, calls } = makeMockMcp({ items: [] })
+    await restoreFurnitureAfterRebuild({
+      items: [preserved({ name: 'Double Bed', roomId: 'bedroom-1', assetName: 'Double Bed' })],
+      rooms: [bedroom],
+      levelId: 'level-1',
+      callMcp,
+    })
+    expect(calls.some(call => call.name === 'apply_patch')).toBe(false)
+  })
+
+  // Bulky pieces must claim the leftover space first, or a small item takes the
+  // only long wall and the bed becomes unplaceable.
+  test('relocates the bulkiest item first', async () => {
+    const { callMcp, calls } = makeMockMcp({ items: [] })
+    const report = await restoreFurnitureAfterRebuild({
+      items: [
+        preserved({ name: 'Plant', roomId: 'bedroom-1', dimensions: [0.4, 1.1, 0.4], position: [2, 0, 99], rotationY: 0 }),
+        preserved({ name: 'Bed', roomId: 'bedroom-1', dimensions: [1.8, 0.5, 2.1], position: [2, 0, 99], rotationY: 0 }),
+      ],
+      rooms: [bedroom],
+      levelId: 'level-1',
+      callMcp,
+    })
+    expect(report.relocated).toEqual(['Bed', 'Plant'])
+    const first = calls.filter(call => call.name === 'place_item')[0]
+    expect(first?.args.catalogItemId).toBe('double-bed')
+  })
+
+  // A rejected identity patch means the piece is back at the right spot under
+  // the CATALOGUE's name/scale — reporting a clean restore would be a lie.
+  test('reports an item whose name/scale patch was rejected', async () => {
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = []
+    let counter = 0
+    const callMcp = async (name: string, args: Record<string, unknown>) => {
+      calls.push({ name, args })
+      if (name === 'get_walls') return { structuredContent: { walls } }
+      if (name === 'apply_patch') throw new Error('patch rejected')
+      if (name === 'place_item') {
+        counter++
+        return { structuredContent: { itemId: `new-item-${counter}` } }
+      }
+      return { structuredContent: {} }
+    }
+    const report = await restoreFurnitureAfterRebuild({
+      items: [preserved({ name: '我的床', roomId: 'bedroom-1', assetName: 'Double Bed' })],
+      rooms: [bedroom],
+      levelId: 'level-1',
+      callMcp,
+    })
+    // Position IS preserved, so it stays in restoredInPlace...
+    expect(report.restoredInPlace).toEqual(['我的床'])
+    // ...but the lost identity is stated explicitly rather than glossed over.
+    expect(report.identityNotRestored).toEqual(['我的床'])
+  })
+
+  // A failed walls read is not the same as "this level has no doors".
+  test('says so when the walls read fails instead of assuming no doors', async () => {
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = []
+    let counter = 0
+    const callMcp = async (name: string, args: Record<string, unknown>) => {
+      calls.push({ name, args })
+      if (name === 'get_walls') throw new Error('transport down')
+      if (name === 'place_item') {
+        counter++
+        return { structuredContent: { itemId: `new-item-${counter}` } }
+      }
+      return { structuredContent: {} }
+    }
+    const report = await restoreFurnitureAfterRebuild({
+      items: [preserved({ name: 'Double Bed', roomId: 'bedroom-1' })],
+      rooms: [bedroom],
+      levelId: 'level-1',
+      callMcp,
+    })
+    expect(report.executionIssues.some(issue => issue.includes('未能校验门净空'))).toBe(true)
+    expect(report.doorClearanceUnverified).toBe(true)
+    // Deliberate: the level was already cleared, so skipping the restore would
+    // destroy every item permanently. We restore and flag instead.
+    expect(report.restoredInPlace).toEqual(['Double Bed'])
   })
 })
