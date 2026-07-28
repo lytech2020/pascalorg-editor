@@ -7,6 +7,7 @@ afterEach(() => {
   restoreEnv('PASCAL_SCENE_API_TOKEN')
   restoreEnv('PASCAL_SCENE_API_ORIGINS')
   restoreEnv('PASCAL_SCENE_API_RATE_LIMIT')
+  restoreEnv('PASCAL_SCENE_API_TRUSTED_HOSTS')
 })
 
 function restoreEnv(key: keyof NodeJS.ProcessEnv): void {
@@ -33,6 +34,16 @@ test('requires a token for non-loopback scene API requests', async () => {
 
   expect(response?.status).toBe(503)
   expect(await response?.json()).toEqual({ error: 'scene_api_token_required' })
+})
+
+test('allows configured trusted scene API hosts without a token', () => {
+  delete process.env.PASCAL_SCENE_API_TOKEN
+  process.env.PASCAL_SCENE_API_TRUSTED_HOSTS = 'editor'
+  const request = new Request('http://editor:3002/api/scenes', {
+    headers: { host: 'editor:3002' },
+  })
+
+  expect(guardSceneApiRequest(request)).toBeNull()
 })
 
 test('accepts bearer token auth when configured', () => {

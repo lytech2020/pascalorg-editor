@@ -1,0 +1,22 @@
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+
+WORKDIR /src
+COPY pascal-reverse-proxy/pascal-reverse-proxy.csproj pascal-reverse-proxy/
+RUN dotnet restore pascal-reverse-proxy/pascal-reverse-proxy.csproj
+
+COPY pascal-reverse-proxy/ pascal-reverse-proxy/
+RUN dotnet publish pascal-reverse-proxy/pascal-reverse-proxy.csproj \
+  --configuration Release \
+  --no-restore \
+  --output /out
+
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
+
+WORKDIR /app/pascal-reverse-proxy
+COPY --from=build /out ./
+COPY pascal-reverse-front /app/pascal-reverse-front
+
+ENV ASPNETCORE_URLS=http://0.0.0.0:8000
+EXPOSE 8000
+CMD ["dotnet", "pascal-reverse-proxy.dll"]
+

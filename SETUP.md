@@ -125,6 +125,52 @@ This starts all workspace `dev` tasks, including package watchers, the editor, t
 
 Do not run the daily three-terminal commands and `bun dev` together; they compete for ports 3002 and 8788.
 
+## Docker Compose startup
+
+Use Docker Compose when you want one command to start the production-like stack:
+
+```bash
+docker compose up --build
+```
+
+Open:
+
+```text
+http://localhost:8000/
+```
+
+The Compose stack runs three services:
+
+| Service | Internal URL | Purpose |
+|---|---|---|
+| `editor` | `http://editor:3002` | Next.js editor and scene APIs |
+| `ai` | `http://ai:8788` | Pascal AI service; starts Pascal MCP over stdio |
+| `proxy` | `http://localhost:8000` | Browser-facing entry point |
+
+Only port `8000` is published by default. The shared named volume `pascal-data`
+stores `pascal.db`, `ai.db`, request artifacts, DXF import jobs, and proxy
+metadata under `/data/pascal`.
+
+The default Compose config sets `PASCAL_SCENE_API_TRUSTED_HOSTS=editor` so the
+proxy can call the editor scene API through Docker's internal hostname without a
+browser-facing scene API token.
+
+Create a local `.env` file before starting the stack. Compose reads it
+automatically, and `.env` is ignored by git:
+
+```env
+AZURE_OPENAI_ENDPOINT=https://your-resource.cognitiveservices.azure.com
+AZURE_OPENAI_API_KEY=your-key
+AZURE_OPENAI_DEPLOYMENT=your-deployment-name
+AZURE_OPENAI_API_VERSION=2024-10-21
+```
+
+Then start Docker Compose:
+
+```bash
+docker compose up --build
+```
+
 ## Common startup problems
 
 ### Port already in use

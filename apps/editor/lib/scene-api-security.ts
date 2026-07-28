@@ -152,7 +152,18 @@ function isSameOrigin(request: Request, origin: string): boolean {
 
 function isTrustedDevHostRequest(request: Request): boolean {
   const host = stripPort(request.headers.get('host') ?? new URL(request.url).host)
-  return isLoopbackHostname(host) || isPrivateLanHostname(host)
+  return isLoopbackHostname(host) || isPrivateLanHostname(host) || configuredTrustedHosts().has(host.toLowerCase())
+}
+
+function configuredTrustedHosts(): Set<string> {
+  const raw = process.env.PASCAL_SCENE_API_TRUSTED_HOSTS
+  if (!raw) return new Set()
+  return new Set(
+    raw
+      .split(',')
+      .map((part) => stripPort(part.trim()).toLowerCase())
+      .filter(Boolean),
+  )
 }
 
 function isLoopbackHostname(hostname: string): boolean {

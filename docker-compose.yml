@@ -1,0 +1,67 @@
+services:
+  editor:
+    build:
+      context: .
+      dockerfile: Dockerfile.bun
+      target: editor
+    environment:
+      NODE_ENV: production
+      PASCAL_DATA_DIR: /data/pascal
+      PASCAL_DB_PATH: /data/pascal/pascal.db
+      AI_AGENT_URL: http://ai:8788
+      NEXT_PUBLIC_APP_URL: http://editor:3002
+      NEXT_ALLOWED_DEV_ORIGINS: localhost:8000,127.0.0.1:8000
+      PASCAL_SCENE_API_TRUSTED_HOSTS: editor
+    volumes:
+      - pascal-data:/data/pascal
+    expose:
+      - "3002"
+    depends_on:
+      - ai
+
+  ai:
+    build:
+      context: .
+      dockerfile: Dockerfile.bun
+      target: ai
+    environment:
+      NODE_ENV: production
+      AI_MCP_HOST: 0.0.0.0
+      AI_PROVIDER: azure-openai
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:?set AZURE_OPENAI_ENDPOINT in .env}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:?set AZURE_OPENAI_API_KEY in .env}
+      AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:?set AZURE_OPENAI_DEPLOYMENT in .env}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-10-21}
+      AI_TEMPERATURE: "1"
+      AI_TEMPERATURE_INTENT: "1"
+      AI_TEMPERATURE_GEOMETRY: "1"
+      AI_MCP_DATABASE_FILE: /data/pascal/ai.db
+      AI_MCP_REQUEST_ARTIFACTS_DIR: /data/pascal/request-artifacts
+      PASCAL_MCP_MODE: stdio
+      PASCAL_MCP_COMMAND: bun
+      PASCAL_MCP_ARGS: /app/packages/mcp/dist/bin/pascal-mcp.js --stdio
+      PASCAL_DATA_DIR: /data/pascal
+      PASCAL_NORM_PROFILE: ${PASCAL_NORM_PROFILE:-default}
+    volumes:
+      - pascal-data:/data/pascal
+    expose:
+      - "8788"
+
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    environment:
+      ASPNETCORE_URLS: http://0.0.0.0:8000
+      ReverseProxy__Clusters__pascal__Destinations__editor__Address: http://editor:3002/
+      PascalDatabase__Path: /data/pascal/pascal.db
+      ProxyDatabase__Path: /data/pascal/pascal-reverse-proxy.db
+    volumes:
+      - pascal-data:/data/pascal
+    ports:
+      - "8000:8000"
+    depends_on:
+      - editor
+
+volumes:
+  pascal-data:

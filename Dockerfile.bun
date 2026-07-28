@@ -1,0 +1,25 @@
+FROM oven/bun:1.3.14 AS base
+
+WORKDIR /app
+ENV NEXT_TELEMETRY_DISABLED=1
+
+COPY . .
+RUN bun install --frozen-lockfile
+
+FROM base AS editor-build
+RUN bun run build --filter=editor
+
+FROM editor-build AS editor
+ENV NODE_ENV=production
+WORKDIR /app/apps/editor
+EXPOSE 3002
+CMD ["bun", "run", "start"]
+
+FROM base AS ai-build
+RUN bun run build --filter=@pascal-app/mcp
+
+FROM ai-build AS ai
+ENV NODE_ENV=production
+WORKDIR /app/pascal-ai-mcp
+EXPOSE 8788
+CMD ["bun", "run", "start"]
